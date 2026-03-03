@@ -470,25 +470,6 @@ def process_and_save_record(file_path: Path) -> str:
                         json.dumps(feats_clean),
                     ),
                 )
-
-                # DUAL INSERT: Patch the Ingestion Gap by writing to the new table too
-                cur.execute(
-                    """
-                    INSERT INTO ecg_segments
-                    (filename, segment_index, signal, features, segment_state, segment_fs, events_json)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (filename, segment_index) DO NOTHING
-                    """,
-                    (
-                        filename_key,
-                        i,
-                        json.dumps(segment.tolist()),
-                        json.dumps(feats_clean),
-                        'ANALYZED',
-                        TARGET_FS,
-                        '[]'
-                    ),
-                )
         conn.commit()
         return filename_key
 
@@ -544,7 +525,7 @@ def index():
     """
     Main dashboard view – loads first segment from SQL.
     """
-    row = db_service.fetch_one("SELECT MIN(segment_id) FROM ecg_segments;")
+    row = db_service.fetch_one("SELECT MIN(segment_id) FROM ecg_features_annotatable;")
     first_segment_id = row[0] if row and row[0] else 1
 
     load_segment_id = request.args.get("load_segment_id", first_segment_id)
@@ -600,7 +581,7 @@ def upload_and_process():
 def api_xai(segment_id: int):
     """
     Standardized Decision Engine & XAI Endpoint.
-    Leverages pre-computed results from ecg_segments if available.
+    Leverages pre-computed results from ecg_features_annotatable if available.
     """
     new_data = db_service.get_segment_new(segment_id)
     # Success from new table (Migration is handled inside get_segment_new)
@@ -681,14 +662,15 @@ def api_xai(segment_id: int):
 def get_segment_api(segment_id: int):
     """
     Fetch all necessary info for a specific segment ID.
-    Prioritizes the optimized ecg_segments table.
+    Prioritizes the optimized ecg_features_annotatable table.
     """
     meta = db_service.get_segment_new(segment_id)
     # Success from new table (Migration is handled inside get_segment_new)
     if not meta:
         return jsonify({"error": "Segment not found"}), 404
         
-    raw_signal = meta.get("raw_signal")
+    # get_segment_new returns key "signal" (not "raw_signal")
+    raw_signal = meta.get("signal")
     # If signal is still missing (NULL in both tables), try disk load
     if not raw_signal or len(raw_signal) == 0:
         try:
@@ -696,16 +678,22 @@ def get_segment_api(segment_id: int):
         except Exception as e:
             return jsonify({"error": f"Failed to load ECG: {e}"}), 500
 
-    features = meta.get("features_json") or {}
+    # get_segment_new returns key "features" (not "features_json")
+    features = meta.get("features") or {}
     mean_hr = float(features.get("mean_hr", 0.0))
 
     # Parse r-peaks from DB (Prioritize manual edits)
     r_peaks_for_frontend = meta.get("r_peaks_in_segment")
 
+    # Use the actual fs stored in the DB — critical for coordinate sync
+    # MIT-BIH data is at 125 Hz; uploading a file via app might be 250 Hz.
+    # Using a hard-coded TARGET_FS here would cause a 2× coordinate shift.
+    seg_fs = int(meta.get("segment_fs") or 125)
+
     if not r_peaks_for_frontend:
         # 1. Calculate FRESH R-peaks on the fly ONLY if missing from DB
         try:
-            r_peaks_arr = _detect_r_peaks_neurokit(np.array(raw_signal), TARGET_FS)
+            r_peaks_arr = _detect_r_peaks_neurokit(np.array(raw_signal), seg_fs)
             # Convert to string for JSON
             r_peaks_for_frontend = ",".join(str(x) for x in r_peaks_arr)
         except Exception:
@@ -720,7 +708,7 @@ def get_segment_api(segment_id: int):
 
     # Recompute PR interval from the segment
     try:
-        pr_interval_ms = _calculate_pr_interval(np.array(raw_signal), r_peaks_arr, TARGET_FS)
+        pr_interval_ms = _calculate_pr_interval(np.array(raw_signal), r_peaks_arr, seg_fs)
     except Exception:
         pr_interval_ms = 0.0
 
@@ -728,7 +716,7 @@ def get_segment_api(segment_id: int):
     # QRS width from features (robust to None/NaN) -- RECALCULATED ON THE FLY with NeuroKit
     # Note: We prioritize recomputing it to fix old data issues in dashboard
     try:
-        qrs_durations = _compute_qrs_durations(np.array(raw_signal), r_peaks_arr, TARGET_FS)
+        qrs_durations = _compute_qrs_durations(np.array(raw_signal), r_peaks_arr, seg_fs)
         if len(qrs_durations) > 0:
             # Use MEDIAN for robustness against delineation errors
             qrs_mean_ms = float(np.nanmedian(qrs_durations))
@@ -745,12 +733,12 @@ def get_segment_api(segment_id: int):
 
     return jsonify(
         {
-            "segment_id": meta["segment_id"],
+            "segment_id": segment_id,  # use the route arg directly (not in meta dict)
             "filename": meta["filename"],
             "segment_index": meta["segment_index"],
             "raw_signal": raw_signal,
-            "fs": TARGET_FS,
-            "length": SEGMENT_LENGTH,
+            "fs": seg_fs,            # per-segment fs from DB — used by JS for coordinate scaling
+            "length": len(raw_signal),
             "arrhythmia_label": meta.get("arrhythmia_label"),
             "notes": meta.get("arrhythmia_text_notes") or (meta.get("events_json", {}).get("cardiologist_notes", "") if isinstance(meta.get("events_json"), dict) else ""),
             "features": features,
@@ -900,7 +888,7 @@ def api_next_segment(segment_id: int):
             cur.execute(
                 """
                 SELECT MIN(segment_id)
-                FROM ecg_segments
+                FROM ecg_features_annotatable
                 WHERE segment_id > %s
                 """,
                 (segment_id,),
@@ -909,7 +897,7 @@ def api_next_segment(segment_id: int):
             if row and row[0] is not None:
                 return jsonify({"ok": True, "next": int(row[0])})
 
-            cur.execute("SELECT MIN(segment_id) FROM ecg_segments")
+            cur.execute("SELECT MIN(segment_id) FROM ecg_features_annotatable")
             row = cur.fetchone()
             if row and row[0] is not None:
                 return jsonify({"ok": True, "next": int(row[0])})
@@ -931,7 +919,7 @@ def api_prev_segment(segment_id: int):
             cur.execute(
                 """
                 SELECT MAX(segment_id)
-                FROM ecg_segments
+                FROM ecg_features_annotatable
                 WHERE segment_id < %s
                 """,
                 (segment_id,),
@@ -940,7 +928,7 @@ def api_prev_segment(segment_id: int):
             if row and row[0] is not None:
                 return jsonify({"ok": True, "prev": int(row[0])})
 
-            cur.execute("SELECT MAX(segment_id) FROM ecg_segments")
+            cur.execute("SELECT MAX(segment_id) FROM ecg_features_annotatable")
             row = cur.fetchone()
             if row and row[0] is not None:
                 return jsonify({"ok": True, "prev": int(row[0])})

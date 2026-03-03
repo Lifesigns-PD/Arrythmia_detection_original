@@ -649,6 +649,8 @@
             let viewStart = 0;
             let viewEnd = 0;
             let dpr = window.devicePixelRatio || 1;
+            // Per-segment sampling rate (read from API, do NOT use TARGET_FS for event scaling)
+            let segmentFs = TARGET_FS;
 
             // Selection State
             let selectedBeats = []; // Stores relative indices (samples) of R-peaks
@@ -665,6 +667,8 @@
                 const data = await res.json();
 
                 ecgSignal = data.raw_signal || [];
+                // Use per-segment fs from API for coordinate sync
+                segmentFs = data.fs || TARGET_FS;
                 rPeaks = (data.r_peaks || "").split(",").map(Number).filter(n => !isNaN(n));
 
                 // Basic Vitals from Meta
@@ -816,8 +820,8 @@
                 // Draw Existing Events
                 if (currentDecision && currentDecision.final_display_events) {
                     currentDecision.final_display_events.forEach(e => {
-                        const sIdx = e.start_time * TARGET_FS;
-                        const eIdx = e.end_time * TARGET_FS;
+                        const sIdx = e.start_time * segmentFs;
+                        const eIdx = e.end_time * segmentFs;
                         // Calculate center of the event (peak)
                         const peakIdx = (sIdx + eIdx) / 2;
 
@@ -948,7 +952,7 @@
                     rightClickedEventId = null;
                     if (currentDecision && currentDecision.final_display_events) {
                         const evt = currentDecision.final_display_events.find(e => {
-                            const center = (e.start_time * TARGET_FS + e.end_time * TARGET_FS) / 2;
+                            const center = (e.start_time * segmentFs + e.end_time * segmentFs) / 2;
                             return Math.abs(center - closestIdx) < 20; // 20 sample tolerance
                         });
                         if (evt) rightClickedEventId = evt.event_id;

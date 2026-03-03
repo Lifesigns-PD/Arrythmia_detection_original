@@ -1,5 +1,6 @@
 """
 Quick Database Health Check: Is everything ready for annotation?
+Updated to focus on the single ecg_features_annotatable table.
 """
 import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,57 +41,77 @@ cur = conn.cursor()
 
 # 2. Table Existence
 print("\n[2] TABLES")
-for table in ["ecg_features_annotatable", "ecg_segments"]:
+for table in ["ecg_features_annotatable"]:
     cur.execute("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s)", (table,))
     exists = cur.fetchone()[0]
     check(f"Table '{table}' exists", exists)
 
-# 3. Column checks for ecg_segments
-print("\n[3] SCHEMA (ecg_segments)")
-critical_cols = ["segment_id", "events_json", "segment_state", "background_rhythm", "features_json"]
-cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'ecg_segments'")
-seg_cols = [r[0] for r in cur.fetchall()]
-for col in critical_cols:
-    check(f"Column 'ecg_segments.{col}'", col in seg_cols)
-
-# 4. Column checks for ecg_features_annotatable 
-print("\n[4] SCHEMA (ecg_features_annotatable)")
-critical_cols2 = ["segment_id", "filename", "segment_index", "arrhythmia_label", "r_peaks_in_segment"]
+# 3. Column checks for ecg_features_annotatable 
+print("\n[3] SCHEMA (ecg_features_annotatable)")
+critical_cols = [
+    "segment_id", "filename", "segment_index", "arrhythmia_label", 
+    "features_json", "events_json", "raw_signal", "is_corrected"
+]
 cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'ecg_features_annotatable'")
 feat_cols = [r[0] for r in cur.fetchall()]
-for col in critical_cols2:
+for col in critical_cols:
     check(f"Column 'ecg_features_annotatable.{col}'", col in feat_cols)
 
-# 5. Data counts
-print("\n[5] DATA VOLUME")
-cur.execute("SELECT COUNT(*) FROM ecg_segments")
-seg_count = cur.fetchone()[0]
-check(f"ecg_segments has data", seg_count > 0, f"{seg_count} segments")
-
+# 4. Data counts
+print("\n[4] DATA VOLUME")
 cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable")
 feat_count = cur.fetchone()[0]
 check(f"ecg_features_annotatable has data", feat_count > 0, f"{feat_count} records")
 
-# 6. Annotation readiness: events_json check
-print("\n[6] ANNOTATION READINESS")
-cur.execute("SELECT COUNT(*) FROM ecg_segments WHERE events_json IS NOT NULL")
+# 5. Annotation readiness: events_json check
+print("\n[5] ANNOTATION READINESS")
+cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE events_json IS NOT NULL")
 annotated = cur.fetchone()[0]
-check(f"Segments with annotations", True, f"{annotated}/{seg_count} annotated ({100*annotated//seg_count if seg_count else 0}%)")
+check(f"Segments with annotations", True, f"{annotated}/{feat_count} annotated")
 
-cur.execute("SELECT COUNT(*) FROM ecg_segments WHERE segment_state = 'VERIFIED'")
+cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE is_corrected = TRUE")
 verified = cur.fetchone()[0]
-check(f"Verified segments", True, f"{verified}/{seg_count} verified ({100*verified//seg_count if seg_count else 0}%)")
+check(f"Verified segments", True, f"{verified}/{feat_count} verified")
 
-cur.execute("SELECT COUNT(*) FROM ecg_segments WHERE segment_state = 'PENDING'")
+cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE is_corrected = FALSE")
 pending = cur.fetchone()[0]
 check(f"Pending segments (ready to annotate)", True, f"{pending} segments awaiting annotation")
 
-# 7. Save/Load round-trip test
-print("\n[7] WRITE/READ TEST")
+# 5b. Signal array length integrity
+print("\n[5b] SIGNAL LENGTH INTEGRITY (expected: 1250 samples @ 125 Hz)")
+cur.execute("""
+    SELECT COUNT(*) FROM ecg_features_annotatable
+    WHERE signal_data IS NOT NULL AND array_length(signal_data, 1) != 1250
+""")
+bad_count = cur.fetchone()[0]
+check("All signal_data arrays are 1250 samples", bad_count == 0,
+      f"{bad_count} segments with wrong length" if bad_count else "all correct")
+
+if bad_count > 0:
+    print("  Length distribution (wrong-length segments):")
+    cur.execute("""
+        SELECT array_length(signal_data, 1), COUNT(*)
+        FROM ecg_features_annotatable
+        WHERE signal_data IS NOT NULL AND array_length(signal_data, 1) != 1250
+        GROUP BY array_length(signal_data, 1)
+        ORDER BY COUNT(*) DESC LIMIT 5
+    """)
+    for length, cnt in cur.fetchall():
+        print(f"    length={length}: {cnt} segments")
+
+# Check segments where signal_data is NULL (won't be usable by ML)
+cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE signal_data IS NULL")
+null_sig = cur.fetchone()[0]
+check("No segments with NULL signal_data", null_sig == 0,
+      f"{null_sig} segments missing signal_data (will be skipped by ML)" if null_sig else "")
+
+
+# 6. Save/Load round-trip test
+print("\n[6] WRITE/READ TEST")
 import uuid
 test_id_str = f"HEALTH_CHECK_{uuid.uuid4().hex[:8]}"
 # Find a segment to test on
-cur.execute("SELECT segment_id FROM ecg_segments ORDER BY segment_id LIMIT 1")
+cur.execute("SELECT segment_id FROM ecg_features_annotatable ORDER BY segment_id LIMIT 1")
 test_seg = cur.fetchone()
 if test_seg:
     test_segment_id = test_seg[0]
@@ -116,30 +137,16 @@ if test_seg:
     check("Read event back from DB", found)
 
     # Cleanup
-    conn2 = db_service._connect()
-    cur2 = conn2.cursor()
-    cur2.execute("SELECT events_json FROM ecg_segments WHERE segment_id = %s", (test_segment_id,))
-    row = cur2.fetchone()
-    if row and row[0]:
-        data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-        if isinstance(data, dict):
-            for key in ["events", "final_display_events"]:
-                if key in data:
-                    data[key] = [e for e in data[key] if e.get("event_id") != test_id_str]
-        cur2.execute("UPDATE ecg_segments SET events_json = %s WHERE segment_id = %s",
-                     (json.dumps(data), test_segment_id))
-        conn2.commit()
-    cur2.close()
-    conn2.close()
+    db_service.delete_event(test_segment_id, test_id_str)
     check("Cleanup test data", True)
 else:
     check("Write/Read test", False, "No segments found")
 
-# 8. GIN index check
-print("\n[8] INDEXES")
+# 7. Index check
+print("\n[7] INDEXES")
 cur.execute("""
     SELECT indexname FROM pg_indexes 
-    WHERE tablename IN ('ecg_segments', 'ecg_features_annotatable') 
+    WHERE tablename = 'ecg_features_annotatable' 
     AND indexdef LIKE '%gin%'
 """)
 gin_indexes = [r[0] for r in cur.fetchall()]
