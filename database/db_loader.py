@@ -10,6 +10,7 @@ def _connect():
 def fetch_annotated_segments(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Return list of dict rows from ecg_features_annotatable for the UI.
+    Includes robust JSON parsing for features_json and events_json.
     """
     try:
         conn = _connect()
@@ -31,27 +32,23 @@ def fetch_annotated_segments(limit: Optional[int] = None) -> List[Dict[str, Any]
             cur.execute(q)
             rows = cur.fetchall()
             
-            for seg_id, filename, seg_idx, features_json, arr_label, events_json, seg_fs in rows:
-                # 1. Normalize features_json
-                if isinstance(features_json, str):
-                    try:
-                        features = json.loads(features_json)
-                    except:
-                        features = {}
-                else:
-                    features = features_json or {}
+            for row in rows:
+                seg_id, filename, seg_idx, f_raw, arr_label, e_raw, seg_fs = row
                 
-                # 2. Extract r_peaks directly from the JSON dictionary!
+                # Robust JSON loads
+                def safe_load_dict(data):
+                    if isinstance(data, dict): return data
+                    try: return json.loads(data) if data else {}
+                    except: return {}
+                
+                def safe_load_list(data):
+                    if isinstance(data, list): return data
+                    try: return json.loads(data) if data else []
+                    except: return []
+
+                features = safe_load_dict(f_raw)
+                events = safe_load_list(e_raw)
                 rp = features.get("r_peaks", [])
-                
-                # 3. Normalize events_json (for the red UI markers)
-                if isinstance(events_json, str):
-                    try:
-                        events = json.loads(events_json)
-                    except:
-                        events = []
-                else:
-                    events = events_json or []
 
                 out.append({
                     "segment_id": seg_id,
@@ -61,9 +58,6 @@ def fetch_annotated_segments(limit: Optional[int] = None) -> List[Dict[str, Any]
                     "arrhythmia_label": arr_label,
                     "r_peaks_in_segment": rp,
                     "events_json": events,
-                    # segment_fs is essential for coordinate sync:
-                    # sample_idx = event_time_seconds * segment_fs
-                    # Do NOT hard-code 250 Hz; MIT-BIH data is at 125 Hz
                     "segment_fs": int(seg_fs) if seg_fs is not None else 125,
                 })
     except Exception as ex:
@@ -74,4 +68,4 @@ def fetch_annotated_segments(limit: Optional[int] = None) -> List[Dict[str, Any]
         except:
             pass
             
-    return out 
+    return out

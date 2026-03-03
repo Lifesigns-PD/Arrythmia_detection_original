@@ -158,22 +158,22 @@ def get_segment_new(segment_id: int) -> Optional[Dict[str, Any]]:
             
             row = cur.fetchone()
             if row:
-                # Safely parse the JSON fields for the UI
-                raw_sig = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
-                feats = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or {})
-                events = json.loads(row[3]) if isinstance(row[3], str) else (row[3] or [])
-                
+                def safe_load(data):
+                    if isinstance(data, (list, dict)): return data
+                    try: return json.loads(data) if data else []
+                    except: return []
+
                 return {
-                    "signal": raw_sig,
-                    "features": feats,
+                    "signal": safe_load(row[0]),
+                    "features": safe_load(row[1]),
                     "background_rhythm": row[2] or "Unlabeled",
-                    "events_json": events,
-                    "segment_fs": row[4] or 125,  # Matches the 125Hz we set
+                    "events_json": safe_load(row[3]),
+                    "segment_fs": row[4] or 125,
                     "filename": row[5],
                     "segment_index": row[6]
                 }
     except Exception as e:
-        print(f"DB ERROR get_segment_new: {e}")
+        print(f"CRITICAL DB ERROR in get_segment_new: {e}")
     finally:
         conn.close()
     return None
