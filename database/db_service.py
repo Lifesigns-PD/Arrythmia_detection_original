@@ -151,7 +151,7 @@ def get_segment_new(segment_id: int) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             # We now query ecg_features_annotatable and use raw_signal, features_json, and arrhythmia_label
             cur.execute("""
-                SELECT raw_signal, features_json, arrhythmia_label, events_json, segment_fs, filename, segment_index, r_peaks_in_segment
+                SELECT raw_signal, features_json, arrhythmia_label, events_json, segment_fs, filename, segment_index, r_peaks_in_segment, cardiologist_notes
                 FROM ecg_features_annotatable
                 WHERE segment_id = %s
             """, (segment_id,))
@@ -171,7 +171,8 @@ def get_segment_new(segment_id: int) -> Optional[Dict[str, Any]]:
                     "segment_fs": row[4] or 125,
                     "filename": row[5],
                     "segment_index": row[6],
-                    "r_peaks_in_segment": row[7]
+                    "r_peaks_in_segment": row[7],
+                    "cardiologist_notes": row[8] or ""
                 }
     except Exception as e:
         print(f"CRITICAL DB ERROR in get_segment_new: {e}")
@@ -409,7 +410,7 @@ def get_all_segments() -> List[Dict[str, Any]]:
                     is_corrected,
                     COALESCE(arrhythmia_label, 'Unlabeled') as arrhythmia_label
                 FROM ecg_features_annotatable
-                ORDER BY segment_id DESC
+                ORDER BY segment_id ASC
             """)
             rows = cur.fetchall()
             return [
@@ -417,7 +418,7 @@ def get_all_segments() -> List[Dict[str, Any]]:
                     "id": r[0],
                     "filename": r[1],
                     "index": r[2] or 0,
-                    "status": 'confirmed' if (r[3] or (r[4] and r[4] != 'Unlabeled')) else 'pending'
+                    "status": 'confirmed' if r[3] else 'pending'
                 }
                 for r in rows
             ]

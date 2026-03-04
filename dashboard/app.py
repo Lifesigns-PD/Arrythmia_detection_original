@@ -731,6 +731,10 @@ def get_segment_api(segment_id: int):
     except Exception as e:
         qrs_mean_ms = float(features.get("mean_qrs", 0.0))
 
+    # NaN Guards for JSON compliance
+    if np.isnan(qrs_mean_ms): qrs_mean_ms = 0.0
+    if np.isnan(pr_interval_ms): pr_interval_ms = 0.0
+
     return jsonify(
         {
             "segment_id": segment_id,  # use the route arg directly (not in meta dict)
@@ -740,7 +744,7 @@ def get_segment_api(segment_id: int):
             "fs": seg_fs,            # per-segment fs from DB — used by JS for coordinate scaling
             "length": len(raw_signal),
             "arrhythmia_label": meta.get("arrhythmia_label"),
-            "notes": meta.get("arrhythmia_text_notes") or (meta.get("events_json", {}).get("cardiologist_notes", "") if isinstance(meta.get("events_json"), dict) else ""),
+            "notes": meta.get("cardiologist_notes") or meta.get("arrhythmia_text_notes") or "",
             "features": features,
             "mean_hr": mean_hr,
             "pr_interval": float(pr_interval_ms),
@@ -750,6 +754,33 @@ def get_segment_api(segment_id: int):
             "corrected_at": meta.get("corrected_at"),
         }
     )
+
+@app.route("/api/next_unverified/<int:current_id>")
+def get_next_unverified_api(current_id: int):
+    """Finds the next unverified segment ID (is_corrected = FALSE) starting from current_id."""
+    conn = db_service._connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT segment_id FROM ecg_features_annotatable 
+                WHERE segment_id > %s AND is_corrected = FALSE 
+                ORDER BY segment_id ASC LIMIT 1
+            """, (current_id,))
+            row = cur.fetchone()
+            if row:
+                return jsonify({"ok": True, "next": row[0]})
+            
+            # If nothing found after current, wrap around to start
+            cur.execute("SELECT segment_id FROM ecg_features_annotatable WHERE is_corrected = FALSE ORDER BY segment_id ASC LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                return jsonify({"ok": True, "next": row[0]})
+                
+            return jsonify({"ok": False, "msg": "No unverified segments left!"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        conn.close()
 
 
 # =========================================================

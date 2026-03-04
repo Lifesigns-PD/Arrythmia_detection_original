@@ -144,10 +144,9 @@
         /* State Overlays */
         .state-overlay {
             position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
             z-index: 100;
             display: flex;
             align-items: center;
@@ -159,26 +158,24 @@
 
         .state-overlay.visible {
             opacity: 1;
-            pointer-events: all;
         }
 
         .overlay-warmup {
-            background: rgba(30, 30, 30, 0.85);
             color: #888;
         }
 
         .overlay-unreliable {
-            background: rgba(80, 60, 20, 0.6);
             color: #ffcc00;
         }
 
         .overlay-msg {
-            font-size: clamp(16px, 2.5vw, 28px);
+            font-size: 14px;
             font-weight: bold;
-            border: 2px solid currentColor;
-            padding: 15px 25px;
-            border-radius: 15px;
-            backdrop-filter: blur(10px);
+            border: 1px solid currentColor;
+            padding: 8px 16px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(5px);
         }
 
         /* Suppressed Side Panel */
@@ -806,8 +803,9 @@
                 ctx.strokeStyle = "red";
                 ctx.setLineDash([]);
                 selectedBeats.forEach(idx => {
-                    const sIdx = idx - 150;
-                    const eIdx = idx + 150;
+                    const highlightHalfWidth = Math.floor(0.15 * segmentFs); // 150ms half-width (300ms total)
+                    const sIdx = idx - highlightHalfWidth;
+                    const eIdx = idx + highlightHalfWidth;
                     if (eIdx < start || sIdx > end) return;
 
                     const xS = Math.max(0, ((sIdx - start) / (visible.length - 1)) * w);
@@ -897,7 +895,7 @@
                 const clickedSampleIdx = startIdx + (x / w) * (visibleLen - 1);
 
                 let closestPeak = null;
-                let minDistance = 50;
+                let minDistance = 0.2 * segmentFs; // 200ms tolerance
 
                 rPeaks.forEach(peak => {
                     const dist = Math.abs(peak - clickedSampleIdx);
@@ -929,7 +927,7 @@
                 const clickSample = startIdx + (x / rect.width) * (visibleLen - 1);
                 window.lastClickSample = clickSample; // For manual add
 
-                let closestDist = 50;
+                let closestDist = 0.2 * segmentFs; // 200ms tolerance
                 let closestIdx = -1;
 
                 rPeaks.forEach((peakSample) => {
@@ -1082,14 +1080,28 @@
                     // 2. Clear UI Selection
                     selectedBeats = [];
                     updateSelectionCount();
-                    runAnalysis(); // Refresh
+                    // 3. Auto-Advance to next unverified
+                    const nextRes = await fetch(`/api/next_unverified/${currentSegment}`);
+                    const nextData = await nextRes.json();
+                    if (nextData.ok) {
+                        setTimeout(() => loadSegment(nextData.next), 1000);
+                    }
                 } else {
                     alert("Failed to save annotation.");
                 }
             }
 
-            window.onload = () => {
+            window.onload = async () => {
                 resizeCanvas();
+                // Auto-load first pending segment
+                const res = await fetch(`/api/next_unverified/0`);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.ok) {
+                        loadSegment(data.next);
+                        return;
+                    }
+                }
                 loadSegment(INITIAL_SEGMENT_ID);
             };
 
