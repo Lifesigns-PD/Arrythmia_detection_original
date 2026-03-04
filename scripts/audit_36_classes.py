@@ -309,15 +309,15 @@ def test_annotation_roundtrip():
         conn = psycopg2.connect(**PSQL_CONN_PARAMS)
         with conn.cursor() as cur:
             # Find a real segment to use for the test
-            cur.execute("SELECT segment_id FROM ecg_segments LIMIT 1")
+            cur.execute("SELECT segment_id FROM ecg_features_annotatable LIMIT 1")
             row = cur.fetchone()
             if not row:
-                log_warn("No segments found in ecg_segments. Skipping round-trip test.")
+                log_warn("No segments found in ecg_features_annotatable. Skipping round-trip test.")
                 return
             test_segment_id = row[0]
             
             # Read existing events_json
-            cur.execute("SELECT events_json FROM ecg_segments WHERE segment_id = %s", (test_segment_id,))
+            cur.execute("SELECT events_json FROM ecg_features_annotatable WHERE segment_id = %s", (test_segment_id,))
             original_data = cur.fetchone()[0]
             
             # === SAVE: Inject a test annotation ===
@@ -345,14 +345,14 @@ def test_annotation_roundtrip():
             data.setdefault("final_display_events", []).append(test_event)
             
             cur.execute(
-                "UPDATE ecg_segments SET events_json = %s WHERE segment_id = %s",
+                "UPDATE ecg_features_annotatable SET events_json = %s WHERE segment_id = %s",
                 (json.dumps(data), test_segment_id)
             )
             conn.commit()
             log_pass(f"SAVE: Injected test annotation '{test_event_id}' into segment {test_segment_id}.")
 
             # === LOAD: Read it back ===
-            cur.execute("SELECT events_json FROM ecg_segments WHERE segment_id = %s", (test_segment_id,))
+            cur.execute("SELECT events_json FROM ecg_features_annotatable WHERE segment_id = %s", (test_segment_id,))
             loaded_data = cur.fetchone()[0]
             if isinstance(loaded_data, str):
                 loaded_data = json.loads(loaded_data)
@@ -390,7 +390,7 @@ def test_annotation_roundtrip():
                 loaded_data["final_display_events"] = [e for e in loaded_data.get("final_display_events", []) if e.get("event_id") != test_event_id]
             
             cur.execute(
-                "UPDATE ecg_segments SET events_json = %s WHERE segment_id = %s",
+                "UPDATE ecg_features_annotatable SET events_json = %s WHERE segment_id = %s",
                 (json.dumps(loaded_data), test_segment_id)
             )
             conn.commit()

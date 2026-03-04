@@ -151,7 +151,7 @@ def get_segment_new(segment_id: int) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             # We now query ecg_features_annotatable and use raw_signal, features_json, and arrhythmia_label
             cur.execute("""
-                SELECT raw_signal, features_json, arrhythmia_label, events_json, segment_fs, filename, segment_index
+                SELECT raw_signal, features_json, arrhythmia_label, events_json, segment_fs, filename, segment_index, r_peaks_in_segment
                 FROM ecg_features_annotatable
                 WHERE segment_id = %s
             """, (segment_id,))
@@ -170,7 +170,8 @@ def get_segment_new(segment_id: int) -> Optional[Dict[str, Any]]:
                     "events_json": safe_load(row[3]),
                     "segment_fs": row[4] or 125,
                     "filename": row[5],
-                    "segment_index": row[6]
+                    "segment_index": row[6],
+                    "r_peaks_in_segment": row[7]
                 }
     except Exception as e:
         print(f"CRITICAL DB ERROR in get_segment_new: {e}")
@@ -470,6 +471,7 @@ def clear_all_annotations(segment_id: int) -> bool:
                     arrhythmia_label = 'Unlabeled',
                     cardiologist_notes = '',
                     is_corrected = FALSE,
+                    used_for_training = FALSE,
                     corrected_at = NULL
                 WHERE segment_id = %s
             """, (segment_id,))

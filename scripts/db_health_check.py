@@ -50,7 +50,7 @@ for table in ["ecg_features_annotatable"]:
 print("\n[3] SCHEMA (ecg_features_annotatable)")
 critical_cols = [
     "segment_id", "filename", "segment_index", "arrhythmia_label", 
-    "features_json", "events_json", "raw_signal", "is_corrected"
+    "features_json", "events_json", "raw_signal", "is_corrected", "used_for_training"
 ]
 cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'ecg_features_annotatable'")
 feat_cols = [r[0] for r in cur.fetchall()]
@@ -64,14 +64,18 @@ feat_count = cur.fetchone()[0]
 check(f"ecg_features_annotatable has data", feat_count > 0, f"{feat_count} records")
 
 # 5. Annotation readiness: events_json check
-print("\n[5] ANNOTATION READINESS")
+print("\n[5] ANNOTATION READINESS & RETRAINING FLAGS")
 cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE events_json IS NOT NULL")
 annotated = cur.fetchone()[0]
 check(f"Segments with annotations", True, f"{annotated}/{feat_count} annotated")
 
 cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE is_corrected = TRUE")
 verified = cur.fetchone()[0]
-check(f"Verified segments", True, f"{verified}/{feat_count} verified")
+check(f"Verified segments (is_corrected = TRUE)", True, f"{verified}/{feat_count} verified")
+
+cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE is_corrected = TRUE AND used_for_training = FALSE")
+to_retrain = cur.fetchone()[0]
+check(f"Corrected segments ready for retraining (used_for_training = FALSE)", True, f"{to_retrain}/{verified} segments")
 
 cur.execute("SELECT COUNT(*) FROM ecg_features_annotatable WHERE is_corrected = FALSE")
 pending = cur.fetchone()[0]
