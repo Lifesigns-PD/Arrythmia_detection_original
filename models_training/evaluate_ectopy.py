@@ -11,8 +11,7 @@ import os
 sys.path.append(os.getcwd())
 sys.path.append(os.path.join(os.getcwd(), "models_training"))
 
-from models_training.data_loader import ECTOPY_CLASS_NAMES
-from models_training.retrain import ECGRawDatasetSQL, collate_fn
+from models_training.data_loader import ECTOPY_CLASS_NAMES, ECGRawDatasetSQL, collate_fn
 from models_training.models import CNNTransformerClassifier
 
 def evaluate_ectopy(ckpt_path):
@@ -36,7 +35,7 @@ def evaluate_ectopy(ckpt_path):
 
     print("Running Inference...")
     with torch.no_grad():
-        for x, y, _, _ in loader:
+        for x, y in loader:
             x = x.to(device)
             logits = model(x)
             preds = torch.argmax(logits, dim=1)

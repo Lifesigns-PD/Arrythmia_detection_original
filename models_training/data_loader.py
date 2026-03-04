@@ -302,158 +302,125 @@ def normalize_label(label: str):
 # DATASET - Lazy and robust JSON reading
 # ============================================================
 
+# ============================================================
+# DATASET - SQL based loading
+# ============================================================
+
 class ECGDataset:
     """
-    Lightweight dataset that lists JSON files at init and reads them on demand.
-    This avoids long startup times when many JSONs exist.
+    SQL-based dataset that loads ECG segments from ecg_features_annotatable.
+    Replaces the old file-strolling JSON loader.
     """
 
-    def __init__(self, data_dir):
+    def __init__(self, mode='all', limit=None, task='all', **kwargs):
         """
-        data_dir: folder (string or Path) containing JSON ECG segments
+        mode: 'all' to load everything, 'retrain' to load only clinician-corrected segments.
+        limit: Max segments to load (int or None).
+        task: Filter for task-specific labels (e.g. 'rhythm', 'ectopy').
         """
-        self.data_dir = Path(data_dir)
-        if not self.data_dir.exists():
-            raise RuntimeError(f"Dataset folder not found: {self.data_dir}")
+        self.samples = []
+        self.task = task
+        
+        # Connection params (Match db_service.py/retrain.py)
+        DB_PARAMS = {
+            "host":     "127.0.0.1",
+            "dbname":   "ecg_analysis",
+            "user":     "ecg_user",
+            "password": "sais",
+            "port":     "5432",
+        }
 
-        # only top-level *.json (user previously used many folder layouts; this keeps it simple)
-        self.files = sorted(list(self.data_dir.glob("*.json")))
-
-        if len(self.files) == 0:
-            raise RuntimeError(f"No JSON files found in dataset: {data_dir}")
-
-        print(f"[Dataset] Found {len(self.files)} JSON ECG segments in {self.data_dir}.")
-
-    def __len__(self):
-        return len(self.files)
-
-    def _safe_load_json(self, fpath: Path):
+        print(f"[Dataset] Initializing SQL dataset (mode={mode}, limit={limit}, task={task})...")
         try:
-            with fpath.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return data
+            conn = psycopg2.connect(**DB_PARAMS)
+            cur = conn.cursor()
+            
+            # Fetch signal_data (REAL[]), label, and fs
+            base_query = """
+                SELECT segment_id, signal_data, arrhythmia_label, segment_fs, filename
+                FROM ecg_features_annotatable 
+            """
+            
+            where_clauses = ["signal_data IS NOT NULL"]
+            if mode == 'retrain':
+                where_clauses.append("is_corrected = TRUE")
+            
+            query = base_query + " WHERE " + " AND ".join(where_clauses)
+            query += " ORDER BY segment_id DESC" # Get recent ones first if limited
+            
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            cur.execute(query)
+            rows = cur.fetchall()
+            
+            for seg_id, signal_raw, label_txt, fs, filename in rows:
+                # 1. Parse signal (Postgres REAL[] comes back as list)
+                sig = np.array(signal_raw, dtype=np.float32)
+                
+                # 2. Resample & Fix Length (10s @ 250Hz = 2500 samples)
+                fs = int(fs or 125)
+                sig = self._resample_and_fixlen(sig, fs)
+                
+                # 3. Resolve label index based on actual task
+                if self.task == 'rhythm':
+                    y = get_rhythm_label_idx(label_txt)
+                elif self.task == 'ectopy':
+                    y = get_ectopy_label_idx(label_txt)
+                else:
+                    label_norm = normalize_label(label_txt or "Sinus Rhythm")
+                    y = CLASS_INDEX.get(label_norm, 0)
+                
+                # Skip if label is invalid for the specified task
+                if y is None: 
+                    continue
+
+                self.samples.append({
+                    "signal": sig,
+                    "label": int(y),
+                    "id": seg_id,
+                    "filename": filename
+                })
+                
+            cur.close()
+            conn.close()
+            print(f"[Dataset] Loaded {len(self.samples)} samples from SQL.")
+            
         except Exception as e:
-            # Print a short message; don't crash on one corrupted file
-            print(f"[WARN] Failed to load JSON {fpath.name}: {e}")
-            return None
-
-    def _extract_signal_and_fs(self, data: dict):
-        # Try typical locations (mirrors your earlier loader)
-        if data is None:
-            return None, None
-
-        # 1) Standard our-converted format
-        if "ECG_CH_A" in data and data.get("ECG_CH_A") is not None:
-            sig = np.array(data["ECG_CH_A"], dtype=np.float32)
-            fs = int(data.get("fs", TARGET_FS))
-            return sig, fs
-
-        # 2) SensorData from raw Lifesigns / PTB / etc
-        sd = data.get("SensorData")
-        if (
-            isinstance(sd, list)
-            and len(sd) > 0
-            and isinstance(sd[0], dict)
-            and "ECG_CH_A" in sd[0]
-        ):
-            sig = np.array(sd[0]["ECG_CH_A"], dtype=np.float32)
-            fs = int(data.get("fs", sd[0].get("fs", TARGET_FS)))
-            return sig, fs
-
-        # 3) Sometimes wrapped inside features_json / meta
-        fj = data.get("features_json")
-        if isinstance(fj, dict) and "segment_signal" in fj:
-            sig = np.array(fj["segment_signal"], dtype=np.float32)
-            fs = int(fj.get("fs", data.get("fs", TARGET_FS)))
-            return sig, fs
-
-        meta = data.get("meta")
-        if isinstance(meta, dict) and "segment_signal" in meta:
-            sig = np.array(meta["segment_signal"], dtype=np.float32)
-            fs = int(meta.get("fs", TARGET_FS))
-            return sig, fs
-
-        # 4) last resort: generic 'signal'
-        if "signal" in data:
-            try:
-                sig = np.array(data["signal"], dtype=np.float32)
-                fs = int(data.get("fs", TARGET_FS))
-                return sig, fs
-            except Exception:
-                pass
-
-        return None, None
+            print(f"[ERROR] Failed to load SQL dataset: {e}")
+            raise
 
     def _resample_and_fixlen(self, sig, orig_fs):
-        # If orig_fs invalid, assume TARGET_FS
-        try:
-            orig_fs = int(orig_fs)
-        except Exception:
-            orig_fs = TARGET_FS
-
+        """Standardizes signal to 250 Hz and 2500 samples."""
         if orig_fs != TARGET_FS and len(sig) > 1:
-            # simple resample using scipy.signal.resample
             try:
                 new_len = int(len(sig) * float(TARGET_FS) / float(orig_fs))
                 sig = resample(sig, new_len).astype(np.float32)
             except Exception:
-                # fallback: numpy interp
+                # Fallback: numpy interp
                 idx_old = np.arange(len(sig))
-                idx_new = np.linspace(
-                    0, len(sig) - 1,
-                    int(len(sig) * float(TARGET_FS) / float(orig_fs))
-                )
+                idx_new = np.linspace(0, len(sig) - 1, int(len(sig) * float(TARGET_FS) / float(orig_fs)))
                 sig = np.interp(idx_new, idx_old, sig).astype(np.float32)
 
-        # pad/truncate to SEG_LEN
+        # Pad/truncate to SEG_LEN (2500)
         if len(sig) < SEG_LEN:
-            pad = SEG_LEN - len(sig)
+            pad = int(SEG_LEN - len(sig))
             sig = np.pad(sig, (0, pad))
         elif len(sig) > SEG_LEN:
-            sig = sig[:SEG_LEN]
+            sig = sig[:int(SEG_LEN)]
 
         return sig.astype(np.float32)
 
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        fpath = self.files[idx]
-        data = self._safe_load_json(fpath)
-
-        if data is None:
-            # return a zero sample so training doesn't crash; label 0 is Sinus Rhythm
-            return {
-                "signal": np.zeros(SEG_LEN, dtype=np.float32),
-                "label": 0,
-                "meta": {"source": str(fpath)},
-            }
-
-        sig, fs = self._extract_signal_and_fs(data)
-        if sig is None:
-            # fallback: zero sample
-            return {
-                "signal": np.zeros(SEG_LEN, dtype=np.float32),
-                "label": 0,
-                "meta": {"source": str(fpath)},
-            }
-
-        # 1. Resample & Fix Length
-        sig = self._resample_and_fixlen(sig, fs)
-
-        # LABEL resolution
-        label_txt = None
-        if data.get("label"):
-            label_txt = data.get("label")
-        elif isinstance(data.get("features_json"), dict) and data["features_json"].get("inferred_label"):
-            label_txt = data["features_json"].get("inferred_label")
-        elif isinstance(data.get("meta"), dict) and data["meta"].get("arrhythmia_label"):
-            label_txt = data["meta"].get("arrhythmia_label")
-
-        # normalize and map to index
-        label_norm = normalize_label(label_txt or "Sinus Rhythm")
-        y = CLASS_INDEX.get(label_norm, 0)
-
-        meta = data.get("meta", {"source": str(fpath)})
-        return {"signal": sig, "label": int(y), "meta": meta}
+        s = self.samples[idx]
+        return {
+            "signal": s["signal"], 
+            "label": s["label"], 
+            "meta": {"id": s["id"], "filename": s["filename"]}
+        }
 
 
 def collate_fn(batch):
@@ -461,6 +428,9 @@ def collate_fn(batch):
     signals = np.stack([b["signal"] for b in batch])
     labels = np.array([b["label"] for b in batch])
     return signals, labels
+
+# Backward Compatibility Alias
+ECGRawDatasetSQL = ECGDataset
 
 # ============================================================
 # END OF DATA_LOADER

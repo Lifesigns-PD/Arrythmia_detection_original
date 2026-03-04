@@ -12,8 +12,7 @@ from pathlib import Path
 sys.path.append(os.getcwd())
 sys.path.append(os.path.join(os.getcwd(), "models_training"))
 
-from models_training.data_loader import RHYTHM_CLASS_NAMES
-from models_training.retrain import ECGRawDatasetSQL, collate_fn
+from models_training.data_loader import RHYTHM_CLASS_NAMES, ECGRawDatasetSQL, collate_fn
 from models_training.models import CNNTransformerClassifier
 from models_training.calibration import TemperatureScaling
 
@@ -47,7 +46,7 @@ def evaluate_rhythm(ckpt_path):
 
     print("Running Inference...")
     with torch.no_grad():
-        for x, y, _, _ in loader:
+        for x, y in loader:
             # OPTIONAL: SQI Check Simulation
             # if check_sqi(x) < 0.5: 
             #     preds = ARTIFACT_INDEX

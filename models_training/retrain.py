@@ -7,7 +7,7 @@ BUGS FIXED IN THIS VERSION:
   [FIX 1] Model now LOADS existing checkpoint before retraining (not random weights)
   [FIX 2] Window extraction: slides across full 10s segment instead of always taking first 2s
   [FIX 3] Cardiologist events get 20x oversampling weight vs trusted_source
-  [FIX 4] used_for_training flag now correctly tracked in ecg_segments
+  [FIX 4] used_for_training flag now correctly tracked in ecg_features_annotatable
   [FIX 5] Filename-based split prevents data leakage (same recording in train+val)
   [FIX 6] host changed to 127.0.0.1 (consistent with db_service.py)
   [FIX 7] Signal null guard — skips empty/null signals silently
@@ -111,7 +111,7 @@ class FocalLoss(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class ECGEventDataset(torch.utils.data.Dataset):
     """
-    Loads ECG events from ecg_segments.
+    Loads ECG events from ecg_features_annotatable.
 
     KEY DIFFERENCES from old ECGRawDatasetSQL
     -----------------------------------------
@@ -145,9 +145,9 @@ class ECGEventDataset(torch.utils.data.Dataset):
             with conn.cursor() as cur:
                 # [FIX 7] signal IS NOT NULL guard in the query itself
                 cur.execute("""
-                    SELECT segment_id, signal, events_json, segment_fs, filename
-                    FROM   ecg_segments
-                    WHERE  signal      IS NOT NULL
+                    SELECT segment_id, signal_data, events_json, segment_fs, filename
+                    FROM   ecg_features_annotatable
+                    WHERE  signal_data IS NOT NULL
                       AND  events_json IS NOT NULL
                 """)
                 rows = cur.fetchall()
@@ -431,7 +431,7 @@ def _build_criterion(labels, num_classes, device):
 def mark_cardiologist_events_used():
     """
     Updates ecg_features_annotatable.used_for_training = TRUE
-    for all segments that have at least one cardiologist event in ecg_segments.
+    for all segments that have at least one cardiologist event in ecg_features_annotatable.
 
     NOTE: The NEXT retrain still picks up these events (finetune will filter
     by source_filter="cardiologist", so used_for_training is informational only —
@@ -442,20 +442,18 @@ def mark_cardiologist_events_used():
         with psycopg2.connect(**DB_PARAMS) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE ecg_features_annotatable fa
+                    UPDATE ecg_features_annotatable
                     SET    used_for_training = TRUE
-                    FROM   ecg_segments s
-                    WHERE  fa.segment_id = s.segment_id
-                      AND  s.events_json IS NOT NULL
+                    WHERE  events_json IS NOT NULL
                       AND  EXISTS (
                           SELECT 1
                           FROM   jsonb_array_elements(
                               CASE
-                                  WHEN jsonb_typeof(s.events_json) = 'array'
-                                       THEN s.events_json
-                                  WHEN jsonb_typeof(s.events_json) = 'object'
-                                       AND  s.events_json ? 'events'
-                                       THEN s.events_json->'events'
+                                  WHEN jsonb_typeof(events_json) = 'array'
+                                       THEN events_json
+                                  WHEN jsonb_typeof(events_json) = 'object'
+                                       AND  events_json ? 'events'
+                                       THEN events_json->'events'
                                   ELSE '[]'::jsonb
                               END
                           ) AS ev
