@@ -719,11 +719,12 @@
 
                 ecgSignal = data.raw_signal || [];
                 // Use per-segment fs from API for coordinate sync
-                segmentFs = data.fs || TARGET_FS;
+                segmentFs = data.fs || data.segment_fs || 125;
                 rPeaks = (data.r_peaks || "").split(",").map(Number).filter(n => !isNaN(n));
 
                 // 3. Update Vitals (The Truth Sync)
-                document.getElementById('hrValue').innerText = data.vitals ? data.vitals.bpm : '--';
+                const liveBPM = (data.vitals && data.vitals.bpm) ? data.vitals.bpm : '--';
+                document.getElementById('hrValue').innerText = liveBPM;
                 document.getElementById('prValue').innerText = data.vitals ? data.vitals.pr_interval : '--';
                 document.getElementById('qrsValue').innerText = data.vitals ? data.vitals.qrs_duration : '--';
 
@@ -1071,61 +1072,68 @@
                 if (menu) menu.style.display = 'none';
             });
 
+            // Local Helper: Append to display events without saving to database yet
+            function addLocalEvent(indices, label, source) {
+                if (!currentDecision) currentDecision = {};
+                if (!currentDecision.final_display_events) currentDecision.final_display_events = [];
+
+                indices.forEach(idx => {
+                    const timeSec = idx / segmentFs;
+                    const newEvent = {
+                        event_id: "local_" + Math.random().toString(36).substr(2, 9),
+                        event_type: label,
+                        event_category: (label.toUpperCase().includes("PVC") || label.toUpperCase().includes("PAC")) ? "ECTOPY" : "RHYTHM",
+                        start_time: Math.max(0, timeSec - 0.3),
+                        end_time: timeSec + 0.3,
+                        annotation_source: source
+                    };
+                    currentDecision.final_display_events.push(newEvent);
+                });
+                redraw();
+            }
+
             // Quick Label Logic
             function quickLabel(label) {
                 if (rightClickedBeatIdx === -1) return;
-                saveAnnotation([rightClickedBeatIdx], label);
+                addLocalEvent([rightClickedBeatIdx], label, "cardiologist");
+                document.getElementById('beat-context-menu').style.display = 'none';
             }
 
             async function addManualBeat() {
                 if (!window.lastClickSample) return;
-
                 const newPeak = Math.round(window.lastClickSample);
                 rPeaks.push(newPeak);
                 rPeaks.sort((a, b) => a - b);
 
-                const res = await fetch("/api/update_rpeaks", {
+                await fetch("/api/update_rpeaks", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ segment_id: currentSegment, r_peaks: rPeaks })
                 });
-
-                if (res.ok) {
-                    // Re-load to ensure everything is consistent
-                    loadSegment(currentSegment);
-                } else {
-                    alert("Failed to save peak.");
-                }
+                // We do not reload the segment entirely here to avoid wiping local annotations!
                 document.getElementById('beat-context-menu').style.display = 'none';
+                redraw();
             }
 
             async function clearAnnotation() {
                 if (!rightClickedEventId) return;
 
-                const res = await fetch("/api/delete_annotation", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ segment_id: currentSegment, event_id: rightClickedEventId })
-                });
-
-                if (res.ok) {
-                    // Toast
-                    const toast = document.createElement("div");
-                    toast.innerText = `🗑️ Annotation Deleted`;
-                    toast.style.cssText = "position:fixed; bottom:20px; right:20px; background:rgba(255, 68, 68, 0.9); color:white; padding:15px; border-radius:8px; z-index:9999; font-weight:bold;";
-                    document.body.appendChild(toast);
-                    setTimeout(() => toast.remove(), 3000);
-
-                    // Re-evaluate verification status? 
-                    // For now, if we delete, we might still be verified if other events exist.
-                    // Ideally we should check if events list is empty. 
-                    // But for simplicity, we don't auto-unverify on delete unless we reload status.
-                    // Let's reload sidebad status via a fetch if needed, 
-                    // or just reload the segment entirely to be safe:
-                    loadSegment(currentSegment);
-                } else {
-                    alert("Failed to delete annotation.");
+                // 1. Remove locally
+                if (currentDecision && currentDecision.final_display_events) {
+                    currentDecision.final_display_events = currentDecision.final_display_events.filter(e => e.event_id !== rightClickedEventId);
+                    redraw();
                 }
+
+                // 2. If it is already a saved event (UUID vs 'local_'), ask backend to delete
+                if (!rightClickedEventId.startsWith("local_")) {
+                    await fetch("/api/delete_annotation", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ segment_id: currentSegment, event_id: rightClickedEventId })
+                    });
+                }
+
+                document.getElementById('beat-context-menu').style.display = 'none';
             }
 
             // Batch Apply Logic
@@ -1139,7 +1147,9 @@
                     alert("Please select a diagnosis from the dropdown.");
                     return;
                 }
-                saveAnnotation(selectedBeats, label);
+                addLocalEvent(selectedBeats, label, "cardiologist");
+                selectedBeats = [];
+                updateSelectionCount();
             };
 
             document.getElementById("clear-selection-btn").onclick = () => {
@@ -1148,41 +1158,7 @@
                 redraw();
             };
 
-            // Shared Save Function
-            async function saveAnnotation(indices, label) {
-                const payload = {
-                    segment_id: currentSegment,
-                    beat_indices: indices,
-                    label: label
-                };
-
-                const res = await fetch("/api/annotate_beats", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(payload)
-                });
-
-                if (res.ok) {
-                    // 1. Show Success Message (Toast)
-                    const toast = document.createElement("div");
-                    toast.innerText = `✅ Saved ${indices.length} beats as ${label}`;
-                    toast.style.cssText = "position:fixed; bottom:20px; right:20px; background:rgba(0, 255, 153, 0.9); color:black; padding:15px; border-radius:8px; z-index:9999; font-weight:bold; box-shadow: 0 0 20px rgba(0,255,153,0.3);";
-                    document.body.appendChild(toast);
-                    setTimeout(() => toast.remove(), 3000);
-
-                    // 2. Clear UI Selection
-                    selectedBeats = [];
-                    updateSelectionCount();
-                    // 3. Auto-Advance to next unverified
-                    const nextRes = await fetch(`/api/next_unverified/${currentSegment}`);
-                    const nextData = await nextRes.json();
-                    if (nextData.ok) {
-                        setTimeout(() => loadSegment(nextData.next), 1000);
-                    }
-                } else {
-                    alert("Failed to save annotation.");
-                }
-            }
+            // Remove Individual Auto-Advance Save Logic (saveAnnotation)
 
             window.onload = async () => {
                 resizeCanvas();
@@ -1212,37 +1188,65 @@
 
             async function verifySegment() {
                 const label = document.getElementById('diagnosis-select').value;
-                const payload = {
-                    segment_id: currentSegment,
-                    background_rhythm: label || "Sinus Rhythm"
-                };
+                const eventsToSave = currentDecision && currentDecision.final_display_events ? currentDecision.final_display_events : [];
+                const verifyBtn = document.getElementById("verify-btn");
+                const oldText = verifyBtn.innerText;
+                verifyBtn.innerText = "Processing...";
 
-                const res = await fetch("/api/verify_segment", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(payload)
-                });
+                try {
+                    // 1. Save all accumulated markers (ONLY on Verify)
+                    await fetch(`/api/segment/${currentSegment}/update`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ events: eventsToSave })
+                    });
 
-                if (res.ok) {
-                    // Success Toast
-                    const toast = document.createElement("div");
-                    toast.innerText = `✅ Segment Verified!`;
-                    toast.style.cssText = "position:fixed; bottom:20px; right:20px; background:rgba(0, 255, 153, 0.9); color:black; padding:15px; border-radius:8px; z-index:9999; font-weight:bold; box-shadow: 0 0 20px rgba(0,255,153,0.3);";
-                    document.body.appendChild(toast);
-                    setTimeout(() => toast.remove(), 3000);
+                    // 2. Mark the segment background rhythm & status as analyzed/verified
+                    const payload = {
+                        segment_id: currentSegment,
+                        background_rhythm: label || "Sinus Rhythm"
+                    };
 
-                    // Update Sidebar
-                    const badge = document.getElementById(`status-badge-${currentSegment}`);
-                    if (badge) badge.style.display = 'inline-block';
-                    const pending = document.getElementById(`pending-badge-${currentSegment}`);
-                    if (pending) pending.style.display = 'none';
+                    const res = await fetch("/api/verify_segment", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload)
+                    });
 
-                    // Update Header Icon
-                    document.getElementById("header-verified-icon").style.display = 'inline';
+                    if (res.ok) {
+                        // Success Toast
+                        const toast = document.createElement("div");
+                        toast.innerText = `✅ Segment Verified!`;
+                        toast.style.cssText = "position:fixed; bottom:20px; right:20px; background:rgba(0, 255, 153, 0.9); color:black; padding:15px; border-radius:8px; z-index:9999; font-weight:bold; box-shadow: 0 0 20px rgba(0,255,153,0.3);";
+                        document.body.appendChild(toast);
+                        setTimeout(() => toast.remove(), 3000);
 
-                    runAnalysis();
-                } else {
-                    alert("Verification failed.");
+                        // Update UI Sidebar Status
+                        const badge = document.getElementById(`status-badge-${currentSegment}`);
+                        if (badge) badge.style.display = 'inline-block';
+                        const pending = document.getElementById(`pending-badge-${currentSegment}`);
+                        if (pending) pending.style.display = 'none';
+
+                        document.getElementById("header-verified-icon").style.display = 'inline';
+
+                        // 3. Auto-Advance to the next UNVERIFIED patient
+                        const nextResponse = await fetch(`/api/next_unverified/${currentSegment}`);
+                        if (nextResponse.ok) {
+                            const nextData = await nextResponse.json();
+                            if (nextData.ok && nextData.next) {
+                                setTimeout(() => loadSegment(nextData.next), 800);
+                            } else {
+                                alert("All segments verified! You can navigate manually.");
+                            }
+                        }
+                    } else {
+                        alert("Verification failed on database level.");
+                    }
+                } catch (e) {
+                    console.error(e);
+                    alert("Network error during verification.");
+                } finally {
+                    verifyBtn.innerText = oldText;
                 }
             }
 
@@ -1264,16 +1268,18 @@
                     document.body.appendChild(toast);
                     setTimeout(() => toast.remove(), 3000);
 
+                    // Drop local markers too
+                    if (currentDecision) currentDecision.final_display_events = [];
+
                     // Reset Sidebar
                     const badge = document.getElementById(`status-badge-${currentSegment}`);
                     if (badge) badge.style.display = 'none';
                     const pending = document.getElementById(`pending-badge-${currentSegment}`);
                     if (pending) pending.style.display = 'inline-block';
 
-                    // Update Header
                     document.getElementById("header-verified-icon").style.display = 'none';
 
-                    loadSegment(currentSegment); // Full Reload
+                    redraw();
                 } else {
                     alert("Failed to clear annotations.");
                 }

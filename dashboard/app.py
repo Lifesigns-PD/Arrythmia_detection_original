@@ -693,7 +693,12 @@ def get_segment_api(segment_id: int):
         except:
             r_peaks_arr = np.array([], dtype=int)
 
-    # Recompute PR interval from the segment
+    # Calculate LIVE Heart Rate
+    if len(r_peaks_arr) >= 2:
+        rr_intervals = np.diff(r_peaks_arr)
+        mean_rr = np.mean(rr_intervals)
+        if mean_rr > 0:
+            mean_hr = 60.0 * seg_fs / mean_rr
     try:
         pr_interval_ms = _calculate_pr_interval(np.array(raw_signal), r_peaks_arr, seg_fs)
     except Exception:
@@ -1040,6 +1045,38 @@ def verify_segment():
     else:
         return jsonify({"error": "Database update failed"}), 500
 
+
+@app.route("/api/segment/<int:segment_id>/update", methods=["POST"])
+def update_segment_events(segment_id: int):
+    """
+    Overwrites the saved events for a segment with a new array from the UI.
+    """
+    data = request.json
+    events = data.get("events", [])
+    
+    # 1. Clear existing annotations
+    db_service.clear_all_annotations(segment_id)
+    
+    # 2. Insert new ones
+    success_count = 0
+    import uuid
+    for evt in events:
+        # Format the event for DB
+        event_dict = {
+            "event_id": str(uuid.uuid4()),
+            "event_type": evt.get("event_type", "Unknown"),
+            "event_category": evt.get("event_category", "ECTOPY"),
+            "start_time": float(evt.get("start_time", 0.0)),
+            "end_time": float(evt.get("end_time", 0.0)),
+            "beat_indices": [],
+            "annotation_source": evt.get("annotation_source", "cardiologist"),
+            "annotation_status": "confirmed",
+            "used_for_training": True
+        }
+        if db_service.save_event_to_db(segment_id, event_dict):
+            success_count += 1
+            
+    return jsonify({"status": "ok", "saved": success_count})
 
 # =========================================================
 # Main
