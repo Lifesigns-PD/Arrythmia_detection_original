@@ -1,19 +1,3 @@
-"""
-xai.py
-
-Explainable AI module for the CNN+Transformer ECG Arrhythmia classifier.
-
-Provides:
-  - Option A clinical explanation (model + rules)
-  - Saliency map (vanilla gradient)
-  - CNN feature maps
-  - Transformer self-attention weights
-
-Used by app.py:
-   /api/xai/<segment_id>  → explain_segment()
-   /api/xai_raw           → predict_and_explain()  (if you add route)
-"""
-
 from pathlib import Path
 import sys
 
@@ -25,8 +9,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models import CNNTransformerClassifier
-from data_loader import CLASS_NAMES, RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES, extract_fixed_window, WINDOW_SEC
+from models_training.models import CNNTransformerClassifier
+from models_training.data_loader import CLASS_NAMES, RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES, extract_fixed_window, WINDOW_SEC
 from decision_engine.models import SegmentDecision, SegmentState, DisplayState
 
 
@@ -184,6 +168,10 @@ def _clinical_explanation(label: str, features: dict, attention_context: str = "
     It synthesizes quantitative data (features) with clinical logic.
     """
 
+    # Define default values to prevent NameError
+    cond_str = "normal"
+    rhythm_desc = "regular"
+
     if not label:
         return "Analysis: No specific arrhythmia detected. The signal appears to be within normal limits."
 
@@ -222,27 +210,17 @@ def _clinical_explanation(label: str, features: dict, attention_context: str = "
     # -------------------------------------------------------------
     
     # Rate descriptors
-    if hr < 40: rate_desc = "profoundly bradycardic"
-    elif hr < 60: rate_desc = "bradycardic"
-    elif hr < 100: rate_desc = "normal range"
-    elif hr < 150: rate_desc = "tachycardic"
-    else: rate_desc = "severely tachycardic"
+    if hr == 0:
+        rate_desc = "unmeasurable"
+        intro = f"**Clinical Context**: The heart rate is {rate_desc}. Conduction analysis shows {cond_str}."
+    else:
+        if hr < 40: rate_desc = "profoundly bradycardic"
+        elif hr < 60: rate_desc = "bradycardic"
+        elif hr < 100: rate_desc = "normal range"
+        elif hr < 150: rate_desc = "tachycardic"
+        else: rate_desc = "severely tachycardic"
+        intro = f"**Clinical Context**: The rhythm is {rate_desc} ({hr:.0f} bpm) and {rhythm_desc}, with {cond_str}."
     
-    # Rhythm descriptors
-    if cv < 0.08: rhythm_desc = "regular"
-    elif cv < 0.15: rhythm_desc = "mildly irregular"
-    else: rhythm_desc = "irregular"
-    
-    # Conduction descriptors
-    cond_parts = []
-    if pr > 200: cond_parts.append(f"AV delay (PR {pr:.0f}ms)")
-    elif pr < 120 and pr > 10: cond_parts.append("rapid AV conduction")
-    
-    if qrs_mean > 120: cond_parts.append(f"wide QRS ({qrs_mean:.0f}ms)")
-    else: cond_parts.append(f"normal QRS ({qrs_mean:.0f}ms)")
-    
-    cond_str = ", ".join(cond_parts) if cond_parts else "normal conduction"
-
     # Helper function to add attention context
     def enhance(base_text):
         if attention_context:
@@ -252,8 +230,6 @@ def _clinical_explanation(label: str, features: dict, attention_context: str = "
     # -------------------------------------------------------------
     # 3. ARRHYTHMIA-SPECIFIC NARRATIVES
     # -------------------------------------------------------------
-    
-    intro = f"**Clinical Context**: The rhythm is {rate_desc} ({hr:.0f} bpm) and {rhythm_desc}, with {cond_str}."
     
     # Atrial Fibrillation
     if "fibrillation" in text and "atrial" in text:
@@ -354,7 +330,7 @@ def _clinical_explanation(label: str, features: dict, attention_context: str = "
                    f"Rhythm Pattern: Normal → Normal → PAC. "
                    f"Every third beat acts as a premature atrial stimulus. Common in high adrenergic states.")
         return enhance(f"{intro}\n\n{analysis}")
-
+    
     # PACs (general)
     if "pac" in text.lower():
         analysis = (f"**Analysis**: **Premature Atrial Contractions**.\n"
@@ -388,7 +364,7 @@ def _clinical_explanation(label: str, features: dict, attention_context: str = "
         base = f"**Analysis**: **Normal Sinus Rhythm**.\nPhysiological rhythm with normal intervals."
         if hr > 100:
             base += f"\n*Note: Rate is elevated ({hr:.0f} bpm) - consider sinus tachycardia.*"
-        if hr < 50:
+        if hr < 50 and hr > 0:
             base += f"\n*Note: Rate is low ({hr:.0f} bpm) - consider sinus bradycardia.*"
         if pr > 200:
             base += f"\n*Note: PR prolonged ({pr:.0f}ms) - suggests 1st degree AV block.*"
