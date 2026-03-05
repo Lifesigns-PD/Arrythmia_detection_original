@@ -181,8 +181,10 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                 # Primary path: use beat indices for precise pattern detection
                 diffs = np.diff(indices)
                 is_consecutive = all(d == 1 for d in diffs)
+                # Require at least 2 cycles (3 beats) for Bigeminy/Trigeminy as per new UI rules
                 is_bigeminy = len(diffs) >= 2 and all(d == 2 for d in diffs)
                 is_trigeminy = len(diffs) >= 2 and all(d == 3 for d in diffs)
+                is_quadrigeminy = len(diffs) >= 2 and all(d == 4 for d in diffs)
             else:
                 # Fallback path: use TIME intervals when beat_indices are missing
                 # (common with manual cardiologist annotations)
@@ -209,12 +211,14 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                 # Never detect Bigeminy/Trigeminy without beat_indices
                 is_bigeminy = False
                 is_trigeminy = False
+                is_quadrigeminy = False
 
 
-            # Rule 1: Bigeminy/Trigeminy (Interspersed patterns)
-            if is_bigeminy or is_trigeminy:
-
-                pattern_name = "Bigeminy" if is_bigeminy else "Trigeminy"
+            # Rule 1: Bigeminy/Trigeminy/Quadrigeminy (Interspersed patterns)
+            if is_bigeminy or is_trigeminy or is_quadrigeminy:
+                if is_bigeminy: pattern_name = "Bigeminy"
+                elif is_trigeminy: pattern_name = "Trigeminy"
+                else: pattern_name = "Quadrigeminy"
                 priority = 55 # Greater than isolated (10), less than Run (80)
                 
                 new_event = Event(
@@ -250,9 +254,9 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                 )
                 events.append(new_event)
 
-            # Rule 3: Run (exactly 3 consecutive beats)
+            # Rule 3: Triplet (exactly 3 consecutive beats)
             elif is_consecutive and count == 3:
-                event_type = "Ventricular Run" if target_type == "PVC" else "Atrial Run"
+                event_type = "Ventricular Triplet" if target_type == "PVC" else "Atrial Triplet"
                 new_event = Event(
                     event_id=str(uuid.uuid4()),
                     event_type=event_type,
@@ -298,8 +302,8 @@ def apply_display_rules(background_rhythm: str, events: List[Event]) -> List[Eve
 
     # Pass 1: Global Hierarchy & Veto
     has_af = any(e.event_type in ["Atrial Fibrillation", "Atrial Flutter"] for e in events)
-    has_svt = any(e.event_type in ["SVT", "Atrial Run (PSVT)", "Atrial Run", "PSVT"] for e in events)
-    has_vt = any(e.event_type in ["VT", "NSVT", "Ventricular Run"] for e in events)
+    has_svt = any(e.event_type in ["SVT", "Atrial Run (PSVT)", "Atrial Triplet", "PSVT"] for e in events)
+    has_vt = any(e.event_type in ["VT", "NSVT", "Ventricular Triplet"] for e in events)
 
     for event in events:
         should_display = True
@@ -373,12 +377,18 @@ def apply_training_flags(events: List[Event]) -> None:
     and the Rhythm specialist on Runs/Rhythms.
     """
     training_set = {
-        "PAC", "PVC", "PVCs",
-        "PAC Bigeminy", "PAC Trigeminy", "PVC Bigeminy", "PVC Trigeminy",
-        "AF", "Atrial Fibrillation", "Atrial Flutter",
-        "SVT", "Supraventricular Tachycardia", "PSVT", "Atrial Run", "Atrial Couplet",
-        "VT", "Ventricular Tachycardia", "NSVT", "Ventricular Run", "PVC Couplet",
-        "1st Degree AV Block", "2nd Degree AV Block Type 1", "2nd Degree AV Block Type 2", "3rd Degree AV Block"
+        # Atrial
+        "PAC", "PAC Couplet", "Atrial Triplet", "PSVT",
+        "PAC Bigeminy", "PAC Trigeminy", "PAC Quadrigeminy",
+        "AF", "Atrial Fibrillation", "Atrial Flutter", "SVT",
+        
+        # Ventricular
+        "PVC", "PVC Couplet", "Ventricular Triplet", "NSVT",
+        "PVC Bigeminy", "PVC Trigeminy", "PVC Quadrigeminy",
+        "VT", "Ventricular Tachycardia", "Ventricular Fibrillation",
+        
+        # Blocks
+        "1st Degree AV Block", "2nd Degree AV Block Type 1", "3rd Degree AV Block"
     }
     for event in events:
         # Never train on Sinus or Artifact as primary labels to avoid baseline bias

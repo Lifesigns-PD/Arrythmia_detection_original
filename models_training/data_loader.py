@@ -24,6 +24,51 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 # ============================================================
 WINDOW_SEC = 2.0
 
+# ============================================================
+# CLINICAL LABEL TO TENSOR CLASS MAPPING
+# ============================================================
+LABEL_TO_INT = {
+    # CLASS 0: NORMAL
+    "Sinus Rhythm": 0,
+    "Sinus Bradycardia": 0,
+    "Sinus Tachycardia": 0,
+    "Normal": 0,
+
+    # CLASS 1: SUPRAVENTRICULAR / ATRIAL
+    "PAC": 1,
+    "PAC Couplet": 1,
+    "Atrial Triplet": 1,
+    "PSVT": 1,
+    "PAC Bigeminy": 1,
+    "PAC Trigeminy": 1,
+    "PAC Quadrigeminy": 1,
+    "AF": 1,
+    "Atrial Fibrillation": 1,
+    "Atrial Flutter": 1,
+    "SVT": 1,
+
+    # CLASS 2: VENTRICULAR
+    "PVC": 2,
+    "PVC Couplet": 2,
+    "Ventricular Triplet": 2,
+    "NSVT": 2,
+    "PVC Bigeminy": 2,
+    "PVC Trigeminy": 2,
+    "PVC Quadrigeminy": 2,
+    "VT": 2,
+    "Ventricular Tachycardia": 2,
+    "Ventricular Fibrillation": 2,
+
+    # CLASS 3: BLOCKS (Only if your model supports 4 classes)
+    "1st Degree AV Block": 3,
+    "2nd Degree AV Block Type 1": 3,
+    "3rd Degree AV Block": 3
+}
+
+def get_label_integer(label_string):
+    """Translates the specific clinical string from the DB into the ML class."""
+    return LABEL_TO_INT.get(label_string, 0) # Defaults to 0 (Normal) if unknown string sneaks in
+
 def extract_fixed_window(signal, fs, start_s, end_s):
     """
     Extracts a fixed-length window for XAI explanation.
