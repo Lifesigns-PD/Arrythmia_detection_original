@@ -602,6 +602,7 @@
                             <option value="Ventricular Run">Ventricular Run</option>
                             <option value="PVC Bigeminy">Ventricular Bigeminy</option>
                             <option value="PVC Trigeminy">Ventricular Trigeminy</option>
+                            <option value="PVC Quadrigeminy">Ventricular Quadrigeminy</option>
                         </optgroup>
 
                         <optgroup label="--- Common Combinations ---">
@@ -834,6 +835,7 @@
                 }
 
                 redraw();
+                evaluateClinicalRules();
             }
 
             function resizeCanvas() {
@@ -1090,6 +1092,103 @@
                     currentDecision.final_display_events.push(newEvent);
                 });
                 redraw();
+                evaluateClinicalRules();
+            }
+
+            function evaluateClinicalRules() {
+                if (!currentDecision || !currentDecision.final_display_events) return;
+
+                let events = currentDecision.final_display_events;
+
+                // 1. Count the specific beat markers (Case-insensitive)
+                let pvcCount = events.filter(e => e.event_type.toUpperCase().includes("PVC") || e.event_type.toUpperCase().includes("VENTRICULAR")).length;
+                let pacCount = events.filter(e => e.event_type.toUpperCase().includes("PAC") || e.event_type.toUpperCase().includes("ATRIAL")).length;
+
+                let autoLabel = null;
+
+                // 2. Identify Patterns (Sequence-based)
+                // Map events to R-peak indices for pattern detection
+                let pvcIndices = [];
+                let pacIndices = [];
+                events.forEach(e => {
+                    const type = e.event_type.toUpperCase();
+                    const isV = type.includes("PVC") || type.includes("VENTRICULAR");
+                    const isA = type.includes("PAC") || type.includes("ATRIAL");
+                    if (!isV && !isA) return;
+
+                    const center = (e.start_time + e.end_time) / 2 * segmentFs;
+                    let closest = -1;
+                    let minDist = 40;
+                    rPeaks.forEach((p, idx) => {
+                        if (Math.abs(p - center) < minDist) {
+                            minDist = Math.abs(p - center);
+                            closest = idx;
+                        }
+                    });
+                    if (closest !== -1) {
+                        if (isV) pvcIndices.push(closest);
+                        else pacIndices.push(closest);
+                    }
+                });
+
+                let pvcSeq = rPeaks.map((_, i) => pvcIndices.includes(i) ? 'V' : 'N').join('');
+                let pacSeq = rPeaks.map((_, i) => pacIndices.includes(i) ? 'A' : 'N').join('');
+
+                // Check Pattern overrides first
+                if (pvcSeq.includes('VNVN') || pvcSeq.includes('NVNV')) {
+                    autoLabel = "PVC Bigeminy";
+                } else if (pvcSeq.includes('VNNVNN') || pvcSeq.includes('NNVNNV') || pvcSeq.includes('NVNNVN')) {
+                    autoLabel = "PVC Trigeminy";
+                } else if (pvcSeq.includes('VNNNVNNN') || pvcSeq.includes('NVNNNV') || pvcSeq.includes('NNVNNNV')) {
+                    autoLabel = "PVC Quadrigeminy";
+                } else if (pacSeq.includes('ANAN') || pacSeq.includes('NANA')) {
+                    autoLabel = "PAC Bigeminy";
+                }
+
+                // 3. Fallback to Simple Count Rules if no sequence found
+                if (!autoLabel) {
+                    if (pvcCount >= 3) {
+                        autoLabel = "Ventricular Tachycardia";
+                    } else if (pvcCount === 2) {
+                        autoLabel = "PVC Couplet";
+                    } else if (pvcCount === 1) {
+                        autoLabel = "PVC";
+                    }
+                    else if (pacCount >= 3) {
+                        autoLabel = "Supraventricular Tachycardia";
+                    } else if (pacCount === 2) {
+                        autoLabel = "Atrial Couplet";
+                    } else if (pacCount === 1) {
+                        autoLabel = "PAC";
+                    }
+                }
+
+                // 4. Force the Dashboard to update if a rule is triggered!
+                if (autoLabel) {
+                    const aiBadge = document.getElementById("ui-ai-pred");
+                    if (aiBadge) {
+                        aiBadge.innerText = `${autoLabel} (Auto-Rule)`;
+                        aiBadge.style.color = "#ffaa00"; // Highlight orange to show it changed
+                    }
+
+                    const select = document.getElementById("diagnosis-select");
+                    if (select) {
+                        for (let i = 0; i < select.options.length; i++) {
+                            // Check both value and text matches
+                            if (select.options[i].value === autoLabel || select.options[i].text.includes(autoLabel)) {
+                                select.selectedIndex = i;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // Reset to normal if no ectopy found
+                    const aiBadge = document.getElementById("ui-ai-pred");
+                    if (aiBadge && aiBadge.innerText.includes("(Auto-Rule)")) {
+                        aiBadge.innerText = currentDecision.background_rhythm || "Sinus Rhythm";
+                        aiBadge.style.color = "#00ffd0";
+                    }
+                }
             }
 
             // Quick Label Logic
@@ -1121,6 +1220,7 @@
                 // 1. Remove locally
                 if (currentDecision && currentDecision.final_display_events) {
                     currentDecision.final_display_events = currentDecision.final_display_events.filter(e => e.event_id !== rightClickedEventId);
+                    evaluateClinicalRules();
                     redraw();
                 }
 
@@ -1269,7 +1369,14 @@
                     setTimeout(() => toast.remove(), 3000);
 
                     // Drop local markers too
-                    if (currentDecision) currentDecision.final_display_events = [];
+                    if (currentDecision) {
+                        currentDecision.final_display_events = [];
+                        const aiBadge = document.getElementById("ui-ai-pred");
+                        if (aiBadge) {
+                            aiBadge.innerText = "Analyzing...";
+                            aiBadge.style.color = "#00ffd0";
+                        }
+                    }
 
                     // Reset Sidebar
                     const badge = document.getElementById(`status-badge-${currentSegment}`);
@@ -1279,6 +1386,7 @@
 
                     document.getElementById("header-verified-icon").style.display = 'none';
 
+                    evaluateClinicalRules();
                     redraw();
                 } else {
                     alert("Failed to clear annotations.");
