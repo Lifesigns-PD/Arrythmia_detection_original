@@ -1164,31 +1164,24 @@
                     autoLabel = (vPriority >= aPriority) ? vLabel : aLabel;
                 }
 
-                // 6. APPLY TO UI CAREFULLY
+                // 6. APPLY TO UI CAREFULLY (No Dropdown Hijacking!)
                 const aiBadge = document.getElementById("ui-ai-pred");
                 if (autoLabel) {
-                    // If it's a Locked Rhythm (AFib), show Ectopy in the Badge, but DO NOT change the dropdown!
+                    // Let the AI Badge show the full complex clinical deduction
                     if (isLockedRhythm) {
                         if (aiBadge) {
-                            aiBadge.innerText = `${currentRhythm} + ${autoLabel}`;
-                            aiBadge.style.color = "#ffaa00";
+                            aiBadge.innerText = `AI Deduction: ${currentRhythm} + ${autoLabel}`;
+                            aiBadge.style.color = "#00ff99"; // Neon Green for positive rule match
                         }
-                    }
-                    // If it's a Normal rhythm, allow the Auto-Rule to change the primary dropdown
-                    else {
+                    } else {
                         if (aiBadge) {
-                            aiBadge.innerText = `${autoLabel} (Auto-Rule)`;
-                            aiBadge.style.color = "#ffaa00";
-                        }
-                        if (rhythmSelect) {
-                            for (let i = 0; i < rhythmSelect.options.length; i++) {
-                                if (rhythmSelect.options[i].text.includes(autoLabel) || rhythmSelect.options[i].value.includes(autoLabel)) {
-                                    rhythmSelect.selectedIndex = i;
-                                    break;
-                                }
-                            }
+                            aiBadge.innerText = `AI Deduction: ${autoLabel} (Rule Engine Override)`;
+                            aiBadge.style.color = "#00ff99";
                         }
                     }
+
+                    // --> WE DELETED THE CODE THAT CHANGES THE DROPDOWN HERE <--
+                    // The dropdown remains untouched so the doctor has total control.
                 } else {
                     // Reset to normal if no automatic trigger found
                     if (aiBadge && aiBadge.innerText.includes("(Auto-Rule)")) {
@@ -1375,15 +1368,13 @@
                     document.body.appendChild(toast);
                     setTimeout(() => toast.remove(), 3000);
 
-                    // Drop local markers too
+                    // Clear local arrays
                     if (currentDecision) {
                         currentDecision.final_display_events = [];
-                        const aiBadge = document.getElementById("ui-ai-pred");
-                        if (aiBadge) {
-                            aiBadge.innerText = "Analyzing...";
-                            aiBadge.style.color = "#00ffd0";
-                        }
                     }
+
+                    // Force the dashboard to fetch the original, uncorrupted SQL data
+                    await loadSegment(currentSegment);
 
                     // Reset Sidebar
                     const badge = document.getElementById(`status-badge-${currentSegment}`);

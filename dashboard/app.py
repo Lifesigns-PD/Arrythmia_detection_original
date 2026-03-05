@@ -25,7 +25,7 @@ import psycopg2
 import subprocess
 
 # XAI – Option A (clinical text + model prediction)
-from xai import explain_segment, explain_decision, reset_model
+from xai import explain_segment, explain_decision, reset_model, generate_detailed_ledger
 from decision_engine.rhythm_orchestrator import RhythmOrchestrator
 from decision_engine.models import SegmentDecision
 from models_training.data_loader import CLASS_NAMES, RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES
@@ -739,6 +739,11 @@ def get_segment_api(segment_id: int):
         "imported_label": meta.get("dataset_source") or "Unknown"
     }
 
+    # Extract events for dynamic detailed ledger
+    events_json = meta.get("events_json") or {}
+    raw_events = events_json.get("events", []) if isinstance(events_json, dict) else (events_json if isinstance(events_json, list) else [])
+    ledger_text = generate_detailed_ledger(labels["ai_prediction"], raw_events)
+
     return jsonify(
         {
             "segment_id": segment_id,
@@ -752,7 +757,8 @@ def get_segment_api(segment_id: int):
             "r_peaks": r_peaks_for_frontend,
             "notes": meta.get("cardiologist_notes") or "",
             "corrected_by": meta.get("corrected_by"),
-            "corrected_at": meta.get("corrected_at")
+            "corrected_at": meta.get("corrected_at"),
+            "xai_explanation": ledger_text
         }
     )
 
