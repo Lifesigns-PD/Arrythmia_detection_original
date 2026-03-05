@@ -594,12 +594,14 @@
                         <optgroup label="--- Ectopy Patterns ---">
                             <option value="PAC">PAC (Single Atrial Ectopy)</option>
                             <option value="Atrial Couplet">Atrial Couplet</option>
-                            <option value="Atrial Run">Atrial Run</option>
+                            <option value="Atrial Triplet">Atrial Triplet</option>
                             <option value="PAC Bigeminy">PAC Bigeminy</option>
+                            <option value="PAC Trigeminy">PAC Trigeminy</option>
+                            <option value="PAC Quadrigeminy">PAC Quadrigeminy</option>
                             <hr>
                             <option value="PVC">PVC (Single Ventricular Ectopy)</option>
                             <option value="PVC Couplet">Ventricular Couplet</option>
-                            <option value="Ventricular Run">Ventricular Run</option>
+                            <option value="Ventricular Triplet">Ventricular Triplet</option>
                             <option value="PVC Bigeminy">Ventricular Bigeminy</option>
                             <option value="PVC Trigeminy">Ventricular Trigeminy</option>
                             <option value="PVC Quadrigeminy">Ventricular Quadrigeminy</option>
@@ -1098,32 +1100,28 @@
             function evaluateClinicalRules() {
                 if (!currentDecision || !currentDecision.final_display_events) return;
 
-                let events = currentDecision.final_display_events;
+                // 1. GET CURRENT BACKGROUND RHYTHM (To prevent Erasure Bug)
+                const rhythmSelect = document.getElementById("diagnosis-select");
+                let currentRhythm = rhythmSelect ? rhythmSelect.options[rhythmSelect.selectedIndex].text : "";
 
-                // 1. Count the specific beat markers (Case-insensitive)
-                let pvcCount = events.filter(e => e.event_type.toUpperCase().includes("PVC") || e.event_type.toUpperCase().includes("VENTRICULAR")).length;
-                let pacCount = events.filter(e => e.event_type.toUpperCase().includes("PAC") || e.event_type.toUpperCase().includes("ATRIAL")).length;
+                // Define "Locked" Tier-1 Rhythms that should NEVER be overwritten by simple ectopy
+                const isLockedRhythm = currentRhythm.includes("Fibrillation") ||
+                    currentRhythm.includes("Flutter") ||
+                    currentRhythm.includes("Block");
 
-                let autoLabel = null;
-
-                // 2. Identify Patterns (Sequence-based)
-                // Map events to R-peak indices for pattern detection
+                // 2. BUILD THE SEQUENCE (Using R-peaks for absolute precision)
                 let pvcIndices = [];
                 let pacIndices = [];
-                events.forEach(e => {
+                currentDecision.final_display_events.forEach(e => {
                     const type = e.event_type.toUpperCase();
                     const isV = type.includes("PVC") || type.includes("VENTRICULAR");
                     const isA = type.includes("PAC") || type.includes("ATRIAL");
                     if (!isV && !isA) return;
 
                     const center = (e.start_time + e.end_time) / 2 * segmentFs;
-                    let closest = -1;
-                    let minDist = 40;
+                    let closest = -1; let minDist = 40;
                     rPeaks.forEach((p, idx) => {
-                        if (Math.abs(p - center) < minDist) {
-                            minDist = Math.abs(p - center);
-                            closest = idx;
-                        }
+                        if (Math.abs(p - center) < minDist) { minDist = Math.abs(p - center); closest = idx; }
                     });
                     if (closest !== -1) {
                         if (isV) pvcIndices.push(closest);
@@ -1131,59 +1129,68 @@
                     }
                 });
 
-                let pvcSeq = rPeaks.map((_, i) => pvcIndices.includes(i) ? 'V' : 'N').join('');
-                let pacSeq = rPeaks.map((_, i) => pacIndices.includes(i) ? 'A' : 'N').join('');
+                let seq = rPeaks.map((_, i) => {
+                    if (pvcIndices.includes(i)) return 'V';
+                    if (pacIndices.includes(i)) return 'A';
+                    return 'N';
+                }).join('');
 
-                // Check Pattern overrides first
-                if (pvcSeq.includes('VNVN') || pvcSeq.includes('NVNV')) {
-                    autoLabel = "PVC Bigeminy";
-                } else if (pvcSeq.includes('VNNVNN') || pvcSeq.includes('NNVNNV') || pvcSeq.includes('NVNNVN')) {
-                    autoLabel = "PVC Trigeminy";
-                } else if (pvcSeq.includes('VNNNVNNN') || pvcSeq.includes('NVNNNV') || pvcSeq.includes('NNVNNNV')) {
-                    autoLabel = "PVC Quadrigeminy";
-                } else if (pacSeq.includes('ANAN') || pacSeq.includes('NANA')) {
-                    autoLabel = "PAC Bigeminy";
+                let vLabel = null, vPriority = 0;
+                let aLabel = null, aPriority = 0;
+
+                // 3. VENTRICULAR RULES
+                if (seq.includes('VVVV')) { vLabel = "NSVT"; vPriority = 100; }
+                else if (seq.includes('VVV')) { vLabel = "Ventricular Triplet"; vPriority = 80; }
+                else if (seq.includes('VNVNVN') || seq.includes('NVNVNV')) { vLabel = "PVC Bigeminy"; vPriority = 70; }
+                else if (seq.includes('VNNVNN') || seq.includes('NNVNNV') || seq.includes('NVNNVN')) { vLabel = "PVC Trigeminy"; vPriority = 60; }
+                else if (seq.includes('VNNNVNNN') || seq.includes('NNNVNNNV') || seq.includes('NVNNNVNN') || seq.includes('NNVNNNVN')) { vLabel = "PVC Quadrigeminy"; vPriority = 50; }
+                else if (seq.includes('VV')) { vLabel = "PVC Couplet"; vPriority = 40; }
+                else if (seq.includes('V')) { vLabel = "PVC"; vPriority = 20; }
+
+                // 4. ATRIAL RULES (Disable Atrial Rules if patient is in AFib/Flutter)
+                if (!currentRhythm.includes("Fibrillation") && !currentRhythm.includes("Flutter")) {
+                    if (seq.includes('AAAA')) { aLabel = "PSVT"; aPriority = 90; }
+                    else if (seq.includes('AAA')) { aLabel = "Atrial Triplet"; aPriority = 75; }
+                    else if (seq.includes('ANANAN') || seq.includes('NANANA')) { aLabel = "PAC Bigeminy"; aPriority = 65; }
+                    else if (seq.includes('ANNANN') || seq.includes('NNANNA') || seq.includes('NANNAN')) { aLabel = "PAC Trigeminy"; aPriority = 55; }
+                    else if (seq.includes('ANNNANNN') || seq.includes('NNNANNN') || seq.includes('NANNNANN') || seq.includes('NNANNNAN')) { aLabel = "PAC Quadrigeminy"; aPriority = 45; }
+                    else if (seq.includes('AA')) { aLabel = "PAC Couplet"; aPriority = 35; }
+                    else if (seq.includes('A')) { aLabel = "PAC"; aPriority = 10; }
                 }
 
-                // 3. Fallback to Simple Count Rules if no sequence found
-                if (!autoLabel) {
-                    if (pvcCount >= 3) {
-                        autoLabel = "Ventricular Tachycardia";
-                    } else if (pvcCount === 2) {
-                        autoLabel = "PVC Couplet";
-                    } else if (pvcCount === 1) {
-                        autoLabel = "PVC";
-                    }
-                    else if (pacCount >= 3) {
-                        autoLabel = "Supraventricular Tachycardia";
-                    } else if (pacCount === 2) {
-                        autoLabel = "Atrial Couplet";
-                    } else if (pacCount === 1) {
-                        autoLabel = "PAC";
-                    }
+                // 5. DETERMINE THE WINNER
+                let autoLabel = null;
+                if (vPriority > 0 || aPriority > 0) {
+                    autoLabel = (vPriority >= aPriority) ? vLabel : aLabel;
                 }
 
-                // 4. Force the Dashboard to update if a rule is triggered!
+                // 6. APPLY TO UI CAREFULLY
+                const aiBadge = document.getElementById("ui-ai-pred");
                 if (autoLabel) {
-                    const aiBadge = document.getElementById("ui-ai-pred");
-                    if (aiBadge) {
-                        aiBadge.innerText = `${autoLabel} (Auto-Rule)`;
-                        aiBadge.style.color = "#ffaa00"; // Highlight orange to show it changed
+                    // If it's a Locked Rhythm (AFib), show Ectopy in the Badge, but DO NOT change the dropdown!
+                    if (isLockedRhythm) {
+                        if (aiBadge) {
+                            aiBadge.innerText = `${currentRhythm} + ${autoLabel}`;
+                            aiBadge.style.color = "#ffaa00";
+                        }
                     }
-
-                    const select = document.getElementById("diagnosis-select");
-                    if (select) {
-                        for (let i = 0; i < select.options.length; i++) {
-                            // Check both value and text matches
-                            if (select.options[i].value === autoLabel || select.options[i].text.includes(autoLabel)) {
-                                select.selectedIndex = i;
-                                break;
+                    // If it's a Normal rhythm, allow the Auto-Rule to change the primary dropdown
+                    else {
+                        if (aiBadge) {
+                            aiBadge.innerText = `${autoLabel} (Auto-Rule)`;
+                            aiBadge.style.color = "#ffaa00";
+                        }
+                        if (rhythmSelect) {
+                            for (let i = 0; i < rhythmSelect.options.length; i++) {
+                                if (rhythmSelect.options[i].text.includes(autoLabel) || rhythmSelect.options[i].value.includes(autoLabel)) {
+                                    rhythmSelect.selectedIndex = i;
+                                    break;
+                                }
                             }
                         }
                     }
                 } else {
-                    // Reset to normal if no ectopy found
-                    const aiBadge = document.getElementById("ui-ai-pred");
+                    // Reset to normal if no automatic trigger found
                     if (aiBadge && aiBadge.innerText.includes("(Auto-Rule)")) {
                         aiBadge.innerText = currentDecision.background_rhythm || "Sinus Rhythm";
                         aiBadge.style.color = "#00ffd0";
