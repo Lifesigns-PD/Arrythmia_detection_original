@@ -5,7 +5,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-INPUT = Path("data/mitdb_data")
+INPUT = Path("../raw_data/mitdb")
 OUTPUT = Path("data/converted_ecg")
 OUTPUT.mkdir(parents=True, exist_ok=True)
 

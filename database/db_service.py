@@ -440,17 +440,33 @@ def update_segment_status(segment_id: int, background_rhythm: str = 'Unlabeled',
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            events_json_str = json.dumps(events) if events is not None else '[]'
+            if events is not None:
+                # If events are provided (from the UI), we overwrite the current JSON
+                events_json_str = json.dumps({"events": events, "final_display_events": events})
+                cur.execute("""
+                    UPDATE ecg_features_annotatable 
+                    SET arrhythmia_label = %s,
+                        cardiologist_notes = %s,
+                        events_json = %s,
+                        is_corrected = TRUE,
+                        used_for_training = TRUE,
+                        corrected_at = CURRENT_TIMESTAMP
+                    WHERE segment_id = %s
+                """, (background_rhythm, notes, events_json_str, segment_id))
+            else:
+                # If events is None, we preserve the existing events_json
+                cur.execute("""
+                    UPDATE ecg_features_annotatable 
+                    SET arrhythmia_label = %s,
+                        cardiologist_notes = %s,
+                        is_corrected = TRUE,
+                        used_for_training = TRUE,
+                        corrected_at = CURRENT_TIMESTAMP
+                    WHERE segment_id = %s
+                """, (background_rhythm, notes, segment_id))
             
-            cur.execute("""
-                UPDATE ecg_features_annotatable 
-                SET arrhythmia_label = %s,
-                    cardiologist_notes = %s,
-                    is_corrected = TRUE,
-                    used_for_training = TRUE,
-                    corrected_at = CURRENT_TIMESTAMP
-                WHERE segment_id = %s
-            """, (background_rhythm, notes, segment_id))
+        conn.commit()
+        return True
             
         conn.commit()
         return True

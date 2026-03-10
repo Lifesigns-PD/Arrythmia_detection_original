@@ -8,17 +8,18 @@ from typing import List, Dict, Any, Tuple
 import warnings
 from pathlib import Path
 import sys
+import uuid
 
 # Suppress harmless scipy warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 
 # --- Configuration Constants ---
 TARGET_FS = 250  # Target sampling rate in Hz
-SEGMENT_DURATION_S = 5.0  # Length of each segment in seconds
-SEGMENT_LENGTH = int(TARGET_FS * SEGMENT_DURATION_S)
+SEGMENT_DURATION_S = 10.0  # Length of each segment in seconds (Refactored from 5s)
+SEGMENT_LENGTH = int(TARGET_FS * SEGMENT_DURATION_S) # Exactly 2500 samples
 HRV_INTERP_FS = 4.0 # Resampling rate for RR intervals for PSD calculation (standard is 4 Hz)
 # Define the root directory where your JSON files are located
-DATA_ROOT_DIR = "." 
+DATA_ROOT_DIR = "data/converted_ecg" 
 
 PSQL_CONN_PARAMS = {
     "dbname": "ecg_analysis",
@@ -37,7 +38,7 @@ class ECGProcessor:
     def __init__(self, target_fs: int = TARGET_FS):
         self.target_fs = target_fs
 
-    def _load_data_from_json(self, file_path: str) -> Tuple[np.ndarray, int]:
+    def _load_data_from_json(self, file_path: str) -> Tuple[np.ndarray, int, str]:
         """Loads ECG data from the JSON file, accommodating heterogeneous structures."""
         file_path_obj = Path(file_path)
         filename = file_path_obj.name
@@ -48,11 +49,13 @@ class ECGProcessor:
         signal = None
         original_fs = 250 # Default
 
-        # Structure 1 & 3: Nested under "SensorData" (PTB-XL/Wearable)
+        # Enforce Lead I extraction: Assume first channel is Lead I for PTB-XL and MITDB
         if isinstance(data.get("SensorData"), list) and data["SensorData"]:
             signal_data = data["SensorData"][0]
-            if "ECG_CH_A" in signal_data:
-                signal = np.array(signal_data["ECG_CH_A"], dtype=float)
+            # Use the first available key as Lead I fallback
+            keys = list(signal_data.keys())
+            if keys:
+                signal = np.array(signal_data[keys[0]], dtype=float)
             
             if "PTB-XL" in file_path or "00001_hr.json" in filename:
                 original_fs = 360
@@ -60,14 +63,23 @@ class ECGProcessor:
                 original_fs = 1000
 
         # Structure 2: Directly under the root (MIT-BIH style)
-        elif "ECG_CH_A" in data:
-            signal = np.array(data["ECG_CH_A"], dtype=float)
+        elif isinstance(data, dict):
+            # Check for common Lead I keys or just take the first list found
+            lead_keys = ["ECG_CH_A", "MLII", "LEAD I", "Lead I"]
+            for k in lead_keys:
+                if k in data:
+                    signal = np.array(data[k], dtype=float)
+                    break
+            
+            if signal is None:
+                # Fallback: find the first list of numbers
+                for k, v in data.items():
+                    if isinstance(v, list) and len(v) > 0 and isinstance(v[0], (int, float)):
+                        signal = np.array(v, dtype=float)
+                        break
+
             if "MIT-BIH" in file_path or "104.json" in filename:
                  original_fs = 360 
-        
-        # Fallback for other files
-        elif 'ECG_CH_B' in data: 
-             signal = np.array(data["ECG_CH_B"], dtype=float)
 
         if signal is None:
             raise ValueError(f"Could not find valid ECG data channel in {filename}")
@@ -77,7 +89,8 @@ class ECGProcessor:
             print(f"Normalizing raw signal data for {filename}.")
             signal = (signal - np.min(signal)) / (np.max(signal) - np.min(signal))
 
-        return signal, original_fs
+        label = data.get("label", "Sinus Rhythm") # From wfdb_to_json segments
+        return signal, original_fs, label
 
 
     def _preprocess(self, signal: np.ndarray, original_fs: int) -> np.ndarray:
@@ -154,7 +167,14 @@ class ECGProcessor:
             return hrv_freq
 
         # 3. Calculate Power Spectral Density (PSD) using Welch's method
-        fxx, pxx = welch(rr_interp, fs=HRV_INTERP_FS, window='hann', nperseg=256, noverlap=128)
+        n_samples = len(rr_interp)
+        if n_samples < 2:
+            return hrv_freq
+            
+        nperseg = min(n_samples, 256)
+        noverlap = nperseg // 2
+        
+        fxx, pxx = welch(rr_interp, fs=HRV_INTERP_FS, window='hann', nperseg=nperseg, noverlap=noverlap)
         
         # 4. Integrate Power in Standard Bands
         vlf_band = (0.0, 0.04)
@@ -163,7 +183,12 @@ class ECGProcessor:
         
         def band_power(f, p, band):
             idx = np.logical_and(f >= band[0], f < band[1])
-            return np.trapz(p[idx], f[idx])
+            if len(f[idx]) < 2: return 0.0
+            # Support both old and new NumPy
+            try:
+                return np.trapz(p[idx], f[idx])
+            except AttributeError:
+                return np.trapezoid(p[idx], f[idx])
 
         vlf_power = band_power(fxx, pxx, vlf_band)
         lf_power = band_power(fxx, pxx, lf_band)
@@ -325,7 +350,9 @@ class ECGProcessor:
                     segment_index INT NOT NULL,
                     segment_start_s FLOAT NOT NULL,
                     segment_duration_s FLOAT NOT NULL,
-                    arrhythmia_label VARCHAR(50) DEFAULT NULL,
+                    signal_data REAL[], -- The 2500 sample array
+                    raw_signal JSONB,   -- For dashboard UI
+                    arrhythmia_label VARCHAR(255) DEFAULT NULL,
                     r_peaks_in_segment TEXT, -- Segment-relative R-peak indices
                     features_json JSONB
                 );
@@ -340,8 +367,8 @@ class ECGProcessor:
         print(f"\n--- Processing Record: {filename} ({file_path_obj.parent.name}) ---")
         
         try:
-            raw_signal, original_fs = self._load_data_from_json(file_path)
-            processed_signal = self._preprocess(raw_signal, original_fs)
+            raw_signal_all, original_fs, record_label = self._load_data_from_json(file_path)
+            processed_signal = self._preprocess(raw_signal_all, original_fs)
             r_peaks_all = self._r_peak_detection(processed_signal, self.target_fs)
         except ValueError as e:
             print(f"Skipping {filename}: Data format error ({e})")
@@ -359,6 +386,11 @@ class ECGProcessor:
             return
 
         # Segment and Extract Features
+        # Safety Guard: Ensure signal is at least SEGMENT_LENGTH
+        if len(processed_signal) < SEGMENT_LENGTH:
+            print(f"Padding short signal: {len(processed_signal)} -> {SEGMENT_LENGTH}")
+            processed_signal = np.pad(processed_signal, (0, SEGMENT_LENGTH - len(processed_signal)))
+            
         num_segments = len(processed_signal) // SEGMENT_LENGTH
         print(f"Detected {len(processed_signal)} samples. Creating {num_segments} segments.")
         
@@ -382,19 +414,34 @@ class ECGProcessor:
                 r_peaks_str = ",".join(map(str, segment_r_peaks_relative))
                 segment_start_s = start_sample / self.target_fs
                 
+                # Create an initial 'imported' rhythm event so the training dataloader can find it
+                initial_event = {
+                    "event_id": f"imp_{uuid.uuid4().hex[:8]}",
+                    "event_type": record_label,
+                    "event_category": "RHYTHM",
+                    "start_time": 0.0,
+                    "end_time": SEGMENT_DURATION_S,
+                    "annotation_source": "imported"
+                }
+                events_json_dict = {"events": [initial_event]}
+
                 try:
                     cur.execute("""
                         INSERT INTO ecg_features_annotatable 
-                        (filename, segment_index, segment_start_s, segment_duration_s, r_peaks_in_segment, features_json)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        (filename, segment_index, segment_start_s, segment_duration_s, signal_data, raw_signal, arrhythmia_label, r_peaks_in_segment, features_json, events_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (filename, segment_index) DO NOTHING
                     """, (
                         filename,
                         i,
                         segment_start_s,
                         SEGMENT_DURATION_S,
+                        segment.tolist(),            # REAL[]
+                        json.dumps(segment.tolist()), # JSONB for frontend
+                        record_label,
                         r_peaks_str,
-                        json.dumps(sanitized_features) # Using sanitized features
+                        json.dumps(sanitized_features),
+                        json.dumps(events_json_dict)
                     ))
                     segments_processed += 1
                 except psycopg2.Error as db_err:

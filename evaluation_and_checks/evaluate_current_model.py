@@ -45,7 +45,7 @@ def evaluate():
     loader = DataLoader(dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
 
     # 3. Load Model
-    ckpt_path = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model.pth"
+    ckpt_path = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm.pth"
     if not ckpt_path.exists():
         print(f"Error: Checkpoint not found at {ckpt_path}")
         return

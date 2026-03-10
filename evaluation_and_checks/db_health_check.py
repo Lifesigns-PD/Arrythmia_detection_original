@@ -82,13 +82,13 @@ pending = cur.fetchone()[0]
 check(f"Pending segments (ready to annotate)", True, f"{pending} segments awaiting annotation")
 
 # 5b. Signal array length integrity
-print("\n[5b] SIGNAL LENGTH INTEGRITY (expected: 1250 samples @ 125 Hz)")
+print("\n[5b] SIGNAL LENGTH INTEGRITY (expected: 2500 samples @ 250 Hz)")
 cur.execute("""
     SELECT COUNT(*) FROM ecg_features_annotatable
-    WHERE signal_data IS NOT NULL AND array_length(signal_data, 1) != 1250
+    WHERE signal_data IS NOT NULL AND array_length(signal_data, 1) != 2500
 """)
 bad_count = cur.fetchone()[0]
-check("All signal_data arrays are 1250 samples", bad_count == 0,
+check("All signal_data arrays are 2500 samples", bad_count == 0,
       f"{bad_count} segments with wrong length" if bad_count else "all correct")
 
 if bad_count > 0:
@@ -96,7 +96,7 @@ if bad_count > 0:
     cur.execute("""
         SELECT array_length(signal_data, 1), COUNT(*)
         FROM ecg_features_annotatable
-        WHERE signal_data IS NOT NULL AND array_length(signal_data, 1) != 1250
+        WHERE signal_data IS NOT NULL AND array_length(signal_data, 1) != 2500
         GROUP BY array_length(signal_data, 1)
         ORDER BY COUNT(*) DESC LIMIT 5
     """)

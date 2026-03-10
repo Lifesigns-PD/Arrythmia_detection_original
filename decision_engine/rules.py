@@ -294,12 +294,15 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
 # =============================================================================
 
 def apply_display_rules(background_rhythm: str, events: List[Event]) -> List[Event]:
-    # 1. DETECT VETO: Check if doctor marked Sinus Rhythm
-    has_manual_sinus = any(
-        e.event_type == "Sinus Rhythm" and getattr(e, "annotation_source", "") == "cardiologist"
-        for e in events
-    )
+    # # DEBUG MODE: Show all AI events for transition.
+    # # We temporarily disable the veto logic so the user can audit model performance.
+    # has_manual_sinus = any(
+    #     e.event_type == "Sinus Rhythm" and getattr(e, "annotation_source", "") == "cardiologist"
+    #     for e in events
+    # )
 
+    has_manual_sinus = False # FORCE DISABLE VETO
+    
     # Pass 1: Global Hierarchy & Veto
     has_af = any(e.event_type in ["Atrial Fibrillation", "Atrial Flutter"] for e in events)
     has_svt = any(e.event_type in ["SVT", "Atrial Run (PSVT)", "Atrial Triplet", "PSVT"] for e in events)
@@ -309,14 +312,21 @@ def apply_display_rules(background_rhythm: str, events: List[Event]) -> List[Eve
         should_display = True
         suppression_reason = None
         
-        # 2. APPLY VETO: Hide AI Rhythms if doctor said Sinus
+        # AI Visibility: Never hide AI events during this validation phase
         is_ai_event = getattr(event, "annotation_source", "ai") != "cardiologist"
-        if has_manual_sinus and is_ai_event and event.event_category == EventCategory.RHYTHM:
-             should_display = False
-             suppression_reason = "Cardiologist Veto (Sinus)"
+        
+        if is_ai_event:
+            should_display = True # Force display for AI auditing
+            event.display_state = DisplayState.DISPLAYED
+            continue
+
+        # 2. APPLY VETO (Disabled)
+        # if has_manual_sinus and is_ai_event and event.event_category == EventCategory.RHYTHM:
+        #      should_display = False
+        #      suppression_reason = "Cardiologist Veto (Sinus)"
 
         # Rule A: Life-Threatening
-        elif event.priority >= 95:
+        if event.priority >= 95:
              should_display = True
             
         # Rule B: AF Dominance (Show AF as background, allow Ectopy on top)

@@ -10,10 +10,10 @@ from tqdm import tqdm
 # Configuration
 DATA_DIR = r"C:\Users\admin\Documents\porject\Project_Submission_Clean\raw_data\mitdb"
 FS_ORIGINAL = 360
-FS_TARGET = 125
+FS_TARGET = 250
 SEGMENT_SECONDS = 10
-TARGET_LENGTH = SEGMENT_SECONDS * FS_TARGET
-ORIGINAL_LENGTH = SEGMENT_SECONDS * FS_ORIGINAL
+TARGET_LENGTH = SEGMENT_SECONDS * FS_TARGET  # 2500
+ORIGINAL_LENGTH = SEGMENT_SECONDS * FS_ORIGINAL # 3600
 
 def connect_db():
     return psycopg2.connect(
@@ -50,8 +50,8 @@ def main():
     INSERT_SQL = """
         INSERT INTO ecg_features_annotatable (
             dataset_source, filename, segment_index, signal_data, raw_signal, 
-            features_json, arrhythmia_label, segment_fs
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            features_json, arrhythmia_label, segment_fs, events_json
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (filename, segment_index) DO NOTHING;
     """
 
@@ -81,8 +81,8 @@ def main():
                 # 1. Slice original 360Hz signal
                 segment_360 = signal[start_idx:end_idx]
                 
-                # 2. Resample to 125 Hz (1,250 points)
-                segment_125 = resample(segment_360, TARGET_LENGTH)
+                # 2. Resample to 250 Hz (2,500 points)
+                segment_250 = resample(segment_360, TARGET_LENGTH)
                 
                 # 3. Find annotations that fall into this specific 10-second window
                 ann_indices = np.where((annotation.sample >= start_idx) & (annotation.sample < end_idx))[0]
@@ -92,28 +92,68 @@ def main():
                 
                 # 4. Extract R-peaks for the UI dashboard
                 try:
-                    _, info = nk.ecg_peaks(segment_125, sampling_rate=FS_TARGET)
+                    _, info = nk.ecg_peaks(segment_250, sampling_rate=FS_TARGET)
                     r_peaks = info["ECG_R_Peaks"].tolist()
                 except:
                     r_peaks = []
                     
                 features_dict = {"r_peaks": r_peaks}
                 
-                # 5. Insert to DB
+                # 5. Create basic events_json for training
+                import uuid
+                events_list = []
+                
+                # A. Global Rhythm Event
+                events_list.append({
+                    "event_id": f"mit_r_{uuid.uuid4().hex[:8]}",
+                    "event_type": label,
+                    "event_category": "RHYTHM",
+                    "start_time": 0.0,
+                    "end_time": float(SEGMENT_SECONDS),
+                    "annotation_source": "imported"
+                })
+
+                # B. Per-beat ECTOPY Events
+                for i in ann_indices:
+                    sym = annotation.symbol[i]
+                    samp = annotation.sample[i]
+                    # Calculate time relative to segment start
+                    rel_time = (samp - start_idx) / FS_ORIGINAL
+                    
+                    # Map MIT symbols to our standard clinical strings
+                    e_type = None
+                    if sym == 'V': e_type = "PVC"
+                    elif sym in ['A', 'a', 'S', 'J']: e_type = "PAC"
+                    elif sym == 'E': e_type = "PVC" # Junctional escape or similar - map to PVC for simplicity
+                    
+                    if e_type:
+                        events_list.append({
+                            "event_id": f"mit_e_{uuid.uuid4().hex[:8]}",
+                            "event_type": e_type,
+                            "event_category": "ECTOPY",
+                            "start_time": float(max(0, rel_time - 0.1)), # 0.2s duration window
+                            "end_time": float(rel_time + 0.1),
+                            "annotation_source": "imported"
+                        })
+
+                events_json_dict = {"events": events_list}
+
+                # 6. Insert to DB
                 filename = f"mitdb_{record_name}"
-                signal_list = segment_125.tolist()
+                signal_list = segment_250.tolist()
                 
                 cur.execute(
                     INSERT_SQL,
                     (
                         "mitdb",
                         filename,
-                        seg_idx,                 # Now this tracks which 10s chunk it is (0 to 179)
-                        signal_list,             # Native array
-                        json.dumps(signal_list), # JSON for UI
+                        seg_idx,
+                        signal_list,             # REAL[]
+                        json.dumps(signal_list), # JSONB
                         json.dumps(features_dict),
                         label,
-                        FS_TARGET
+                        FS_TARGET,
+                        json.dumps(events_json_dict)
                     )
                 )
                 success_count += 1
@@ -121,7 +161,7 @@ def main():
         except Exception as e:
             print(f"Error processing record {record_name}: {e}")
 
-    print(f"✅ Finished! Successfully extracted and loaded {success_count} MIT-BIH segments into the database.")
+    print(f"Finished! Successfully extracted and loaded {success_count} MIT-BIH segments into the database.")
     cur.close()
     conn.close()
 

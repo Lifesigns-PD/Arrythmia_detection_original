@@ -6,7 +6,7 @@ from pathlib import Path
 # Add global to allow unpickling if needed
 # torch.serialization.add_safe_globals([np._core.multiarray.scalar])
 
-ckpt_path = Path(r"c:\Users\Lifesigns_LS\Documents\porject\Arrythmia-project-retrain-1\models_training\outputs\checkpoints\best_model_rhythm.pth")
+ckpt_path = Path(__file__).resolve().parent / "outputs" / "checkpoints" / "best_model_rhythm.pth"
 if ckpt_path.exists():
     try:
         # Using weights_only=False because the metadata in the checkpoint needs it

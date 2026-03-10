@@ -55,7 +55,7 @@ class CNNTransformerClassifier(nn.Module):
        
     This hybrid approach ensures both shape (Morphology) and rhythm (Time) are learned.
     """
-    TARGET_LEN = 500 # Event-based length (2 seconds at 250Hz)
+    TARGET_LEN = 2500 # Refactored: 10 seconds at 250Hz
     
     def __init__(self, num_classes=7, cnn_channels=[32, 64, 128],
                  nhead=8, num_layers=2, dim_feedforward=256):

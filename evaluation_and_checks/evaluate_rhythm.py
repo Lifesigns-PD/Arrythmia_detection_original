@@ -9,8 +9,9 @@ import os
 from pathlib import Path
 
 # Add project root to sys.path
-sys.path.append(os.getcwd())
-sys.path.append(os.path.join(os.getcwd(), "models_training"))
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.append(str(BASE_DIR))
+sys.path.append(str(BASE_DIR / "models_training"))
 
 from models_training.data_loader import RHYTHM_CLASS_NAMES, ECGRawDatasetSQL, collate_fn
 from models_training.models import CNNTransformerClassifier
@@ -98,7 +99,7 @@ if __name__ == "__main__":
         ckpt = sys.argv[1]
     else:
         # Default to latest rhythm checkpoint
-        ckpt = "outputs/checkpoints/best_model_rhythm.pth"
+        ckpt = str(BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm.pth")
     
     if os.path.exists(ckpt):
         evaluate_rhythm(ckpt)

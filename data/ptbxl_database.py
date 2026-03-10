@@ -11,8 +11,8 @@ from tqdm import tqdm
 # Configuration
 DATA_DIR = 'raw_data/ptbxl'
 FS_ORIGINAL = 500
-FS_TARGET = 125
-TARGET_LENGTH = 1250  # 10 seconds * 125 Hz
+FS_TARGET = 250
+TARGET_LENGTH = 2500  # 10 seconds * 250 Hz
 
 def connect_db():
     return psycopg2.connect(
@@ -54,16 +54,16 @@ def main():
             # 2. Read the 500Hz signal
             record = wfdb.rdrecord(file_path)
             
-            # Lead II is usually channel 1 in PTB-XL (0-indexed: I, II, III, aVR, aVL, aVF, V1-V6)
-            lead_ii = record.p_signal[:, 1]
+            # Lead I is usually channel 0 in PTB-XL (0-indexed: I, II, III, aVR, aVL, aVF, V1-V6)
+            lead_i = record.p_signal[:, 0]
             
-            # 3. Resample to 125 Hz (1,250 points)
-            signal_125 = resample(lead_ii, TARGET_LENGTH)
+            # 3. Resample to 250 Hz (2,500 points)
+            signal_250 = resample(lead_i, TARGET_LENGTH)
             
             # 4. Extract R-peaks using Neurokit2 for the Dashboard UI
             # We wrap it in a try-except because some extremely noisy signals fail peak detection
             try:
-                _, info = nk.ecg_peaks(signal_125, sampling_rate=FS_TARGET)
+                _, info = nk.ecg_peaks(signal_250, sampling_rate=FS_TARGET)
                 r_peaks = info["ECG_R_Peaks"].tolist()
             except:
                 r_peaks = []
@@ -72,7 +72,7 @@ def main():
             
             # 5. Insert into Database
             filename = f"ptbxl_{ecg_id}"
-            signal_list = signal_125.tolist()
+            signal_list = signal_250.tolist()
             
             cur.execute(
                 INSERT_SQL,

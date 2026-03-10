@@ -638,6 +638,12 @@
                         onmouseout="this.style.background='rgba(0, 255, 153, 0.2)'">
                         ✅ VERIFY SEGMENT
                     </button>
+                    <button id="accept-ai-btn"
+                        style="display: none; width: 100%; padding: 12px; background: rgba(255, 153, 0, 0.2); border: 2px solid #ff9900; color: #ff9900; font-weight: bold; font-size: 14px; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin-top: 5px;"
+                        onmouseover="this.style.background='rgba(255, 153, 0, 0.3)'"
+                        onmouseout="this.style.background='rgba(255, 153, 0, 0.2)'">
+                        ⚠️ ACCEPT AI LABELS
+                    </button>
                 </div>
 
                 <!-- 4. Clinical XAI -->
@@ -789,6 +795,10 @@
                     const isVerified = sidebarRow ? sidebarRow.querySelector('.badge-success').style.display !== 'none' : false;
                     headerIcon.style.display = isVerified ? 'inline' : 'none';
                 }
+
+                // Support auto-generated ML events passed from backend
+                if (!currentDecision) currentDecision = {};
+                currentDecision.final_display_events = data.events || [];
 
                 redraw();
                 runAnalysis();
@@ -1206,12 +1216,68 @@
                         aiBadge.style.color = "#00ffd0";
                     }
                 }
+
+                checkAutomationGuard();
             }
+
+            // NEW: AUTOMATION BIAS UI GUARD
+            // Prevents clicking "Verify" if there are any pending ML-only suggestions
+            function checkAutomationGuard() {
+                const verifyBtn = document.getElementById("verify-btn");
+                const acceptAiBtn = document.getElementById("accept-ai-btn");
+
+                if (!currentDecision || !currentDecision.final_display_events) {
+                    verifyBtn.disabled = false;
+                    verifyBtn.style.opacity = "1";
+                    acceptAiBtn.style.display = "none";
+                    return;
+                }
+
+                const hasMLEvents = currentDecision.final_display_events.some(e => e.annotation_source === "ml");
+
+                if (hasMLEvents) {
+                    verifyBtn.disabled = true;
+                    verifyBtn.style.opacity = "0.3";
+                    verifyBtn.innerText = "VERIFY LOCKED";
+                    acceptAiBtn.style.display = "block";
+                } else {
+                    verifyBtn.disabled = false;
+                    verifyBtn.style.opacity = "1";
+                    verifyBtn.innerText = "✅ VERIFY SEGMENT";
+                    acceptAiBtn.style.display = "none";
+                }
+            }
+
+            // Convert ML labels to human upon exact UI click
+            document.getElementById("accept-ai-btn").onclick = function () {
+                if (currentDecision && currentDecision.final_display_events) {
+                    currentDecision.final_display_events.forEach(e => {
+                        if (e.annotation_source === "ml") {
+                            e.annotation_source = "cardiologist";
+                        }
+                    });
+                    checkAutomationGuard();
+                    redraw();
+                }
+            };
 
             // Quick Label Logic
             function quickLabel(label) {
-                if (rightClickedBeatIdx === -1) return;
-                addLocalEvent([rightClickedBeatIdx], label, "cardiologist");
+                if (rightClickedEventId) {
+                    // Update existing event (which also overrides 'ml' to 'cardiologist')
+                    if (currentDecision && currentDecision.final_display_events) {
+                        const evt = currentDecision.final_display_events.find(e => e.event_id === rightClickedEventId);
+                        if (evt) {
+                            evt.event_type = label;
+                            evt.event_category = (label.toUpperCase().includes("PVC") || label.toUpperCase().includes("PAC")) ? "ECTOPY" : "RHYTHM";
+                            evt.annotation_source = "cardiologist"; // Overwrite ML if user touches it
+                        }
+                    }
+                    evaluateClinicalRules();
+                    redraw();
+                } else if (rightClickedBeatIdx !== -1) {
+                    addLocalEvent([rightClickedBeatIdx], label, "cardiologist");
+                }
                 document.getElementById('beat-context-menu').style.display = 'none';
             }
 
@@ -1305,23 +1371,40 @@
 
             async function verifySegment() {
                 const label = document.getElementById('diagnosis-select').value;
-                const eventsToSave = currentDecision && currentDecision.final_display_events ? currentDecision.final_display_events : [];
                 const verifyBtn = document.getElementById("verify-btn");
+                if (verifyBtn.disabled) return; // Hard fail if locked
+
+                // ONLY Save events that are marked cardiologist! ML events are wiped if not accepted.
+                const eventsToSave = currentDecision && currentDecision.final_display_events ?
+                    currentDecision.final_display_events.filter(e => e.annotation_source === "cardiologist") : [];
+
                 const oldText = verifyBtn.innerText;
                 verifyBtn.innerText = "Processing...";
 
                 try {
-                    // 1. Save all accumulated markers (ONLY on Verify)
+                    const notes = document.getElementById("cardiologist-notes").value;
+
+                    // 1. Convert all displayed events to 'cardiologist' source before final save to LOCK them in
+                    const finalEvents = (currentDecision && currentDecision.final_display_events) ?
+                        currentDecision.final_display_events.map(e => ({
+                            ...e,
+                            annotation_source: "cardiologist",
+                            annotation_status: "confirmed"
+                        })) : [];
+
+                    // 2. Save all accumulated markers (ONLY on Verify)
                     await fetch(`/api/segment/${currentSegment}/update`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ events: eventsToSave })
+                        body: JSON.stringify({ events: finalEvents })
                     });
 
-                    // 2. Mark the segment background rhythm & status as analyzed/verified
+                    // 3. Mark the segment background rhythm & status as analyzed/verified
                     const payload = {
                         segment_id: currentSegment,
-                        background_rhythm: label || "Sinus Rhythm"
+                        background_rhythm: label || "Sinus Rhythm",
+                        notes: notes,
+                        events: finalEvents
                     };
 
                     const res = await fetch("/api/verify_segment", {

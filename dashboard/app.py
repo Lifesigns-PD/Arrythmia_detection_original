@@ -264,7 +264,10 @@ def _compute_qrs_durations(segment: np.ndarray, segment_r_peaks: np.ndarray, fs:
 
 
 
-def _calculate_morphology_features(segment: np.ndarray, segment_r_peaks: np.ndarray) -> Dict[str, Any]:
+    out["qrs_durations_ms"] = qrs_list.tolist() if qrs_list.size > 0 else []
+    return out
+
+def _calculate_morphology_features(segment: np.ndarray, segment_r_peaks: np.ndarray, fs: int = 250) -> Dict[str, Any]:
     """
     QRS energy + QRS duration distribution (ms).
     """
@@ -276,7 +279,7 @@ def _calculate_morphology_features(segment: np.ndarray, segment_r_peaks: np.ndar
     if len(segment_r_peaks) == 0:
         return out
 
-    window_samples = int(0.100 * TARGET_FS)
+    window_samples = int(0.100 * fs)
     energies = []
 
     for r in segment_r_peaks:
@@ -289,7 +292,7 @@ def _calculate_morphology_features(segment: np.ndarray, segment_r_peaks: np.ndar
         out["QRS_Avg_Energy"] = float(np.mean(energies))
         out["QRS_Energy_Std"] = float(np.std(energies))
 
-    qrs_list = _compute_qrs_durations(segment, segment_r_peaks, TARGET_FS)
+    qrs_list = _compute_qrs_durations(segment, segment_r_peaks, fs)
     out["qrs_durations_ms"] = qrs_list.tolist() if qrs_list.size > 0 else []
     return out
 
@@ -367,7 +370,7 @@ def _extract_segment_features(
     rr_intervals_ms = np.array([])
     if len(segment_r_peaks) >= 2:
         rr_samples = np.diff(segment_r_peaks)
-        rr_intervals_ms = rr_samples * 1000.0 / TARGET_FS
+        rr_intervals_ms = rr_samples * 1000.0 / fs
 
     if rr_intervals_ms.size > 0:
         features["rr_intervals_ms"] = rr_intervals_ms.tolist()
@@ -395,12 +398,12 @@ def _extract_segment_features(
         features["RMSSD"] = 0.0
         features["pNN50"] = 0.0
 
-    features.update(_calculate_morphology_features(segment, segment_r_peaks))
+    features.update(_calculate_morphology_features(segment, segment_r_peaks, fs))
     features.update(_calculate_frequency_hrv(rr_intervals_ms))
     features.update(_calculate_nonlinear_hrv(rr_intervals_ms))
 
     # Calculate PR interval from waveform
-    pr_interval = _calculate_pr_interval(segment, segment_r_peaks, TARGET_FS)
+    pr_interval = _calculate_pr_interval(segment, segment_r_peaks, fs)
     features["pr_interval"] = float(pr_interval)
     
     return features
@@ -735,13 +738,97 @@ def get_segment_api(segment_id: int):
     }
 
     labels = {
-        "ai_prediction": meta.get("arrhythmia_label") or "Unlabeled",
-        "imported_label": meta.get("dataset_source") or "Unknown"
+        "ai_prediction": "AI Inference pending...",
+        "imported_label": meta.get("arrhythmia_label") or "Unlabeled"
     }
 
     # Extract events for dynamic detailed ledger
     events_json = meta.get("events_json") or {}
     raw_events = events_json.get("events", []) if isinstance(events_json, dict) else (events_json if isinstance(events_json, list) else [])
+    
+    # ---------------------------------------------------------
+    # NEW: AI EVENT AUTO-GENERATION FOR UNANNOTATED SEGMENTS
+    # ---------------------------------------------------------
+    if not raw_events:
+        print(f"[API] No manual events for segment {segment_id}. Running ML inference...")
+        try:
+            # We must run the actual ML models
+            from xai import _load_model, _init_device, extract_fixed_window
+            import torch
+            import torch.nn.functional as F
+            
+            # Temporary lazy inference (similar to /api/xai)
+            device = _init_device()
+            model_rhythm = _load_model(task="rhythm")
+            model_ectopy = _load_model(task="ectopy")
+            
+            arr = np.array(raw_signal, dtype=np.float32)
+            # Center 2s window for rhythm
+            signal_2s = extract_fixed_window(arr, 250, 0.0, 10.0) 
+            x = torch.from_numpy(signal_2s[None, None, :]).to(device)
+            
+            with torch.no_grad():
+                r_logits = model_rhythm(x)
+                r_probs = F.softmax(r_logits, dim=1)[0].cpu().numpy()
+            
+            r_idx = int(np.argmax(r_probs))
+            r_label = RHYTHM_CLASS_NAMES[r_idx]
+            
+            generated_events = []
+            
+            # Multi-beat inference for ectopy
+            if len(r_peaks_arr) > 0:
+                import uuid
+                from decision_engine.models import Event, EventCategory, SegmentDecision, SegmentState
+                from decision_engine.rules import apply_ectopy_patterns, apply_display_rules
+                
+                for peak_idx in r_peaks_arr:
+                    start_s = (peak_idx / seg_fs) - 1.0
+                    end_s = (peak_idx / seg_fs) + 1.0
+                    beat_window = extract_fixed_window(arr, 250, start_s, end_s)
+                    bx = torch.from_numpy(beat_window[None, None, :]).to(device)
+                    
+                    with torch.no_grad():
+                        be_logits = model_ectopy(bx)
+                        be_probs = F.softmax(be_logits, dim=1)[0].cpu().numpy()
+                    
+                    e_idx = int(np.argmax(be_probs))
+                    beat_label = ECTOPY_CLASS_NAMES[e_idx]
+                    
+                    if beat_label != "None":
+                         # High confidence threshold for UI display
+                         if be_probs[e_idx] > 0.4:
+                             generated_events.append(Event(
+                                 event_id=str(uuid.uuid4()),
+                                 start_time=max(0.0, (peak_idx/seg_fs) - 0.3),
+                                 end_time=(peak_idx/seg_fs) + 0.3,
+                                 event_type=beat_label,
+                                 event_category=EventCategory.ECTOPY,
+                                 beat_indices=[int(peak_idx)],
+                                 annotation_source="ml"  # VERY IMPORTANT: Mark as ML
+                             ))
+                
+                # Apply rules engine to ML events (Couplets, Runs, etc.)
+                apply_ectopy_patterns(generated_events)
+                final_ml_events = apply_display_rules(r_label, generated_events)
+                
+                # Convert back to dicts for JSON
+                raw_events = [e.to_dict() for e in final_ml_events]
+                
+                # Also update the primary label guess
+                labels["ai_prediction"] = r_label
+                
+                # Overwrite if current label is generic/missing
+                generic_labels = ["Unlabeled", "Normal", "Other Arrhythmia", "Unknown", "Sinus Rhythm"]
+                current_db_label = meta.get("arrhythmia_label")
+                if not current_db_label or current_db_label in generic_labels:
+                     meta["arrhythmia_label"] = r_label
+                     
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[API] Error running ML inference on unannotated segment: {e}")
+
     ledger_text = generate_detailed_ledger(labels["ai_prediction"], raw_events)
 
     return jsonify(
@@ -755,6 +842,7 @@ def get_segment_api(segment_id: int):
             "vitals": vitals,
             "labels": labels,
             "r_peaks": r_peaks_for_frontend,
+            "events": raw_events,  # Send the parsed/generated events directly to the frontend
             "notes": meta.get("cardiologist_notes") or "",
             "corrected_by": meta.get("corrected_by"),
             "corrected_at": meta.get("corrected_at"),
@@ -824,13 +912,15 @@ def annotate_beats():
     # Convert beat_indices to R-peak index within the segment
     # We need the R-peaks to compute the beat_index (ordinal position)
     r_peaks_str = None
+    seg_fs = int(TARGET_FS) # Default fallback
     try:
         conn = db_service._connect()
         with conn.cursor() as cur:
-            cur.execute("SELECT r_peaks_in_segment FROM ecg_features_annotatable WHERE segment_id = %s", (segment_id,))
+            cur.execute("SELECT r_peaks_in_segment, segment_fs FROM ecg_features_annotatable WHERE segment_id = %s", (segment_id,))
             row = cur.fetchone()
-            if row and row[0]:
+            if row:
                 r_peaks_str = row[0]
+                if row[1]: seg_fs = int(row[1])
         conn.close()
     except Exception:
         pass
@@ -842,7 +932,7 @@ def annotate_beats():
     success_count = 0
     for idx_rel in beat_indices:
         # Convert relative index (samples) to relative time (seconds)
-        peak_time = idx_rel / TARGET_FS
+        peak_time = idx_rel / seg_fs
         
         # Compute beat_index: which R-peak number is this beat?
         beat_index = None
@@ -987,7 +1077,7 @@ def api_retrain_model():
 
     Pipeline:
       1) export_corrected_segments()  -> retraining_data/
-      2) run retrain_model.py         -> outputs/checkpoints/best_model.pth
+      2) run retrain_model.py         -> models_training/outputs/checkpoints/best_model_{rhythm|ectopy}.pth
       3) xai.reset_model()            -> reload new weights on next XAI call
     """
     try:
@@ -1041,11 +1131,13 @@ def verify_segment():
     data = request.json
     segment_id = data.get("segment_id")
     bg_rhythm = data.get("background_rhythm")
+    events = data.get("events")  # May be None, that's fine
+    notes = data.get("notes", "")
 
     if not segment_id:
         return jsonify({"error": "Missing segment_id"}), 400
 
-    success = db_service.update_segment_status(segment_id, bg_rhythm)
+    success = db_service.update_segment_status(segment_id, bg_rhythm, events, notes)
     if success:
         return jsonify({"status": "ok"})
     else:

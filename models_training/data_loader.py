@@ -143,6 +143,7 @@ CLASS_NAMES = [
     "PAC Bigeminy",                  # 19
     "Bundle Branch Block",           # 20
     "Artifact",                      # 21
+    "Other Arrhythmia",              # 22
     
     # NEW COMBINATIONS
     "Sinus Bradycardia + PVC",       # 22
@@ -185,6 +186,7 @@ ECTOPY_TERMS = [
 ]
 
 RHYTHM_CLASS_NAMES = [
+    "Sinus Rhythm",
     "Supraventricular Tachycardia",
     "Atrial Fibrillation",
     "Atrial Flutter",
@@ -199,7 +201,8 @@ RHYTHM_CLASS_NAMES = [
     "Bundle Branch Block",
     "Artifact",
     "PSVT",
-    "Pause"
+    "Pause",
+    "Other Arrhythmia"
 ]
 
 # Hard Safety Assertion
@@ -251,6 +254,13 @@ def get_ectopy_label_idx(original_label_name):
     if original_label_name is None: return ECTOPY_INDEX["None"]
     label = normalize_label(original_label_name).upper()
 
+    # --- THE FIX: Bypassing the Rhythm Shield ---
+    # We now allow ectopy detection even if a global rhythm is mentioned,
+    # because clinical datasets like MITDB provide per-beat 'V'/'A' labels
+    # alongside the global rhythm.
+    
+    label_upper = label.upper()
+
     # Priority 1: Runs (Highest severity ectopy)
     if any(t in label for t in ["RUN", "NSVT", "TRIPLET", "PSVT"]):
         return ECTOPY_INDEX["Run"]
@@ -277,7 +287,7 @@ SEG_LEN = TARGET_FS * 10
 
 LABEL_MAP = {
     # Normals
-    "NORMAL": "Sinus Rhythm", "NSR": "Sinus Rhythm", "NORM": "Sinus Rhythm",
+    "NORMAL": "Sinus Rhythm", "NSR": "Sinus Rhythm", "NORM": "Sinus Rhythm", "ARRHYTHMIA": "Other Arrhythmia",
     "SB": "Sinus Bradycardia", "BRADY": "Sinus Bradycardia", "SINUS BRADYCARDIA": "Sinus Bradycardia",
     "ST": "Sinus Tachycardia", "TACHY": "Sinus Tachycardia", "SINUS TACHYCARDIA": "Sinus Tachycardia", "SINUS TACH": "Sinus Tachycardia",
     
@@ -317,6 +327,17 @@ LABEL_MAP = {
     # Synonyms for MITDB/Clinical terminology
     "ATRIAL PREMATURE CONTRACTION": "PAC", 
     "APC": "PAC",
+    
+    # Per-beat mappings for MITDB/PTB-XL
+    "N": "Sinus Rhythm",      # Normal beat
+    "V": "PVC",               # Premature ventricular contraction
+    "A": "PAC",               # Atrial premature contraction
+    "F": "Fusion",            # Fusion of ventricular and normal beat (map to PVC for simplicity or None)
+    "E": "Junctional Rhythm", # Escape beat
+    "J": "Junctional Rhythm", # Nodal (junctional) premature beat
+    "L": "Bundle Branch Block", # Left bundle branch block beat
+    "R": "Bundle Branch Block", # Right bundle branch block beat
+    "Q": "Artifact",          # Unclassifiable beat
     
     "ARTIFACT": "Artifact"
 }
@@ -358,6 +379,12 @@ def normalize_label(label: str):
         norm_parts = [normalize_label(p) for p in parts]
         return " + ".join(norm_parts)
     
+    # Clinical Single Character Fallbacks
+    if L == "V": return "PVC"
+    if L == "A": return "PAC"
+    if L == "F": return "PVC" # Fusion often grouped with PVC in binary tasks
+    if L == "N": return "Sinus Rhythm"
+
     return "Sinus Rhythm" # Default fallback
 
 
