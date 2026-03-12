@@ -39,7 +39,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 app = Flask(__name__)
 
-TARGET_FS = 250
+TARGET_FS = 125
 SEGMENT_DURATION_S = 10.0
 SEGMENT_LENGTH = int(TARGET_FS * SEGMENT_DURATION_S)
 HRV_INTERP_FS = 4.0
@@ -71,7 +71,7 @@ def _load_data_from_json(file_path: Path) -> Tuple[np.ndarray, int]:
         data = json.load(f)
 
     signal = None
-    original_fs = 250
+    original_fs = 125
     filename = file_path.name
 
     # Structure 1: SensorData list (PTB-XL style, etc.)
@@ -267,7 +267,7 @@ def _compute_qrs_durations(segment: np.ndarray, segment_r_peaks: np.ndarray, fs:
     out["qrs_durations_ms"] = qrs_list.tolist() if qrs_list.size > 0 else []
     return out
 
-def _calculate_morphology_features(segment: np.ndarray, segment_r_peaks: np.ndarray, fs: int = 250) -> Dict[str, Any]:
+def _calculate_morphology_features(segment: np.ndarray, segment_r_peaks: np.ndarray, fs: int = 125) -> Dict[str, Any]:
     """
     QRS energy + QRS duration distribution (ms).
     """
@@ -630,7 +630,7 @@ def api_xai(segment_id: int):
         background_rhythm=bg_rhythm,
         events=event_objs,
         final_display_events=final_display,
-        xai_notes=new_data.get("features_json") or {}
+        xai_notes=new_data.get("features") or {}
     )
     
     explanation_text = explain_decision(decision)
@@ -676,8 +676,8 @@ def get_segment_api(segment_id: int):
     r_peaks_for_frontend = meta.get("r_peaks_in_segment")
 
     # Use the actual fs stored in the DB — critical for coordinate sync
-    # MIT-BIH data is at 125 Hz; uploading a file via app might be 250 Hz.
-    # Using a hard-coded TARGET_FS here would cause a 2× coordinate shift.
+    # All data is now standardized to 125 Hz.
+    # Using the actual fs from DB for coordinate sync.
     seg_fs = int(meta.get("segment_fs") or 125)
 
     if not r_peaks_for_frontend:
@@ -739,7 +739,7 @@ def get_segment_api(segment_id: int):
 
     labels = {
         "ai_prediction": "AI Inference pending...",
-        "imported_label": meta.get("arrhythmia_label") or "Unlabeled"
+        "imported_label": meta.get("background_rhythm") or "Unlabeled"
     }
 
     # Extract events for dynamic detailed ledger
@@ -764,7 +764,7 @@ def get_segment_api(segment_id: int):
             
             arr = np.array(raw_signal, dtype=np.float32)
             # Center 2s window for rhythm
-            signal_2s = extract_fixed_window(arr, 250, 0.0, 10.0) 
+            signal_2s = extract_fixed_window(arr, TARGET_FS, 0.0, 10.0) 
             x = torch.from_numpy(signal_2s[None, None, :]).to(device)
             
             with torch.no_grad():
@@ -785,7 +785,7 @@ def get_segment_api(segment_id: int):
                 for peak_idx in r_peaks_arr:
                     start_s = (peak_idx / seg_fs) - 1.0
                     end_s = (peak_idx / seg_fs) + 1.0
-                    beat_window = extract_fixed_window(arr, 250, start_s, end_s)
+                    beat_window = extract_fixed_window(arr, TARGET_FS, start_s, end_s)
                     bx = torch.from_numpy(beat_window[None, None, :]).to(device)
                     
                     with torch.no_grad():
@@ -820,9 +820,9 @@ def get_segment_api(segment_id: int):
                 
                 # Overwrite if current label is generic/missing
                 generic_labels = ["Unlabeled", "Normal", "Other Arrhythmia", "Unknown", "Sinus Rhythm"]
-                current_db_label = meta.get("arrhythmia_label")
+                current_db_label = meta.get("background_rhythm")
                 if not current_db_label or current_db_label in generic_labels:
-                     meta["arrhythmia_label"] = r_label
+                     meta["background_rhythm"] = r_label
                      
         except Exception as e:
             import traceback
@@ -1173,8 +1173,23 @@ def update_segment_events(segment_id: int):
         }
         if db_service.save_event_to_db(segment_id, event_dict):
             success_count += 1
-            
+
+    # Mark segment as corrected so the training pipeline picks it up
+    if success_count > 0:
+        db_service.mark_segment_corrected(segment_id)
+
     return jsonify({"status": "ok", "saved": success_count})
+
+@app.route("/api/event/<int:segment_id>/<event_id>", methods=["PATCH"])
+def patch_event_span(segment_id: int, event_id: str):
+    """Update start_time/end_time of a specific event (span drag from UI)."""
+    body = request.get_json(force=True) or {}
+    start_time = body.get("start_time")
+    end_time = body.get("end_time")
+    if start_time is None or end_time is None:
+        return jsonify({"error": "start_time and end_time required"}), 400
+    ok = db_service.update_event_span(segment_id, event_id, float(start_time), float(end_time))
+    return jsonify({"ok": ok})
 
 # =========================================================
 # Main

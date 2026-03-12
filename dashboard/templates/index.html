@@ -238,7 +238,7 @@
 
         .suppressed-card {
             background: rgba(20, 20, 20, 0.9);
-            border-left: 4px solid #ff4444;
+            border-left: 4px solid #ea6464;
             padding: 10px;
             font-size: 12px;
             border-radius: 4px;
@@ -632,6 +632,11 @@
                         </button>
                     </div>
 
+                    <label
+                        style="font-size: 11px; color: var(--text-muted); margin-top: 10px; display: block;">Notes:</label>
+                    <textarea id="cardiologist-notes" rows="3" placeholder="Clinical observations..."
+                        style="width: 100%; background: rgba(0,0,0,0.3); color: white; border: 1px solid var(--border-color); border-radius: 4px; padding: 8px; margin-bottom: 10px; font-size: 12px;"></textarea>
+
                     <button id="verify-btn"
                         style="width: 100%; padding: 12px; background: rgba(0, 255, 153, 0.2); border: 2px solid var(--accent-secondary); color: var(--accent-secondary); font-weight: bold; font-size: 14px; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin-top: 5px;"
                         onmouseover="this.style.background='rgba(0, 255, 153, 0.3)'"
@@ -721,6 +726,9 @@
             let selectedBeats = []; // Stores relative indices (samples) of R-peaks
             let rightClickedBeatIdx = -1;
             let rightClickedEventId = null;
+            let draggingHandle = null; // {eventIdx, side: "start"|"end"}
+            let editingEvents = null;  // working copy of events while dragging
+            let wasDragging = false;   // guard: prevent click from selecting a beat after a drag
 
             const canvas = document.getElementById("ecgCanvas");
             const ctx = canvas.getContext("2d");
@@ -895,34 +903,165 @@
                 const h = canvas.height / dpr;
                 ctx.clearRect(0, 0, w, h);
 
+                // Margins: left for amplitude labels, bottom for time labels
+                const PAD_L = 52;
+                const PAD_B = 26;
+                const pw = w - PAD_L;   // plot width
+                const ph = h - PAD_B;   // plot height
+
                 const start = Math.floor(viewStart);
                 const end = Math.ceil(viewEnd);
                 const visible = ecgSignal.slice(start, end + 1);
+                if (visible.length < 2) return;
 
-                // AutoScale Y
+                // AutoScale Y within plot area
                 const min = Math.min(...visible);
                 const max = Math.max(...visible);
                 const range = Math.max(max - min, 1.0);
                 const mid = (min + max) / 2;
-                const scaleY = (h - 100) / range;
+                const scaleY = (ph - 20) / range;
+
+                // Helpers: convert sample index / amplitude to canvas coords
+                const smpX = (s) => PAD_L + ((s - start) / (visible.length - 1)) * pw;
+                const ampY = (v) => ph / 2 - (v - mid) * scaleY;
+
+                // --- TIME AXIS (bottom) ---
+                ctx.fillStyle = "rgba(200,200,200,0.85)";
+                ctx.font = "10px monospace";
+                ctx.textBaseline = "top";
+                ctx.textAlign = "center";
+                const durationSec = (visible.length - 1) / segmentFs;
+                // Pick a nice tick interval based on visible duration
+                const tickIntervals = [0.1, 0.2, 0.5, 1, 2, 5];
+                let tickStep = 1;
+                for (const ti of tickIntervals) {
+                    if ((durationSec / ti) <= 20) { tickStep = ti; break; }
+                }
+                const tickStepSamples = tickStep * segmentFs;
+                const tickStart = Math.ceil(start / tickStepSamples) * tickStepSamples;
+                for (let s = tickStart; s <= start + visible.length; s += tickStepSamples) {
+                    const gx = smpX(s);
+                    if (gx < PAD_L || gx > PAD_L + pw) continue;
+                    const timeSec = s / segmentFs;
+                    // Small tick mark
+                    ctx.strokeStyle = "rgba(200,200,200,0.5)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath(); ctx.moveTo(gx, ph); ctx.lineTo(gx, ph + 4); ctx.stroke();
+                    // Label
+                    ctx.fillText(timeSec.toFixed(1) + "s", gx, ph + 5);
+                }
+
+                // --- AMPLITUDE AXIS (left) ---
+                ctx.textBaseline = "middle";
+                ctx.textAlign = "right";
+                // Pick a nice amplitude tick step
+                const ampTicks = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0];
+                let ampStep = 0.2;
+                for (const at of ampTicks) {
+                    if ((range / at) <= 12) { ampStep = at; break; }
+                }
+                const ampLo = Math.floor(min / ampStep) * ampStep;
+                const ampHi = Math.ceil(max / ampStep) * ampStep;
+                for (let a = ampLo; a <= ampHi; a += ampStep) {
+                    const gy = ampY(a);
+                    if (gy < 2 || gy > ph - 2) continue;
+                    // Small tick mark
+                    ctx.strokeStyle = "rgba(200,200,200,0.5)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath(); ctx.moveTo(PAD_L - 4, gy); ctx.lineTo(PAD_L, gy); ctx.stroke();
+                    // Faint horizontal guide line
+                    ctx.strokeStyle = "rgba(200,200,200,0.15)";
+                    ctx.beginPath(); ctx.moveTo(PAD_L, gy); ctx.lineTo(PAD_L + pw, gy); ctx.stroke();
+                    // Label
+                    ctx.fillStyle = "rgba(200,200,200,0.85)";
+                    ctx.fillText(a.toFixed(2), PAD_L - 6, gy);
+                }
+                ctx.textBaseline = "alphabetic";
+                ctx.textAlign = "left";
+
+                // --- EVENT SPAN BANDS (behind trace) ---
+                const evList = editingEvents || (currentDecision && currentDecision.final_display_events) || [];
+                evList.forEach(ev => {
+                    const sIdx = ev.start_time * segmentFs;
+                    const eIdx = ev.end_time * segmentFs;
+                    if (eIdx < start || sIdx > start + visible.length) return;
+                    const xS = Math.max(PAD_L, smpX(sIdx));
+                    const xE = Math.min(PAD_L + pw, smpX(eIdx));
+                    const isCardio = ev.annotation_source === "cardiologist";
+                    ctx.fillStyle = ev.event_category === "ECTOPY"
+                        ? (isCardio ? "rgba(255,60,60,0.22)" : "rgba(255,80,80,0.13)")
+                        : (isCardio ? "rgba(0,200,255,0.20)" : "rgba(0,200,255,0.10)");
+                    ctx.setLineDash([]);
+                    ctx.fillRect(xS, 0, xE - xS, ph);
+                });
 
                 // Draw Trace
                 ctx.strokeStyle = "#000000";
                 ctx.lineWidth = 2;
                 ctx.beginPath();
                 for (let i = 0; i < visible.length; i++) {
-                    const x = (i / (visible.length - 1)) * w;
-                    const y = h / 2 - (visible[i] - mid) * scaleY;
+                    const x = PAD_L + (i / (visible.length - 1)) * pw;
+                    const y = ampY(visible[i]);
                     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
                 }
                 ctx.stroke();
 
-                // Draw R Peaks
-                ctx.fillStyle = "#ff4444";
+                // Draw R Peaks — normal beats get small red tick; ectopy beats get distinct markers
+                // First, build a map of which R-peaks are ectopy beats
+                const ectopyPeaks = new Map();  // peakIdx -> {type, color}
+                evList.forEach(ev => {
+                    const type = ev.event_type.toUpperCase();
+                    const isEctopy = type.includes("PVC") || type.includes("PAC") ||
+                                     type.includes("VENTRICULAR") || type.includes("ATRIAL") ||
+                                     ev.event_category === "ECTOPY";
+                    if (!isEctopy) return;
+                    // Find the closest R-peak to this event's center
+                    const center = (ev.start_time + ev.end_time) / 2 * segmentFs;
+                    let closest = -1, minDist = 0.3 * segmentFs;
+                    rPeaks.forEach(p => {
+                        const d = Math.abs(p - center);
+                        if (d < minDist) { minDist = d; closest = p; }
+                    });
+                    if (closest !== -1) {
+                        const isPVC = type.includes("PVC") || type.includes("VENTRICULAR");
+                        ectopyPeaks.set(closest, {
+                            type: ev.event_type,
+                            color: isPVC ? "#ff3333" : "#ffcc00"  // red for PVC, gold for PAC
+                        });
+                    }
+                });
+
                 rPeaks.forEach(idx => {
-                    if (idx >= start && idx <= end) {
-                        const x = ((idx - start) / (visible.length - 1)) * w;
-                        const y = h / 2 - (ecgSignal[idx] - mid) * scaleY;
+                    if (idx < start || idx > end) return;
+                    const x = smpX(idx);
+                    const y = ampY(ecgSignal[idx]);
+
+                    if (ectopyPeaks.has(idx)) {
+                        // ECTOPY BEAT: draw a filled diamond marker at the R-peak
+                        const info = ectopyPeaks.get(idx);
+                        const sz = 8;
+                        ctx.fillStyle = info.color;
+                        ctx.strokeStyle = "#ffffff";
+                        ctx.lineWidth = 1.5;
+                        ctx.beginPath();
+                        ctx.moveTo(x, y - sz);       // top
+                        ctx.lineTo(x + sz, y);       // right
+                        ctx.lineTo(x, y + sz);       // bottom
+                        ctx.lineTo(x - sz, y);       // left
+                        ctx.closePath();
+                        ctx.fill();
+                        ctx.stroke();
+                        // Small label above diamond
+                        ctx.fillStyle = info.color;
+                        ctx.font = "bold 9px sans-serif";
+                        ctx.textAlign = "center";
+                        ctx.textBaseline = "bottom";
+                        ctx.fillText(info.type, x, y - sz - 2);
+                        ctx.textAlign = "left";
+                        ctx.textBaseline = "alphabetic";
+                    } else {
+                        // Normal beat: small red tick above peak
+                        ctx.fillStyle = "#ff4444";
                         ctx.fillRect(Math.round(x) - 2, Math.round(y) - 20, 4, 10);
                     }
                 });
@@ -932,67 +1071,87 @@
                 ctx.strokeStyle = "red";
                 ctx.setLineDash([]);
                 selectedBeats.forEach(idx => {
-                    const highlightHalfWidth = Math.floor(0.15 * segmentFs); // 150ms half-width (300ms total)
+                    const highlightHalfWidth = Math.floor(0.15 * segmentFs);
                     const sIdx = idx - highlightHalfWidth;
                     const eIdx = idx + highlightHalfWidth;
                     if (eIdx < start || sIdx > end) return;
-
-                    const xS = Math.max(0, ((sIdx - start) / (visible.length - 1)) * w);
-                    const xE = Math.min(w, ((eIdx - start) / (visible.length - 1)) * w);
-
-                    ctx.fillRect(xS, 0, xE - xS, h);
-                    ctx.strokeRect(xS, 0, xE - xS, h);
+                    const xS = Math.max(PAD_L, smpX(sIdx));
+                    const xE = Math.min(PAD_L + pw, smpX(eIdx));
+                    ctx.fillRect(xS, 0, xE - xS, ph);
+                    ctx.strokeRect(xS, 0, xE - xS, ph);
                 });
 
-                // Draw Existing Events
-                if (currentDecision && currentDecision.final_display_events) {
-                    currentDecision.final_display_events.forEach(e => {
-                        const sIdx = e.start_time * segmentFs;
-                        const eIdx = e.end_time * segmentFs;
-                        // Calculate center of the event (peak)
-                        const peakIdx = (sIdx + eIdx) / 2;
+                // Draw Event Markers (vertical lines + labels + drag handles)
+                evList.forEach(e => {
+                    const sIdx = e.start_time * segmentFs;
+                    const eIdx = e.end_time * segmentFs;
+                    const peakIdx = (sIdx + eIdx) / 2;
 
-                        if (peakIdx < start || peakIdx > end) return;
+                    if (peakIdx < start || peakIdx > end) return;
 
-                        const x = ((peakIdx - start) / (visible.length - 1)) * w;
+                    const x = smpX(peakIdx);
+                    let evColor;
 
-                        ctx.beginPath();
-                        ctx.moveTo(x, 0);
-                        ctx.lineTo(x, h);
+                    ctx.beginPath();
+                    ctx.moveTo(x, 0);
+                    ctx.lineTo(x, ph);
 
-                        if (e.annotation_source === "cardiologist") {
-                            // Manual Annotation: Thick, distinct dotted line
-                            ctx.lineWidth = 3;
-                            ctx.setLineDash([4, 4]); // Clear dots
-
-                            // Color code based on type even for manual
-                            if (e.event_type.includes("PVC")) ctx.strokeStyle = "red";
-                            else if (e.event_type.includes("PAC")) ctx.strokeStyle = "#ffcc00"; // Gold/Orange
-                            else if (e.event_type.includes("Sinus")) ctx.strokeStyle = "#00ff00"; // Green
-                            else ctx.strokeStyle = "#ff00ff"; // Magenta default
-
-                        } else {
-                            // AI Annotation: Thinner, different dash
-                            ctx.lineWidth = 1;
-                            ctx.setLineDash([2, 2]);
-                            ctx.strokeStyle = e.event_category === "ECTOPY" ? "red" : "cyan";
-                        }
-
-                        ctx.stroke();
-                        ctx.setLineDash([]); // Reset
+                    if (e.annotation_source === "cardiologist") {
+                        ctx.lineWidth = 3;
+                        ctx.setLineDash([4, 4]);
+                        if (e.event_type.includes("PVC")) evColor = "red";
+                        else if (e.event_type.includes("PAC")) evColor = "#ffcc00";
+                        else if (e.event_type.includes("Sinus")) evColor = "#00ff00";
+                        else evColor = "#ff00ff";
+                    } else {
                         ctx.lineWidth = 1;
+                        ctx.setLineDash([2, 2]);
+                        evColor = e.event_category === "ECTOPY" ? "red" : "cyan";
+                    }
+                    ctx.strokeStyle = evColor;
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.lineWidth = 1;
 
-                        // Label at top
-                        ctx.fillStyle = ctx.strokeStyle;
-                        ctx.font = "bold 12px sans-serif";
-                        ctx.fillText(e.event_type, x + 4, 15);
+                    // Label at top
+                    ctx.fillStyle = evColor;
+                    ctx.font = "bold 12px sans-serif";
+                    ctx.fillText(e.event_type, x + 4, 15);
 
-                        // Small marker at bottom of line
-                        ctx.beginPath();
-                        ctx.arc(x, h - 5, 3, 0, 2 * Math.PI);
-                        ctx.fill();
+                    // Small marker at bottom of plot
+                    ctx.beginPath();
+                    ctx.arc(x, ph - 5, 3, 0, 2 * Math.PI);
+                    ctx.fill();
+
+                    // Span edge drag handles — thick colored bar + circle grip at mid-height
+                    const xS_edge = smpX(sIdx);
+                    const xE_edge = smpX(eIdx);
+                    [xS_edge, xE_edge].forEach(hx => {
+                        if (hx < PAD_L - 10 || hx > PAD_L + pw + 10) return;
+                        // Thick edge bar
+                        ctx.strokeStyle = evColor;
+                        ctx.lineWidth = 3;
+                        ctx.globalAlpha = 0.8;
+                        ctx.setLineDash([]);
+                        ctx.beginPath(); ctx.moveTo(hx, 0); ctx.lineTo(hx, ph); ctx.stroke();
+                        ctx.globalAlpha = 1.0;
+                        // Circle grip at mid-height
+                        const my = ph / 2;
+                        ctx.fillStyle = evColor;
+                        ctx.strokeStyle = "#ffffff";
+                        ctx.lineWidth = 2;
+                        ctx.beginPath(); ctx.arc(hx, my, 7, 0, 2 * Math.PI);
+                        ctx.fill(); ctx.stroke();
+                        // ↔ arrow inside circle
+                        ctx.fillStyle = "#ffffff";
+                        ctx.font = "bold 8px sans-serif";
+                        ctx.textAlign = "center";
+                        ctx.textBaseline = "middle";
+                        ctx.fillText("↔", hx, my);
+                        ctx.textAlign = "left";
+                        ctx.textBaseline = "alphabetic";
                     });
-                }
+                });
             }
 
             function inspectEvent(e) {
@@ -1015,13 +1174,15 @@
 
             // Left Click: Toggle Selection
             canvas.addEventListener("click", function (e) {
+                if (wasDragging) { wasDragging = false; return; } // swallow click after drag
                 const rect = canvas.getBoundingClientRect();
                 const x = e.clientX - rect.left;
 
+                const PAD_L = 52;
                 const startIdx = Math.floor(viewStart);
                 const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
-                const w = rect.width;
-                const clickedSampleIdx = startIdx + (x / w) * (visibleLen - 1);
+                const pw = rect.width - PAD_L;
+                const clickedSampleIdx = startIdx + ((x - PAD_L) / pw) * (visibleLen - 1);
 
                 let closestPeak = null;
                 let minDistance = 0.2 * segmentFs; // 200ms tolerance
@@ -1051,9 +1212,10 @@
 
                 const rect = canvas.getBoundingClientRect();
                 const x = e.clientX - rect.left;
+                const PAD_L = 52;
                 const startIdx = Math.floor(viewStart);
                 const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
-                const clickSample = startIdx + (x / rect.width) * (visibleLen - 1);
+                const clickSample = startIdx + ((x - PAD_L) / (rect.width - PAD_L)) * (visibleLen - 1);
                 window.lastClickSample = clickSample; // For manual add
 
                 let closestDist = 0.2 * segmentFs; // 200ms tolerance
@@ -1106,6 +1268,82 @@
                 const menu = document.getElementById('beat-context-menu');
                 if (menu) menu.style.display = 'none';
             });
+
+            // ---- SPAN DRAG HANDLERS ----
+            canvas.addEventListener("mousedown", function(e) {
+                if (e.button !== 0) return;
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const PAD_L = 52;
+                const pw = rect.width - PAD_L;
+                const startIdx = Math.floor(viewStart);
+                const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
+                const evList = currentDecision && currentDecision.final_display_events || [];
+                const THRESH = 10;
+                for (let i = 0; i < evList.length; i++) {
+                    const ev = evList[i];
+                    const xS = PAD_L + ((ev.start_time * segmentFs - startIdx) / (visibleLen - 1)) * pw;
+                    const xE = PAD_L + ((ev.end_time  * segmentFs - startIdx) / (visibleLen - 1)) * pw;
+                    if (Math.abs(x - xS) < THRESH) {
+                        editingEvents = evList.map(ev2 => Object.assign({}, ev2));
+                        draggingHandle = {eventIdx: i, side: "start"};
+                        e.stopImmediatePropagation();
+                        e.preventDefault();
+                        return;
+                    }
+                    if (Math.abs(x - xE) < THRESH) {
+                        editingEvents = evList.map(ev2 => Object.assign({}, ev2));
+                        draggingHandle = {eventIdx: i, side: "end"};
+                        e.stopImmediatePropagation();
+                        e.preventDefault();
+                        return;
+                    }
+                }
+            }, true); // capture phase so it fires before click
+
+            canvas.addEventListener("mousemove", function(e) {
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const PAD_L = 52;
+                const pw = rect.width - PAD_L;
+                const startIdx = Math.floor(viewStart);
+                const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
+                if (!draggingHandle) {
+                    const evList = currentDecision && currentDecision.final_display_events || [];
+                    let near = false;
+                    evList.forEach(ev => {
+                        const xS = PAD_L + ((ev.start_time * segmentFs - startIdx) / (visibleLen - 1)) * pw;
+                        const xE = PAD_L + ((ev.end_time  * segmentFs - startIdx) / (visibleLen - 1)) * pw;
+                        if (Math.abs(x - xS) < 10 || Math.abs(x - xE) < 10) near = true;
+                    });
+                    canvas.style.cursor = near ? "ew-resize" : "default";
+                    return;
+                }
+                const sampleIdx = startIdx + ((x - PAD_L) / pw) * (visibleLen - 1);
+                const newTime = Math.max(0, sampleIdx / segmentFs);
+                const ev = editingEvents[draggingHandle.eventIdx];
+                if (draggingHandle.side === "start") {
+                    ev.start_time = Math.min(newTime, ev.end_time - 0.04);
+                } else {
+                    ev.end_time = Math.max(newTime, ev.start_time + 0.04);
+                }
+                redraw();
+            });
+
+            canvas.addEventListener("mouseup", async function(e) {
+                if (!draggingHandle || !editingEvents) return;
+                wasDragging = true; // prevent click handler from selecting a beat
+                const ev = editingEvents[draggingHandle.eventIdx];
+                draggingHandle = null;
+                await fetch(`/api/event/${currentSegment}/${ev.event_id}`, {
+                    method: "PATCH",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({start_time: ev.start_time, end_time: ev.end_time})
+                });
+                editingEvents = null;
+                await loadSegment(currentSegment);
+            });
+            // ---- END SPAN DRAG HANDLERS ----
 
             // Local Helper: Append to display events without saving to database yet
             function addLocalEvent(indices, label, source) {
@@ -1440,11 +1678,12 @@
                             }
                         }
                     } else {
-                        alert("Verification failed on database level.");
+                        const errorData = await res.json().catch(() => ({}));
+                        alert(`Verification failed: ${errorData.error || res.statusText}`);
                     }
                 } catch (e) {
-                    console.error(e);
-                    alert("Network error during verification.");
+                    console.error("Verification Error:", e);
+                    alert(`An error occurred during verification: ${e.message}`);
                 } finally {
                     verifyBtn.innerText = oldText;
                 }

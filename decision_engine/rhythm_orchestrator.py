@@ -117,9 +117,7 @@ class RhythmOrchestrator:
         if hr == 0:
             return "Unknown"
         
-        if hr < 40:
-             return "Profound Sinus Bradycardia"
-        elif hr < 60:
+        if hr < 60:
              return "Sinus Bradycardia"
         elif hr > 150:
              return "Sinus Tachycardia" # Or SVT, but "Sinus Tachycardia" for background usually

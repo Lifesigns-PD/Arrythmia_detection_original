@@ -11,7 +11,7 @@ INPUT = Path(r"data/afdb_data")
 OUTPUT = Path("data/converted_ecg")
 OUTPUT.mkdir(parents=True, exist_ok=True)
 
-SEG_LEN = 2500  # 10 sec @ 250 Hz
+SEG_LEN = 1250  # 10 sec @ 125 Hz
 
 def convert_record(record_name):
     try:
@@ -24,8 +24,8 @@ def convert_record(record_name):
 
         # 2. Resample Signal
         scale_factor = 1.0
-        if fs != 250:
-            scale_factor = 250 / fs
+        if fs != 125:
+            scale_factor = 125 / fs
             ecg = resample(ecg, int(len(ecg) * scale_factor))
         
         # 3. Build Rhythm Mask (The Fix)

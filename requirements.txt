@@ -1,0 +1,11 @@
+flask
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+torch
+tqdm
+psycopg2-binary
+pyyaml
+wfdb

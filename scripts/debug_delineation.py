@@ -28,7 +28,7 @@ def test_real_data():
     print(f"Testing Segment ID: {seg_id}")
     
     signal = np.array(raw_signal)
-    fs = 250
+    fs = 125
     
     # 1. Pipeline Cleaning
     # (Note: _preprocess in app.py uses clean_signal from signal_processing)

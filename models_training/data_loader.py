@@ -7,7 +7,7 @@ Loads ECG JSON dataset for training CNN+Transformer model.
 ✔ Normalizes label text to CLASS_NAMES
 ✔ Converts to numpy arrays suitable for collate_fn
 ✔ Handles corrupted JSON files gracefully
-✔ Ensures every signal = 250 Hz, 10 sec (2500 samples)
+✔ Ensures every signal = 125 Hz, 10 sec (1250 samples)
 """
 
 import json
@@ -226,12 +226,18 @@ for name in ECTOPY_CLASS_NAMES:
 RHYTHM_INDEX = {name: i for i, name in enumerate(RHYTHM_CLASS_NAMES)}
 ECTOPY_INDEX = {name: i for i, name in enumerate(ECTOPY_CLASS_NAMES)}
 
+RHYTHM_LABEL_ALIASES = {
+    "Sinus Bradycardia": "Sinus Rhythm",
+    "Sinus Tachycardia": "Sinus Rhythm",
+}
+
 def get_rhythm_label_idx(original_label_name):
     """
     RHYTHM TASK: Focuses on the base pathology.
     - AF + PVC -> AF (KEEP)
     - Sinus + PVC -> Sinus -> None (DROPPED)
     - PVCs -> None (DROPPED - Ectopy is not a rhythm)
+    - Sinus Bradycardia/Tachycardia -> Sinus Rhythm (class 0)
     """
     if original_label_name is None: return None
     label = normalize_label(original_label_name)
@@ -240,7 +246,10 @@ def get_rhythm_label_idx(original_label_name):
     if " + " in label:
         label = label.split(" + ")[0]
 
-    # 2. Return index only if base rhythm is in our targeted list
+    # 2. Map rate variants to base rhythm class
+    label = RHYTHM_LABEL_ALIASES.get(label, label)
+
+    # 3. Return index only if base rhythm is in our targeted list
     return RHYTHM_INDEX.get(label, None)
 
 def get_ectopy_label_idx(original_label_name):
@@ -278,8 +287,8 @@ def get_ectopy_label_idx(original_label_name):
 
 
 
-TARGET_FS = 250
-SEG_LEN = TARGET_FS * 10 
+TARGET_FS = 125
+SEG_LEN = TARGET_FS * 10  # 1250 samples for 10s @ 125Hz
 
 # ============================================================
 # SIMPLE LABEL NORMALIZATION
@@ -359,6 +368,7 @@ def normalize_label(label: str):
     if L in LABEL_MAP: return LABEL_MAP[L]
     
     # Heuristic Fallbacks
+    if "PROFOUND" in L and "BRADY" in L: return "Sinus Bradycardia"
     if "WENCKEBACH" in L: return "2nd Degree AV Block Type 1"
     if "MOBITZ" in L: return "2nd Degree AV Block Type 2"
     if "BIGEMINY" in L: 
@@ -385,7 +395,9 @@ def normalize_label(label: str):
     if L == "F": return "PVC" # Fusion often grouped with PVC in binary tasks
     if L == "N": return "Sinus Rhythm"
 
-    return "Sinus Rhythm" # Default fallback
+    import warnings
+    warnings.warn(f"normalize_label: unrecognized label '{label}', mapping to 'Other Arrhythmia'", stacklevel=2)
+    return "Other Arrhythmia" # Default fallback — catch-all class
 
 
 # ============================================================
@@ -448,7 +460,7 @@ class ECGDataset:
                 # 1. Parse signal (Postgres REAL[] comes back as list)
                 sig = np.array(signal_raw, dtype=np.float32)
                 
-                # 2. Resample & Fix Length (10s @ 250Hz = 2500 samples)
+                # 2. Resample & Fix Length (10s @ 125Hz = 1250 samples)
                 fs = int(fs or 125)
                 sig = self._resample_and_fixlen(sig, fs)
                 
@@ -481,7 +493,7 @@ class ECGDataset:
             raise
 
     def _resample_and_fixlen(self, sig, orig_fs):
-        """Standardizes signal to 250 Hz and 2500 samples."""
+        """Standardizes signal to 125 Hz and 1250 samples."""
         if orig_fs != TARGET_FS and len(sig) > 1:
             try:
                 new_len = int(len(sig) * float(TARGET_FS) / float(orig_fs))
@@ -492,7 +504,7 @@ class ECGDataset:
                 idx_new = np.linspace(0, len(sig) - 1, int(len(sig) * float(TARGET_FS) / float(orig_fs)))
                 sig = np.interp(idx_new, idx_old, sig).astype(np.float32)
 
-        # Pad/truncate to SEG_LEN (2500)
+        # Pad/truncate to SEG_LEN (1250)
         if len(sig) < SEG_LEN:
             pad = int(SEG_LEN - len(sig))
             sig = np.pad(sig, (0, pad))

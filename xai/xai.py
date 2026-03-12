@@ -121,13 +121,13 @@ def _load_model(task="rhythm"):
 
     # Attach XAI hooks only to Rhythm model (it's the complex one)
     if task == "rhythm":
+        _model_rhythm = model
+        _rhythm_mtime = current_mtime
         try:
             if hasattr(model, "cnn"):
                 model.cnn.register_forward_hook(_cnn_hook)
             if hasattr(model, "transformer_encoder"):
                 model.transformer_encoder.layers[-1].self_attn.register_forward_hook(_attention_hook)
-            _model_rhythm = model
-            _rhythm_mtime = current_mtime
         except: pass
     else:
         _model_ectopy = model
@@ -486,8 +486,8 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
         arr = np.asarray(signal_1d, dtype=np.float32)
         
         # 🔒 WORKSTREAM 1: Explicit 2s windowing (Centered on 10s segment)
-        # Target FS is 250Hz as per system standards
-        fs = 250 
+        # Target FS is 125Hz as per system standards
+        fs = 125
         signal_2s = extract_fixed_window(arr, fs, 0.0, 10.0)
         x = torch.from_numpy(signal_2s[None, None, :]).to(device)
 

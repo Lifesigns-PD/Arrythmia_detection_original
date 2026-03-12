@@ -23,7 +23,7 @@ def test_loader_and_model():
                 
             loader = DataLoader(ds, batch_size=4, collate_fn=collate_fn)
             x, y = next(iter(loader))
-            print(f"Batch Shape: {x.shape} (Expected: torch.Size([4, 1, 2500]))")
+            print(f"Batch Shape: {x.shape} (Expected: torch.Size([4, 1, 1250]))")
             
             # Test Model Forward Pass
             num_classes = 22 if task == "rhythm" else 4
@@ -31,7 +31,7 @@ def test_loader_and_model():
             output = model(x)
             print(f"Model Output Shape: {output.shape} (Expected: torch.Size([4, {num_classes}]))")
             
-            if x.shape == torch.Size([4, 1, 2500]) and output.shape == torch.Size([4, num_classes]):
+            if x.shape == torch.Size([4, 1, 1250]) and output.shape == torch.Size([4, num_classes]):
                 print(f"✅ {task.upper()} Architectural Match Success!")
             else:
                 print(f"❌ {task.upper()} Shape Mismatch!")

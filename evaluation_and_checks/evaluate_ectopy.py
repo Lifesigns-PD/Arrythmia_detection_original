@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import classification_report, f1_score, confusion_matrix
 import sys
 import os
 
@@ -56,6 +56,33 @@ def evaluate_ectopy(ckpt_path):
         labels=range(len(ECTOPY_CLASS_NAMES)),
         zero_division=0
     ))
+
+    # Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(ECTOPY_CLASS_NAMES)))
+    present = sorted(set(y_true) | set(y_pred))
+    if present:
+        print("CONFUSION MATRIX (rows=true, cols=predicted):")
+        hdr = "{:>15s}".format("") + "".join(f" {ECTOPY_CLASS_NAMES[c]:>8s}" for c in present)
+        print(hdr)
+        for r in present:
+            row_str = "{:>15s}".format(ECTOPY_CLASS_NAMES[r])
+            for c in present:
+                row_str += f" {cm[r, c]:>8d}"
+            print(row_str)
+        print()
+
+    # Specificity per class
+    print("PER-CLASS SPECIFICITY:")
+    for i, cls in enumerate(ECTOPY_CLASS_NAMES):
+        tp = cm[i, i]
+        fn = np.sum(cm[i, :]) - tp
+        fp = np.sum(cm[:, i]) - tp
+        tn = np.sum(cm) - (tp + fn + fp)
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        support = int(np.sum(cm[i, :]))
+        if support > 0:
+            print(f"  {cls:15s} | Specificity: {spec:.4f}  (support={support})")
+    print()
 
     # False Alarm Rate for Runs/PVCs
     # "None" is class 0 usually

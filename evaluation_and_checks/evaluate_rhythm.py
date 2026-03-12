@@ -75,9 +75,32 @@ def evaluate_rhythm(ckpt_path):
         zero_division=0
     ))
 
-    # Confusion Matrix (optional, nice to have)
-    # cm = confusion_matrix(y_true, y_pred)
-    # print("Confusion Matrix:\n", cm)
+    # Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(RHYTHM_CLASS_NAMES)))
+    present = sorted(set(y_true) | set(y_pred))
+    if present:
+        print("CONFUSION MATRIX (rows=true, cols=predicted):")
+        hdr = "{:>25s}".format("") + "".join(f" {RHYTHM_CLASS_NAMES[c][:8]:>8s}" for c in present)
+        print(hdr)
+        for r in present:
+            row_str = "{:>25s}".format(RHYTHM_CLASS_NAMES[r][:25])
+            for c in present:
+                row_str += f" {cm[r, c]:>8d}"
+            print(row_str)
+        print()
+
+    # Specificity per class (TN / (TN + FP))
+    print("PER-CLASS SPECIFICITY:")
+    for i, cls in enumerate(RHYTHM_CLASS_NAMES):
+        tp = cm[i, i]
+        fn = np.sum(cm[i, :]) - tp
+        fp = np.sum(cm[:, i]) - tp
+        tn = np.sum(cm) - (tp + fn + fp)
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        support = int(np.sum(cm[i, :]))
+        if support > 0:
+            print(f"  {cls:30s} | Specificity: {spec:.4f}  (support={support})")
+    print()
 
     # Check specific critical classes
     print("\nCRITICAL CLASS PERFORMANCE (Recall/Sensitivity):")

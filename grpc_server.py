@@ -35,9 +35,9 @@ from grpc_gen import ecg_pb2, ecg_pb2_grpc
 from signal_processing.cleaning import clean_signal
 from scipy.signal import resample_poly
 
-TARGET_FS = 250
+TARGET_FS = 125
 SEGMENT_DURATION_S = 10.0
-SEGMENT_LENGTH = int(TARGET_FS * SEGMENT_DURATION_S)  # 2500 samples
+SEGMENT_LENGTH = int(TARGET_FS * SEGMENT_DURATION_S)  # 1250 samples
 
 # ── Lazy-loaded ML components ──────────────────────────────────────
 _orchestrator = None
@@ -111,7 +111,7 @@ def _extract_features(segment: np.ndarray, r_peaks: np.ndarray) -> dict:
 class DeviceBuffer:
     """Accumulates ECG samples for one device until a full segment is ready."""
 
-    def __init__(self, device_id: str, sample_rate: int = 250):
+    def __init__(self, device_id: str, sample_rate: int = 125):
         self.device_id = device_id
         self.sample_rate = sample_rate
         self.buffer = collections.deque()

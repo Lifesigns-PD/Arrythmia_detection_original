@@ -17,9 +17,9 @@ DB_PARAMS = {
 }
 BASE_DIR = Path(__file__).resolve().parent.parent
 MITDB_DIR = BASE_DIR / "data" / "mitdb_data"
-SEG_LEN = 2500 # 10 seconds at 250Hz
+SEG_LEN = 1250 # 10 seconds at 125Hz
 ORIGINAL_FS = 360
-TARGET_FS = 250
+TARGET_FS = 125
 SCALE_FACTOR = TARGET_FS / ORIGINAL_FS
 
 def get_db_samples(n=10):

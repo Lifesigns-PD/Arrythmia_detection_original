@@ -30,7 +30,7 @@ LABEL_PRIORITY = {
     "Sinus Rhythm": 1
 }
 
-SEG_LEN = 2500  # 10 sec * 250 Hz
+SEG_LEN = 1250  # 10 sec * 125 Hz
 
 def convert_record(record_name):
     try:
@@ -39,16 +39,16 @@ def convert_record(record_name):
         ann = wfdb.rdann(record_path, "atr")
 
         ecg = sig[:, 0]  # channel A
-        fs = fields.get('fs', 250) if isinstance(fields, dict) else fields.fs
-        
+        fs = fields.get('fs', 125) if isinstance(fields, dict) else fields.fs
+
         scale_factor = 1.0
-        if fs != 250:
-            # resample to 250
+        if fs != 125:
+            # resample to 125
             from scipy.signal import resample
             # Calculate scale factor using original fs BEFORE updating it
-            scale_factor = 250 / fs
+            scale_factor = 125 / fs
             ecg = resample(ecg, int(len(ecg) * scale_factor))
-            fs = 250
+            fs = 125
 
         # assign per-beat labels → convert to segment labels
         beat_labels = {}

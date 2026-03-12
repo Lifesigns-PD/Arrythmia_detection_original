@@ -10,7 +10,7 @@ powerline:
   quality_factor: 30
   
 sampling:
-  target_fs: 250
+  target_fs: 125
 
 artifacts:
   # Threshold below which signal is considered flatline (std dev)

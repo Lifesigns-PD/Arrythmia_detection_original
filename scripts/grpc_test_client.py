@@ -28,7 +28,7 @@ from grpc_gen import ecg_pb2, ecg_pb2_grpc
 
 
 # -- Synthetic ECG Generator --
-def generate_synthetic_ecg(duration_s: float = 10.0, fs: int = 250,
+def generate_synthetic_ecg(duration_s: float = 10.0, fs: int = 125,
                             heart_rate: float = 75.0, add_pvcs: bool = False):
     """
     Generate a synthetic ECG-like signal with QRS-like spikes.
@@ -85,7 +85,7 @@ def run_client(host: str = "localhost", port: int = 50051,
     channel = grpc.insecure_channel(f"{host}:{port}")
     stub = ecg_pb2_grpc.ECGServiceStub(channel)
 
-    fs = 250
+    fs = 125
     chunk_size = int(fs * chunk_s)
 
     print("=" * 60)

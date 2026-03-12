@@ -14,9 +14,9 @@ import uuid
 warnings.filterwarnings('ignore', category=UserWarning)
 
 # --- Configuration Constants ---
-TARGET_FS = 250  # Target sampling rate in Hz
+TARGET_FS = 125  # Target sampling rate in Hz
 SEGMENT_DURATION_S = 10.0  # Length of each segment in seconds (Refactored from 5s)
-SEGMENT_LENGTH = int(TARGET_FS * SEGMENT_DURATION_S) # Exactly 2500 samples
+SEGMENT_LENGTH = int(TARGET_FS * SEGMENT_DURATION_S) # Exactly 1250 samples
 HRV_INTERP_FS = 4.0 # Resampling rate for RR intervals for PSD calculation (standard is 4 Hz)
 # Define the root directory where your JSON files are located
 DATA_ROOT_DIR = "data/converted_ecg" 
@@ -47,7 +47,7 @@ class ECGProcessor:
             data = json.load(f)
 
         signal = None
-        original_fs = 250 # Default
+        original_fs = 125 # Default
 
         # Enforce Lead I extraction: Assume first channel is Lead I for PTB-XL and MITDB
         if isinstance(data.get("SensorData"), list) and data["SensorData"]:
@@ -350,7 +350,7 @@ class ECGProcessor:
                     segment_index INT NOT NULL,
                     segment_start_s FLOAT NOT NULL,
                     segment_duration_s FLOAT NOT NULL,
-                    signal_data REAL[], -- The 2500 sample array
+                    signal_data REAL[], -- The 1250 sample array
                     raw_signal JSONB,   -- For dashboard UI
                     arrhythmia_label VARCHAR(255) DEFAULT NULL,
                     r_peaks_in_segment TEXT, -- Segment-relative R-peak indices

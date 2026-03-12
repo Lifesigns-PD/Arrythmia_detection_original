@@ -1,0 +1,59 @@
+STEP 2: Fix Remaining Code Bugs (Before Using Dashboard)
+These bugs will cause crashes or wrong behavior in the dashboard.
+
+2a. Fix decision_engine/rhythm_orchestrator.py
+Returns "Profound Sinus Bradycardia" — this label is NOT in RHYTHM_CLASS_NAMES, causing model mismatch at inference.
+
+2b. Fix models.py default num_classes=7
+The model constructor defaults to 7 classes but the real class counts are 17 (rhythm) and 4 (ectopy). If anyone instantiates the model without specifying num_classes it silently creates wrong architecture.
+
+2c. Fix normalize_label() fallback
+Currently defaults to "Sinus Rhythm" for ANY unrecognized label. This silently masks bad labels. Should return "Other Arrhythmia" or raise a warning.
+
+2d. Fix xai/__init__.py missing
+xai/ module has no __init__.py, causing import failures in some code paths.
+
+2e. Fix eval scripts (broken sys.path)
+These scripts fail with ImportError: from data_loader import CLASS_NAMES
+
+evaluation_and_checks/evaluate_corrected.py
+evaluation_and_checks/evaluate_simple.py
+evaluation_and_checks/evaluate_detailed.py
+evaluation_and_checks/evaluate_current_model.py Need sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "models_training")) added.
+STEP 3: Dashboard Setup & Use
+After training is done and bugs are fixed:
+
+Start the dashboard: python dashboard/app.py
+Open browser: http://localhost:5001
+Review segments — The dashboard shows model predictions for each ECG segment
+Annotate/correct — For segments where the model is wrong, use the dropdown to set the correct label and click "Verify"
+Run finetune after collecting ~50+ corrections:
+
+python models_training/retrain.py --task rhythm --mode finetune --epochs 10
+python models_training/retrain.py --task ectopy --mode finetune --epochs 10
+STEP 4: Connect gRPC Server (For Real-Time Use)
+Once models are trained and dashboard is working:
+
+
+python grpc_server.py
+Test it with:
+
+
+python scripts/grpc_test_client.py
+Priority Order Summary
+Priority	What	Why
+1	Run full training (Step 1)	No production models exist yet
+2	Fix rhythm_orchestrator "Profound Sinus Bradycardia" (2a)	Will cause label mismatch at inference
+3	Fix models.py num_classes=7 (2b)	Will create wrong architecture if default used
+4	Fix xai/init.py (2d)	Dashboard XAI explanation will crash
+5	Fix eval scripts sys.path (2e)	Can't run evaluation without this
+6	Use dashboard + finetune loop (Step 3)	This is the ongoing workflow forever
+7	Fix normalize_label fallback (2c)	Low risk but good hygiene1
+Files to Modify in Step 2
+File	Fix
+decision_engine/rhythm_orchestrator.py	Remove/rename "Profound Sinus Bradycardia" → "Sinus Bradycardia"
+models_training/models.py	Change num_classes=7 default → raise ValueError if not specified
+models_training/data_loader.py	normalize_label() fallback → "Other Arrhythmia" with warning
+xai/__init__.py	Create empty file
+evaluation_and_checks/*.py (4 files)	Add sys.path fix at top
+Stayed in plan mode

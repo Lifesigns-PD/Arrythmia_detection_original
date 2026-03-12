@@ -1,3 +1,4 @@
+
 Clinical Decision Protocol: Hybrid Intelligence System
 1. Executive Summary
 The system utilizes a Neuro-Symbolic Architecture. It combines the pattern-recognition capabilities of a Deep Learning CNN-Transformer (the "Eyes") with a deterministic Clinical Rule Engine (the "Brain"). This ensures that all diagnoses are not only based on waveform shape but also strictly adhere to established cardiology guidelines.

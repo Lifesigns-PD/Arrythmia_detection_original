@@ -31,7 +31,7 @@ def check_db_shape():
         duration, length, filename = row
         print(f"Record: {filename}")
         print(f"Duration: {duration}s (Expected: 10.0)")
-        print(f"Signal Length: {length} samples (Expected: 2500)")
+        print(f"Signal Length: {length} samples (Expected: 1250)")
         
         cur.close()
         conn.close()

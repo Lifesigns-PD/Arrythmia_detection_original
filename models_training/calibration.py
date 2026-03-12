@@ -52,7 +52,7 @@ class TemperatureScaling(nn.Module):
         logits_list = []
         labels_list = []
         with torch.no_grad():
-            for input, label, _, _ in valid_loader:
+            for input, label in valid_loader:
                 input = input.to(device)
                 logits = self.model(input)
                 logits_list.append(logits)

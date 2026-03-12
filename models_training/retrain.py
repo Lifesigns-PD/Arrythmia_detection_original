@@ -128,9 +128,9 @@ class ECGEventDataset(torch.utils.data.Dataset):
     FIX 9: event.get() used everywhere - never KeyError.
     """
 
-    TARGET_FS      = 250
-    WINDOW_SAMPLES = 2500   # Refactored: 10s @ 250Hz - matches CNNTransformerClassifier.TARGET_LEN
-    SLIDE_STEP     = 2500   # No overlap, take full segments
+    TARGET_FS      = 125
+    WINDOW_SAMPLES = 1250   # 10s @ 125Hz - matches CNNTransformerClassifier.TARGET_LEN
+    SLIDE_STEP     = 1250   # No overlap, take full segments
 
     def __init__(self, task="rhythm", source_filter="all", augment=False):
         self.augment = augment
@@ -173,6 +173,13 @@ class ECGEventDataset(torch.utils.data.Dataset):
                 continue
 
             fs = int(fs) if fs else self.TARGET_FS
+
+            # Resample if segment was stored at a different sampling rate
+            if fs != self.TARGET_FS and fs > 0:
+                from scipy.signal import resample as sci_resample
+                target_len = int(len(signal) * self.TARGET_FS / fs)
+                signal = sci_resample(signal, target_len).astype(np.float32)
+                fs = self.TARGET_FS
 
             # Parse events
             try:
@@ -295,7 +302,7 @@ class ECGEventDataset(torch.utils.data.Dataset):
         return wins
 
     def _pad_or_crop(self, signal):
-        """Standardizes signal to exactly WINDOW_SAMPLES (2500)."""
+        """Standardizes signal to exactly WINDOW_SAMPLES (1250)."""
         if len(signal) > self.WINDOW_SAMPLES:
             return signal[:self.WINDOW_SAMPLES]
         elif len(signal) < self.WINDOW_SAMPLES:
@@ -359,7 +366,8 @@ def train_epoch(model, opt, criterion, loader, device):
     return {"loss": total_loss / max(len(y_true), 1), "acc": acc}
 
 
-def eval_epoch(model, criterion, loader, device, num_classes):
+def eval_epoch(model, criterion, loader, device, num_classes, class_names=None):
+    from sklearn.metrics import confusion_matrix, classification_report
     model.eval()
     total_loss = 0.0
     y_true, y_pred = [], []
@@ -378,11 +386,41 @@ def eval_epoch(model, criterion, loader, device, num_classes):
         i: float((yp_arr[y_arr == i] == i).mean()) if (y_arr == i).sum() > 0 else 0.0
         for i in range(num_classes)
     }
+
+    # Confusion matrix
+    labels = list(range(num_classes))
+    cm = confusion_matrix(y_arr, yp_arr, labels=labels)
+    names = class_names or [str(i) for i in labels]
+
+    # Print confusion matrix
+    present = sorted(set(y_arr.tolist()) | set(yp_arr.tolist()))
+    if len(present) > 0:
+        print("\n  Confusion Matrix (rows=true, cols=pred):")
+        hdr = "  {:>20s}".format("") + "".join(f" {names[c][:8]:>8s}" for c in present)
+        print(hdr)
+        for r in present:
+            row_str = "  {:>20s}".format(names[r][:20])
+            for c in present:
+                row_str += f" {cm[r, c]:>8d}"
+            print(row_str)
+
+    # Classification report (precision / recall / F1)
+    try:
+        report_str = classification_report(
+            y_arr, yp_arr, labels=labels, target_names=names, zero_division=0
+        )
+        print(f"\n{report_str}")
+    except Exception:
+        pass
+
     return {
-        "loss":         total_loss / max(len(y_true), 1),
-        "acc":          float((y_arr == yp_arr).mean()),
-        "balanced_acc": float(np.mean(list(per_cls.values()))),
-        "per_class":    per_cls,
+        "loss":            total_loss / max(len(y_true), 1),
+        "acc":             float((y_arr == yp_arr).mean()),
+        "balanced_acc":    float(np.mean(list(per_cls.values()))),
+        "per_class":       per_cls,
+        "confusion_matrix": cm,
+        "y_true":          y_arr,
+        "y_pred":          yp_arr,
     }
 
 # -----------------------------------------------------------------------------
@@ -564,7 +602,7 @@ def run_initial(task, num_epochs, batch_size, lr):
 
     for ep in range(1, num_epochs + 1):
         tr = train_epoch(model, opt, criterion, train_ldr, device)
-        va = eval_epoch(model, criterion, val_ldr, device, num_classes)
+        va = eval_epoch(model, criterion, val_ldr, device, num_classes, class_names)
         scheduler.step(va["loss"])
 
         print(f"Ep {ep:02d}/{num_epochs}  "
@@ -659,7 +697,7 @@ def run_finetune(task, num_epochs, batch_size, lr):
     )
     for ep in range(1, P1_EPOCHS + 1):
         tr = train_epoch(model, opt_p1, criterion, train_ldr, device)
-        va = eval_epoch(model, criterion, val_ldr, device, num_classes)
+        va = eval_epoch(model, criterion, val_ldr, device, num_classes, class_names)
         print(f"  P1 ep {ep:02d}  loss={tr['loss']:.4f} acc={tr['acc']:.3f}  "
               f"val bal_acc={va['balanced_acc']:.3f}")
         # [FIX] Micro-dataset Save Logic: If tiny dataset and perfect training, allow save
@@ -684,7 +722,7 @@ def run_finetune(task, num_epochs, batch_size, lr):
 
     for ep in range(1, P2_EPOCHS + 1):
         tr = train_epoch(model, opt_p2, criterion, train_ldr, device)
-        va = eval_epoch(model, criterion, val_ldr, device, num_classes)
+        va = eval_epoch(model, criterion, val_ldr, device, num_classes, class_names)
         scheduler.step()
         print(f"  P2 ep {ep:02d}  loss={tr['loss']:.4f} acc={tr['acc']:.3f}  "
               f"val bal_acc={va['balanced_acc']:.3f}")

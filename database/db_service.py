@@ -274,6 +274,45 @@ def delete_event(segment_id: int, event_id: str) -> bool:
     finally:
         conn.close()
 
+def update_event_span(segment_id: int, event_id: str, start_time: float, end_time: float) -> bool:
+    """Updates start_time and end_time for a specific event in events_json."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT events_json FROM ecg_features_annotatable WHERE segment_id = %s", (segment_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            raw_data = row[0]
+            data = json.loads(raw_data) if isinstance(raw_data, str) else (raw_data or [])
+
+            def patch_list(evt_list):
+                for ev in evt_list:
+                    if ev.get("event_id") == event_id:
+                        ev["start_time"] = start_time
+                        ev["end_time"] = end_time
+                return evt_list
+
+            if isinstance(data, list):
+                data = patch_list(data)
+            elif isinstance(data, dict):
+                if "events" in data:
+                    data["events"] = patch_list(data["events"])
+                if "final_display_events" in data:
+                    data["final_display_events"] = patch_list(data["final_display_events"])
+
+            cur.execute(
+                "UPDATE ecg_features_annotatable SET events_json = %s WHERE segment_id = %s",
+                (json.dumps(data), segment_id)
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        print("DB ERROR update_event_span:", e)
+        return False
+    finally:
+        conn.close()
+
 def count_confirmed_cardiologist_events() -> int:
     """Counts how many events marked by a cardiologist exist in the ecg_features_annotatable table."""
     conn = _connect()
@@ -498,6 +537,27 @@ def clear_all_annotations(segment_id: int) -> bool:
         return True
     except Exception as e:
         print(f"DB ERROR clear_all_annotations: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def mark_segment_corrected(segment_id: int) -> bool:
+    """Set is_corrected=TRUE and used_for_training=TRUE after event edits."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE ecg_features_annotatable
+                SET is_corrected = TRUE,
+                    used_for_training = TRUE,
+                    corrected_at = NOW()
+                WHERE segment_id = %s
+            """, (segment_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"DB ERROR mark_segment_corrected: {e}")
         return False
     finally:
         conn.close()
