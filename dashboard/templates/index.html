@@ -804,11 +804,33 @@
                     headerIcon.style.display = isVerified ? 'inline' : 'none';
                 }
 
-                // Support auto-generated ML events passed from backend
+                // Populate currentDecision from backend response
+                // The backend now runs the full orchestrator pipeline (ML + rules)
+                // so events already include pattern labels (PVC Bigeminy, NSVT, etc.)
                 if (!currentDecision) currentDecision = {};
                 currentDecision.final_display_events = data.events || [];
+                currentDecision.background_rhythm = data.background_rhythm || "Sinus Rhythm";
+
+                // Show the PRIMARY CONCLUSION immediately from backend events
+                const arrLabel = document.getElementById("arrLabel");
+                if (arrLabel) {
+                    const topEvent = (data.events || []).find(e =>
+                        e.event_type !== "Sinus Rhythm" &&
+                        e.event_type !== "Sinus Bradycardia" &&
+                        e.event_type !== "Sinus Tachycardia" &&
+                        e.event_type !== "Artifact"
+                    );
+                    if (topEvent) {
+                        arrLabel.innerText = topEvent.event_type;
+                        arrLabel.style.color = topEvent.event_category === "ECTOPY" ? "#ff4444" : "var(--accent-secondary)";
+                    } else {
+                        arrLabel.innerText = data.background_rhythm || "Sinus Rhythm";
+                        arrLabel.style.color = "white";
+                    }
+                }
 
                 redraw();
+                evaluateClinicalRules();
                 runAnalysis();
             }
 
@@ -822,24 +844,51 @@
                 const res = await fetch(`/api/xai/${currentSegment}`);
                 const data = await res.json();
                 console.log("XAI Result:", data);
-                currentDecision = data;
+
+                // Preserve ML-generated events from /api/segment/ if /api/xai/ returns empty
+                // (happens for unannotated segments where DB has no events yet)
+                const xaiEvents = data.final_display_events || [];
+                const existingEvents = (currentDecision && currentDecision.final_display_events) || [];
+
+                if (xaiEvents.length > 0) {
+                    // /api/xai/ has events (annotated segment) — use them
+                    currentDecision = data;
+                } else if (existingEvents.length > 0) {
+                    // /api/xai/ is empty but we have ML events from /api/segment/ — keep them
+                    // Only update explanation text and state overlays from /api/xai/
+                    if (data.explanation) currentDecision.explanation = data.explanation;
+                    if (data.segment_state) currentDecision.segment_state = data.segment_state;
+                    // Keep background_rhythm from /api/segment/ if /api/xai/ has generic
+                    if (data.background_rhythm && data.background_rhythm !== "Sinus Rhythm") {
+                        currentDecision.background_rhythm = data.background_rhythm;
+                    }
+                } else {
+                    // Both empty — use /api/xai/ result as-is
+                    currentDecision = data;
+                }
 
                 // Update States
                 const warmupOverlay = document.getElementById("overlayWarmup");
-                if (warmupOverlay) warmupOverlay.classList.toggle("visible", data.segment_state === "WARMUP");
+                if (warmupOverlay) warmupOverlay.classList.toggle("visible", currentDecision.segment_state === "WARMUP");
                 const unreliableOverlay = document.getElementById("overlayUnreliable");
-                if (unreliableOverlay) unreliableOverlay.classList.toggle("visible", data.segment_state === "UNRELIABLE");
+                if (unreliableOverlay) unreliableOverlay.classList.toggle("visible", currentDecision.segment_state === "UNRELIABLE");
 
                 // Labels
-                document.getElementById("backgroundLabel").innerText = "Background: " + data.background_rhythm;
-                document.getElementById("xaiText").innerHTML = (data.explanation || "").replace(/\n/g, "<br>");
+                document.getElementById("backgroundLabel").innerText = "Background: " + (currentDecision.background_rhythm || "Sinus Rhythm");
+                document.getElementById("xaiText").innerHTML = (currentDecision.explanation || "").replace(/\n/g, "<br>");
 
-                const displayEvents = data.final_display_events || [];
-                if (displayEvents.length > 0) {
-                    document.getElementById("arrLabel").innerText = displayEvents[0].event_type;
-                    document.getElementById("arrLabel").style.color = displayEvents[0].event_category === "ECTOPY" ? "#ff4444" : "var(--accent-secondary)";
+                const displayEvents = currentDecision.final_display_events || [];
+                const topEvt = displayEvents.find(e =>
+                    e.event_type !== "Sinus Rhythm" &&
+                    e.event_type !== "Sinus Bradycardia" &&
+                    e.event_type !== "Sinus Tachycardia" &&
+                    e.event_type !== "Artifact"
+                );
+                if (topEvt) {
+                    document.getElementById("arrLabel").innerText = topEvt.event_type;
+                    document.getElementById("arrLabel").style.color = topEvt.event_category === "ECTOPY" ? "#ff4444" : "var(--accent-secondary)";
                 } else {
-                    document.getElementById("arrLabel").innerText = data.background_rhythm;
+                    document.getElementById("arrLabel").innerText = currentDecision.background_rhythm || "Sinus Rhythm";
                     document.getElementById("arrLabel").style.color = "white";
                 }
                 if (data.explanation) {
@@ -903,9 +952,9 @@
                 const h = canvas.height / dpr;
                 ctx.clearRect(0, 0, w, h);
 
-                // Margins: left for amplitude labels, bottom for time labels
-                const PAD_L = 52;
-                const PAD_B = 26;
+                // No axis labels — use minimal padding
+                const PAD_L = 8;
+                const PAD_B = 4;
                 const pw = w - PAD_L;   // plot width
                 const ph = h - PAD_B;   // plot height
 
@@ -925,59 +974,7 @@
                 const smpX = (s) => PAD_L + ((s - start) / (visible.length - 1)) * pw;
                 const ampY = (v) => ph / 2 - (v - mid) * scaleY;
 
-                // --- TIME AXIS (bottom) ---
-                ctx.fillStyle = "rgba(200,200,200,0.85)";
-                ctx.font = "10px monospace";
-                ctx.textBaseline = "top";
-                ctx.textAlign = "center";
-                const durationSec = (visible.length - 1) / segmentFs;
-                // Pick a nice tick interval based on visible duration
-                const tickIntervals = [0.1, 0.2, 0.5, 1, 2, 5];
-                let tickStep = 1;
-                for (const ti of tickIntervals) {
-                    if ((durationSec / ti) <= 20) { tickStep = ti; break; }
-                }
-                const tickStepSamples = tickStep * segmentFs;
-                const tickStart = Math.ceil(start / tickStepSamples) * tickStepSamples;
-                for (let s = tickStart; s <= start + visible.length; s += tickStepSamples) {
-                    const gx = smpX(s);
-                    if (gx < PAD_L || gx > PAD_L + pw) continue;
-                    const timeSec = s / segmentFs;
-                    // Small tick mark
-                    ctx.strokeStyle = "rgba(200,200,200,0.5)";
-                    ctx.lineWidth = 1;
-                    ctx.beginPath(); ctx.moveTo(gx, ph); ctx.lineTo(gx, ph + 4); ctx.stroke();
-                    // Label
-                    ctx.fillText(timeSec.toFixed(1) + "s", gx, ph + 5);
-                }
-
-                // --- AMPLITUDE AXIS (left) ---
-                ctx.textBaseline = "middle";
-                ctx.textAlign = "right";
-                // Pick a nice amplitude tick step
-                const ampTicks = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0];
-                let ampStep = 0.2;
-                for (const at of ampTicks) {
-                    if ((range / at) <= 12) { ampStep = at; break; }
-                }
-                const ampLo = Math.floor(min / ampStep) * ampStep;
-                const ampHi = Math.ceil(max / ampStep) * ampStep;
-                for (let a = ampLo; a <= ampHi; a += ampStep) {
-                    const gy = ampY(a);
-                    if (gy < 2 || gy > ph - 2) continue;
-                    // Small tick mark
-                    ctx.strokeStyle = "rgba(200,200,200,0.5)";
-                    ctx.lineWidth = 1;
-                    ctx.beginPath(); ctx.moveTo(PAD_L - 4, gy); ctx.lineTo(PAD_L, gy); ctx.stroke();
-                    // Faint horizontal guide line
-                    ctx.strokeStyle = "rgba(200,200,200,0.15)";
-                    ctx.beginPath(); ctx.moveTo(PAD_L, gy); ctx.lineTo(PAD_L + pw, gy); ctx.stroke();
-                    // Label
-                    ctx.fillStyle = "rgba(200,200,200,0.85)";
-                    ctx.fillText(a.toFixed(2), PAD_L - 6, gy);
-                }
-                ctx.textBaseline = "alphabetic";
-                ctx.textAlign = "left";
+                // Axis labels removed — clean waveform view
 
                 // --- EVENT SPAN BANDS (behind trace) ---
                 const evList = editingEvents || (currentDecision && currentDecision.final_display_events) || [];
@@ -1352,16 +1349,59 @@
 
                 indices.forEach(idx => {
                     const timeSec = idx / segmentFs;
+                    // Find sequential beat index from rPeaks array
+                    const seqIdx = rPeaks.indexOf(idx);
+                    const beatIndices = seqIdx !== -1 ? [seqIdx] : [];
                     const newEvent = {
                         event_id: "local_" + Math.random().toString(36).substr(2, 9),
                         event_type: label,
                         event_category: (label.toUpperCase().includes("PVC") || label.toUpperCase().includes("PAC")) ? "ECTOPY" : "RHYTHM",
                         start_time: Math.max(0, timeSec - 0.3),
                         end_time: timeSec + 0.3,
+                        beat_indices: beatIndices,
                         annotation_source: source
                     };
                     currentDecision.final_display_events.push(newEvent);
                 });
+                redraw();
+                // Run backend pattern detection on all current beat events
+                detectPatternsFromBackend();
+            }
+
+            async function detectPatternsFromBackend() {
+                if (!currentDecision || !currentDecision.final_display_events) return;
+                const bg = currentDecision.background_rhythm || "Sinus Rhythm";
+                try {
+                    const resp = await fetch("/api/detect_patterns", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            events: currentDecision.final_display_events,
+                            background_rhythm: bg
+                        })
+                    });
+                    const data = await resp.json();
+                    if (data.final_display_events) {
+                        currentDecision.final_display_events = data.final_display_events;
+                        currentDecision.background_rhythm = data.background_rhythm || bg;
+                        // Update background rhythm label in the UI
+                        const bgLabel = document.getElementById("backgroundLabel");
+                        if (bgLabel) bgLabel.innerText = "Background: " + currentDecision.background_rhythm;
+                        // Auto-sync the diagnosis dropdown so VERIFY saves the correct label
+                        // This prevents the rhythm model from training on a wrong label
+                        const sel = document.getElementById("diagnosis-select");
+                        if (sel && currentDecision.background_rhythm) {
+                            for (let i = 0; i < sel.options.length; i++) {
+                                if (sel.options[i].value === currentDecision.background_rhythm) {
+                                    sel.selectedIndex = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.warn("Pattern detection failed:", err);
+                }
                 redraw();
                 evaluateClinicalRules();
             }
@@ -1369,88 +1409,69 @@
             function evaluateClinicalRules() {
                 if (!currentDecision || !currentDecision.final_display_events) return;
 
-                // 1. GET CURRENT BACKGROUND RHYTHM (To prevent Erasure Bug)
-                const rhythmSelect = document.getElementById("diagnosis-select");
-                let currentRhythm = rhythmSelect ? rhythmSelect.options[rhythmSelect.selectedIndex].text : "";
+                // ---------------------------------------------------------
+                // BACKEND-FIRST: Pattern detection (PVC Bigeminy, NSVT, etc.)
+                // is now done by the backend rules engine. The dashboard only
+                // displays the result. No V/N/A sequence matching here.
+                // ---------------------------------------------------------
 
-                // Define "Locked" Tier-1 Rhythms that should NEVER be overwritten by simple ectopy
+                const events = currentDecision.final_display_events;
+                const currentRhythm = currentDecision.background_rhythm || "Sinus Rhythm";
                 const isLockedRhythm = currentRhythm.includes("Fibrillation") ||
                     currentRhythm.includes("Flutter") ||
                     currentRhythm.includes("Block");
 
-                // 2. BUILD THE SEQUENCE (Using R-peaks for absolute precision)
-                let pvcIndices = [];
-                let pacIndices = [];
-                currentDecision.final_display_events.forEach(e => {
-                    const type = e.event_type.toUpperCase();
-                    const isV = type.includes("PVC") || type.includes("VENTRICULAR");
-                    const isA = type.includes("PAC") || type.includes("ATRIAL");
-                    if (!isV && !isA) return;
-
-                    const center = (e.start_time + e.end_time) / 2 * segmentFs;
-                    let closest = -1; let minDist = 40;
-                    rPeaks.forEach((p, idx) => {
-                        if (Math.abs(p - center) < minDist) { minDist = Math.abs(p - center); closest = idx; }
-                    });
-                    if (closest !== -1) {
-                        if (isV) pvcIndices.push(closest);
-                        else pacIndices.push(closest);
-                    }
-                });
-
-                let seq = rPeaks.map((_, i) => {
-                    if (pvcIndices.includes(i)) return 'V';
-                    if (pacIndices.includes(i)) return 'A';
-                    return 'N';
-                }).join('');
-
-                let vLabel = null, vPriority = 0;
-                let aLabel = null, aPriority = 0;
-
-                // 3. VENTRICULAR RULES
-                if (seq.includes('VVVV')) { vLabel = "NSVT"; vPriority = 100; }
-                else if (seq.includes('VVV')) { vLabel = "Ventricular Triplet"; vPriority = 80; }
-                else if (seq.includes('VNVNVN') || seq.includes('NVNVNV')) { vLabel = "PVC Bigeminy"; vPriority = 70; }
-                else if (seq.includes('VNNVNN') || seq.includes('NNVNNV') || seq.includes('NVNNVN')) { vLabel = "PVC Trigeminy"; vPriority = 60; }
-                else if (seq.includes('VNNNVNNN') || seq.includes('NNNVNNNV') || seq.includes('NVNNNVNN') || seq.includes('NNVNNNVN')) { vLabel = "PVC Quadrigeminy"; vPriority = 50; }
-                else if (seq.includes('VV')) { vLabel = "PVC Couplet"; vPriority = 40; }
-                else if (seq.includes('V')) { vLabel = "PVC"; vPriority = 20; }
-
-                // 4. ATRIAL RULES (Disable Atrial Rules if patient is in AFib/Flutter)
-                if (!currentRhythm.includes("Fibrillation") && !currentRhythm.includes("Flutter")) {
-                    if (seq.includes('AAAA')) { aLabel = "PSVT"; aPriority = 90; }
-                    else if (seq.includes('AAA')) { aLabel = "Atrial Triplet"; aPriority = 75; }
-                    else if (seq.includes('ANANAN') || seq.includes('NANANA')) { aLabel = "PAC Bigeminy"; aPriority = 65; }
-                    else if (seq.includes('ANNANN') || seq.includes('NNANNA') || seq.includes('NANNAN')) { aLabel = "PAC Trigeminy"; aPriority = 55; }
-                    else if (seq.includes('ANNNANNN') || seq.includes('NNNANNN') || seq.includes('NANNNANN') || seq.includes('NNANNNAN')) { aLabel = "PAC Quadrigeminy"; aPriority = 45; }
-                    else if (seq.includes('AA')) { aLabel = "PAC Couplet"; aPriority = 35; }
-                    else if (seq.includes('A')) { aLabel = "PAC"; aPriority = 10; }
-                }
-
-                // 5. DETERMINE THE WINNER
+                // 1. Find the highest-priority event from the backend
+                //    Events are already sorted by priority (descending) from apply_display_rules()
                 let autoLabel = null;
-                if (vPriority > 0 || aPriority > 0) {
-                    autoLabel = (vPriority >= aPriority) ? vLabel : aLabel;
+                if (events.length > 0) {
+                    // Find the top non-trivial event
+                    const top = events.find(e =>
+                        e.event_type !== "Sinus Rhythm" &&
+                        e.event_type !== "Sinus Bradycardia" &&
+                        e.event_type !== "Sinus Tachycardia" &&
+                        e.event_type !== "Artifact"
+                    );
+                    if (top) {
+                        autoLabel = top.event_type;
+                    }
                 }
 
-                // 6. APPLY TO UI CAREFULLY (No Dropdown Hijacking!)
+                // 2. Cardiologist override: if cardiologist explicitly applied a segment-level
+                //    pattern label (via Apply Batch with no beats selected), honour it directly.
+                const cardioExplicit = events.find(e =>
+                    e.annotation_source === "cardiologist" &&
+                    e.start_time === 0.0 && e.end_time >= 9.0
+                );
+                if (cardioExplicit &&
+                    cardioExplicit.event_type !== "Sinus Rhythm" &&
+                    cardioExplicit.event_type !== "Artifact") {
+                    autoLabel = cardioExplicit.event_type;
+                    // Sync the dropdown so Verify sends the correct training label
+                    const sel = document.getElementById("diagnosis-select");
+                    if (sel) {
+                        for (let i = 0; i < sel.options.length; i++) {
+                            if (sel.options[i].value === cardioExplicit.event_type) {
+                                sel.selectedIndex = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Update the PRIMARY CONCLUSION badge
                 const aiBadge = document.getElementById("ui-ai-pred");
-                if (aiBadge) { // Ensure aiBadge exists before manipulating
+                if (aiBadge) {
                     if (autoLabel) {
-                        // Let the AI Badge show the full complex clinical deduction
                         if (isLockedRhythm) {
                             aiBadge.innerText = `AI Deduction: ${currentRhythm} + ${autoLabel}`;
-                            aiBadge.style.color = "#00ff99"; // Neon Green for positive rule match
+                            aiBadge.style.color = "#00ff99";
                         } else {
-                            aiBadge.innerText = autoLabel; // Show just the autoLabel
-                            aiBadge.style.color = "white"; // White for rule engine override
+                            aiBadge.innerText = autoLabel;
+                            aiBadge.style.color = "white";
                         }
-
-                        // --> WE DELETED THE CODE THAT CHANGES THE DROPDOWN HERE <--
-                        // The dropdown remains untouched so the doctor has total control.
                     } else {
-                        // If no automatic trigger found, show background rhythm in white
-                        aiBadge.innerText = currentDecision.background_rhythm || "Sinus Rhythm";
+                        aiBadge.innerText = currentRhythm;
                         aiBadge.style.color = "#00ffd0";
                     }
                 }
@@ -1508,11 +1529,16 @@
                         if (evt) {
                             evt.event_type = label;
                             evt.event_category = (label.toUpperCase().includes("PVC") || label.toUpperCase().includes("PAC")) ? "ECTOPY" : "RHYTHM";
-                            evt.annotation_source = "cardiologist"; // Overwrite ML if user touches it
+                            evt.annotation_source = "cardiologist";
+                            // Ensure beat_indices is set for pattern detection
+                            if ((!evt.beat_indices || evt.beat_indices.length === 0) && rightClickedBeatIdx !== -1) {
+                                const seqIdx = rPeaks.indexOf(rightClickedBeatIdx);
+                                if (seqIdx !== -1) evt.beat_indices = [seqIdx];
+                            }
                         }
                     }
-                    evaluateClinicalRules();
                     redraw();
+                    detectPatternsFromBackend();
                 } else if (rightClickedBeatIdx !== -1) {
                     addLocalEvent([rightClickedBeatIdx], label, "cardiologist");
                 }
@@ -1558,19 +1584,43 @@
             }
 
             // Batch Apply Logic
+            // Labels that only make sense on a specific beat — require beat selection
+            const BEAT_LEVEL_LABELS = new Set(["PVC", "PAC", "Artifact", "Sinus Rhythm"]);
+
             document.getElementById("apply-batch-btn").onclick = function () {
-                if (selectedBeats.length === 0) {
-                    alert("Please select beats first (Left-Click them).");
-                    return;
-                }
                 const label = document.getElementById('diagnosis-select').value;
                 if (!label) {
                     alert("Please select a diagnosis from the dropdown.");
                     return;
                 }
-                addLocalEvent(selectedBeats, label, "cardiologist");
-                selectedBeats = [];
-                updateSelectionCount();
+
+                if (selectedBeats.length === 0) {
+                    // No beats selected — apply as a full 10-second segment-level annotation.
+                    // Beat-level labels (PVC, PAC, etc.) still require a beat to be meaningful.
+                    if (BEAT_LEVEL_LABELS.has(label)) {
+                        alert("Please left-click individual beats first for single-beat labels (PVC, PAC, etc.).\nFor pattern labels like Bigeminy or AF, you can apply without selecting beats.");
+                        return;
+                    }
+                    // Segment-level: one event spanning the full 10s
+                    if (!currentDecision) currentDecision = {};
+                    if (!currentDecision.final_display_events) currentDecision.final_display_events = [];
+                    currentDecision.final_display_events.push({
+                        event_id: "local_" + Math.random().toString(36).substr(2, 9),
+                        event_type: label,
+                        event_category: (label.toUpperCase().includes("PVC") || label.toUpperCase().includes("PAC")) ? "ECTOPY" : "RHYTHM",
+                        start_time: 0.0,
+                        end_time: 10.0,
+                        annotation_source: "cardiologist",
+                        annotation_status: "confirmed"
+                    });
+                    redraw();
+                    evaluateClinicalRules();
+                } else {
+                    // Beats selected — apply per-beat events as before
+                    addLocalEvent(selectedBeats, label, "cardiologist");
+                    selectedBeats = [];
+                    updateSelectionCount();
+                }
             };
 
             document.getElementById("clear-selection-btn").onclick = () => {
@@ -1638,9 +1688,25 @@
                     });
 
                     // 3. Mark the segment background rhythm & status as analyzed/verified
+                    // TRAINING SAFETY: arrhythmia_label feeds the RHYTHM model (17 classes).
+                    // It must ALWAYS be a rhythm-level label (Sinus Rhythm, AF, VT, etc.)
+                    // Ectopy labels (PVC, PAC, PVC Bigeminy) go via events_json → ectopy model.
+                    // The dropdown may contain ectopy labels for display, but we send
+                    // the actual background rhythm for training.
+                    const ECTOPY_LABELS = new Set([
+                        "PVC", "PAC", "PVC Bigeminy", "PVC Trigeminy", "PVC Couplet",
+                        "PVC Quadrigeminy", "PAC Bigeminy", "PAC Trigeminy", "PAC Quadrigeminy",
+                        "PAC Couplet", "NSVT", "PSVT", "Ventricular Triplet", "Atrial Triplet",
+                        "Atrial Couplet", "Ventricular Run", "Atrial Run", "Run", "None"
+                    ]);
+                    const dropdownLabel = label || "Sinus Rhythm";
+                    const rhythmForTraining = ECTOPY_LABELS.has(dropdownLabel)
+                        ? (currentDecision.background_rhythm || "Sinus Rhythm")
+                        : dropdownLabel;
+
                     const payload = {
                         segment_id: currentSegment,
-                        background_rhythm: label || "Sinus Rhythm",
+                        background_rhythm: rhythmForTraining,
                         notes: notes,
                         events: finalEvents
                     };

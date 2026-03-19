@@ -506,9 +506,6 @@ def update_segment_status(segment_id: int, background_rhythm: str = 'Unlabeled',
             
         conn.commit()
         return True
-            
-        conn.commit()
-        return True
     except Exception as e:
         print(f"DB ERROR update_segment_status: {e}")
         return False
@@ -524,8 +521,8 @@ def clear_all_annotations(segment_id: int) -> bool:
             # We ONLY reset the manual markers and training flags. 
             # We DO NOT overwrite the arrhythmia_label with "Unlabeled"!
             cur.execute("""
-                UPDATE ecg_features_annotatable 
-                SET events_json = '[]'::jsonb, 
+                UPDATE ecg_features_annotatable
+                SET events_json = '{"events": [], "final_display_events": [], "cleared": true}'::jsonb,
                     cardiologist_notes = '',
                     is_corrected = FALSE,
                     used_for_training = FALSE,

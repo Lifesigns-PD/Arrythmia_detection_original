@@ -236,8 +236,9 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                 # Label individual beats for dashboard highlight
                 for e in cluster: e.pattern_label = pattern_name
 
-            # Rule 2: NSVT / PSVT (>3 consecutive beats, i.e. 4+)
-            elif is_consecutive and count > 3:
+            # Rule 2: NSVT / PSVT (>3 consecutive beats, i.e. 4+, rate >= 100 bpm)
+            # Rate guard: bigeminy PVC-to-PVC rate ~35 bpm, NSVT requires >= 100 bpm by definition
+            elif is_consecutive and count > 3 and rate >= 100:
                 event_type = "NSVT" if target_type == "PVC" else "PSVT"
                 priority = 90 if target_type == "PVC" else 85
                 

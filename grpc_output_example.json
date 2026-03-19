@@ -1,0 +1,220 @@
+{
+  "input": {
+    "device_id": "monitor_ward3_bed7",
+    "patient_id": "123456789",
+    "sample_rate": 125,
+    "timestamp": 1742198400000,
+    "values": [
+      0.12,
+      0.15,
+      0.18,
+      "...continuous ECG voltage stream in mV (5000 samples = 10s at 500Hz)"
+    ]
+  },
+  "examples": [
+    {
+      "_description": "EXAMPLE  — Rhythm arrhythmia: Atrial Fibrillation detected across the full 10s window",
+      "output": {
+        "arrhythmia_type": "Atrial Fibrillation",
+        "confidence": 0.93,
+        "message": "[monitor_ward3_bed7] Atrial Fibrillation detected (HR: 112 bpm)",
+        "patient_id": "123456789",
+        "timestamp": 1742198400000,
+        "pr_interval": 180,
+        "qrs_duration": 120,
+        "mean_hr": 112,
+        "rr_intervals_ms": [
+          800,
+          750,
+          850,
+          700,
+          900,
+          720,
+          830,
+          780,
+          810,
+          740
+        ],
+        "detection_window": {
+          "description": "Rhythm-level arrhythmia — spans the entire 10-second analysis window",
+          "beat_events": {
+            "event_flag": "True",
+            "events": [
+              {
+                "beat_idx": 0,
+                "peak_sample": 87,
+                "start_pos": 50,
+                "end_pos": 124,
+                "label": "None",
+                "confidence": 0.91
+              },
+              {
+                "beat_idx": 1,
+                "peak_sample": 196,
+                "start_pos": 159,
+                "end_pos": 233,
+                "label": "None",
+                "confidence": 0.85
+              },
+              {
+                "beat_idx": 2,
+                "peak_sample": 289,
+                "start_pos": 252,
+                "end_pos": 326,
+                "label": "None",
+                "confidence": 0.88
+              },
+              {
+                "beat_idx": 3,
+                "peak_sample": 384,
+                "start_pos": 347,
+                "end_pos": 421,
+                "label": "None",
+                "confidence": 0.90
+              },
+              {
+                "beat_idx": 4,
+                "peak_sample": 490,
+                "start_pos": 453,
+                "end_pos": 527,
+                "label": "None",
+                "confidence": 0.87
+              },
+              {
+                "beat_idx": 5,
+                "peak_sample": 581,
+                "start_pos": 544,
+                "end_pos": 618,
+                "label": "None",
+                "confidence": 0.92
+              },
+              {
+                "beat_idx": 6,
+                "peak_sample": 685,
+                "start_pos": 648,
+                "end_pos": 722,
+                "label": "None",
+                "confidence": 0.89
+              },
+              {
+                "beat_idx": 7,
+                "peak_sample": 778,
+                "start_pos": 741,
+                "end_pos": 815,
+                "label": "None",
+                "confidence": 0.86
+              },
+              {
+                "beat_idx": 8,
+                "peak_sample": 879,
+                "start_pos": 842,
+                "end_pos": 916,
+                "label": "None",
+                "confidence": 0.91
+              },
+              {
+                "beat_idx": 9,
+                "peak_sample": 972,
+                "start_pos": 935,
+                "end_pos": 1009,
+                "label": "None",
+                "confidence": 0.84
+              },
+              {
+                "beat_idx": 10,
+                "peak_sample": 1075,
+                "start_pos": 1038,
+                "end_pos": 1112,
+                "label": "None",
+                "confidence": 0.88
+              },
+              {
+                "beat_idx": 11,
+                "peak_sample": 1168,
+                "start_pos": 1131,
+                "end_pos": 1205,
+                "label": "None",
+                "confidence": 0.90
+              }
+            ]
+          }
+        },
+        "xai_explanation": {
+          "rhythm": {
+            "label": "Atrial Fibrillation",
+            "class_probabilities": {
+              "Sinus Rhythm": 0.02,
+              "Sinus Bradycardia": 0.01,
+              "Atrial Fibrillation": 0.93,
+              "Atrial Flutter": 0.02
+            },
+            "transformer_attention": "Model focus concentrated at samples 150, 588, and 1038 — irregular RR intervals consistent with AF"
+          },
+          "ectopy": {
+            "label": "None",
+            "confidence": 0.88,
+            "beat_events": [
+              {
+                "beat_idx": 0,
+                "peak_sample": 87,
+                "start_pos": 50,
+                "end_pos": 124,
+                "label": "None",
+                "confidence": 0.91
+              },
+              {
+                "beat_idx": 1,
+                "peak_sample": 196,
+                "start_pos": 159,
+                "end_pos": 233,
+                "label": "None",
+                "confidence": 0.85
+              },
+              {
+                "beat_idx": 2,
+                "peak_sample": 289,
+                "start_pos": 252,
+                "end_pos": 326,
+                "label": "None",
+                "confidence": 0.88
+              },
+              {
+                "beat_idx": 3,
+                "peak_sample": 384,
+                "start_pos": 347,
+                "end_pos": 421,
+                "label": "None",
+                "confidence": 0.90
+              }
+            ]
+          },
+          "saliency": {
+            "description": "Gradient saliency map — normalized 0.0 to 1.0 per sample. High values = signal regions that most influenced the model decision.",
+            "values": [
+              0.02,
+              0.05,
+              0.41,
+              0.87,
+              0.93,
+              0.76,
+              0.31,
+              0.04,
+              "...1250 values total, one per sample at 125Hz"
+            ]
+          },
+          "clinical_reasoning": "The CNN+Transformer model detected irregularly irregular RR intervals with absent P-waves across the 10-second window. The baseline shows fibrillatory activity between QRS complexes. Heart rate variability (SDNN: 48ms, RMSSD: 52ms) is elevated, consistent with AF. No ectopic beats were identified. Classification: Atrial Fibrillation (confidence 93%)."
+        }
+      }
+    }
+  ],
+  "notes": {
+    "normal_sinus": "No output is sent for normal sinus rhythm — silence means healthy",
+    "multiple_findings": "If two arrhythmias are found in the same 10s window, two separate output messages are streamed",
+    "confidence": "0.0 to 1.0 — values above 0.7 are high confidence",
+    "timestamp": "Milliseconds Unix epoch — echoed from the client input",
+    "start_pos_end_pos": "Each beat event has start_pos and end_pos (sample indices within the 1250-sample segment at 125Hz). Computed as peak_sample ± 37 (0.3s × 125Hz), clamped to [0, 1250]. These define the beat's sample window.",
+    "detection_window": "start_pos/end_pos mark the sample range where the arrhythmia was detected. Rhythm arrhythmias span the full segment (0–1250). Ectopy patterns span only the affected beats' range.",
+    "pattern_detection": "Shows how the rules engine derived the pattern from individual beat classifications: beat_indices → diffs → pattern name",
+    "xai_note": "xai_explanation is the internal AI reasoning block. The 5 proto fields (arrhythmia_type, confidence, message, timestamp, xai) are what is transmitted over the gRPC wire. Full XAI detail is also available via the dashboard REST endpoint: GET /api/xai/<segment_id>"
+  }
+}

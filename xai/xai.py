@@ -508,34 +508,43 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
                 e_probs = F.softmax(e_logits, dim=1)[0].cpu().numpy()
             e_idx = int(np.argmax(e_probs))
             e_label = ECTOPY_CLASS_NAMES[e_idx]
+            beat_records = []  # no per-beat data without r_peaks
         else:
-            # Multi-beat inference
-            all_e_probs = []
-            for peak_idx in r_peaks:
+            # Multi-beat inference — keep per-beat records for bigeminy/trigeminy detection
+            all_e_probs  = []
+            beat_records = []
+            for beat_idx, peak_idx in enumerate(r_peaks):
                 # Center 2s window on this peak
                 start_s = (peak_idx / fs) - 1.0
                 end_s = (peak_idx / fs) + 1.0
                 beat_window = extract_fixed_window(arr, fs, start_s, end_s)
                 bx = torch.from_numpy(beat_window[None, None, :]).to(device)
-                
+
                 with torch.no_grad():
                     be_logits = model_ectopy(bx)
                     be_probs = F.softmax(be_logits, dim=1)[0].cpu().numpy()
                 all_e_probs.append(be_probs)
-            
-            # Aggregate: Take max probability across all beats for non-Sinus classes
-            all_e_probs = np.array(all_e_probs) # (N_beats, N_classes)
-            # Index 0 is "None" or "Normal" ectopy-wise
+
+                b_idx_top = int(np.argmax(be_probs))
+                beat_records.append({
+                    "beat_idx":    beat_idx,             # sequential position in r_peaks list
+                    "peak_sample": int(peak_idx),        # sample index in the segment
+                    "label":       ECTOPY_CLASS_NAMES[b_idx_top],
+                    "conf":        float(be_probs[b_idx_top]),
+                    "probs":       be_probs.tolist(),
+                })
+
+            # Aggregate: Take max probability across all beats for segment-level label
+            all_e_probs = np.array(all_e_probs)  # (N_beats, N_classes)
             max_probs = np.max(all_e_probs, axis=0)
-            
-            # If any specific ectopy (PVC/PAC/Run) has high confidence, pick the max one
-            ectopy_indices = [1, 2, 3] # PVC, PAC, Run
+
+            ectopy_indices = [1, 2, 3]  # PVC, PAC, Run
             if np.max(max_probs[ectopy_indices]) > 0.4:
                 e_idx = int(np.argmax(max_probs))
             else:
-                e_idx = 0 # Default to "None"
-            
-            e_probs = max_probs # For transparency
+                e_idx = 0  # Default to "None"
+
+            e_probs = max_probs
             e_label = ECTOPY_CLASS_NAMES[e_idx]
 
         # 3. Evidence Gathering
@@ -552,7 +561,8 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
             "ectopy": {
                 "label": e_label,
                 "confidence": float(e_probs[e_idx]),
-                "probs": e_probs.tolist()
+                "probs": e_probs.tolist(),
+                "beat_events": beat_records,   # per-beat predictions for bigeminy/trigeminy detection
             },
             "saliency": saliency
         }

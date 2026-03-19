@@ -313,46 +313,57 @@ def _sanitize_features(features: Dict[str, Any]) -> Dict[str, Any]:
 
 def _calculate_pr_interval(signal: np.ndarray, r_peaks: np.ndarray, fs: int) -> float:
     """
-    Estimate PR interval using NeuroKit2 Delineation.
-    Returns median PR interval in ms.
+    Estimate PR interval in ms.
+    Primary: NeuroKit2 DWT delineation (P-onset → R-onset).
+    Fallback: geometric search — for each R-peak find the highest point in the
+              expected P-wave window [R-250ms, R-60ms] of a bandpass-filtered signal.
+    Returns 0.0 only when fewer than 2 valid estimates exist (e.g. AF, no P-waves).
     """
     if r_peaks is None or len(r_peaks) == 0:
         return 0.0
 
+    def _geometric_pr(sig, peaks, sampling_rate):
+        """Search [R-250ms, R-60ms] for P-peak; return median PR in ms."""
+        lo_samp = int(0.250 * sampling_rate)
+        hi_samp = int(0.060 * sampling_rate)
+        nyq = 0.5 * sampling_rate
+        b, a = butter(2, [0.5 / nyq, 20.0 / nyq], btype="band")
+        filtered = filtfilt(b, a, sig.astype(np.float64))
+        pr_vals = []
+        for r in peaks:
+            win_start = r - lo_samp
+            win_end   = r - hi_samp
+            if win_start < 0 or win_end <= win_start:
+                continue
+            p_peak = win_start + int(np.argmax(filtered[win_start:win_end]))
+            pr_ms  = (r - p_peak) * 1000.0 / sampling_rate
+            if 80.0 <= pr_ms <= 400.0:
+                pr_vals.append(pr_ms)
+        return float(np.median(pr_vals)) if len(pr_vals) >= 2 else 0.0
+
+    # --- Primary: NeuroKit2 DWT ---
     try:
-        # Use NeuroKit's DWT method for delineation
-        # IMPROVEMENT: Apply 40Hz lowpass before delineation to ignore high-frequency noise
         nyq = 0.5 * fs
-        b, a = butter(2, 40/nyq, btype='low')
+        b, a = butter(2, 40 / nyq, btype="low")
         smooth_sig = filtfilt(b, a, signal)
 
         _, waves = nk.ecg_delineate(smooth_sig, r_peaks, sampling_rate=fs, method="dwt", show=False)
-        
-        # P-onset to R-onset (beginning of QRS)
+
         p_onsets = np.array(waves.get("ECG_P_Onsets", []))
         r_onsets = np.array(waves.get("ECG_R_Onsets", []))
-        
-        if len(p_onsets) == 0 or len(r_onsets) == 0:
-            return 0.0
-            
-        valid = ~pd.isna(p_onsets) & ~pd.isna(r_onsets)
-        
-        if np.sum(valid) == 0:
-            return 0.0
-            
-        pr_vals = (r_onsets[valid] - p_onsets[valid]) * 1000.0 / fs
-        
-        # Filter valid range (100 - 400 ms) - Short PR < 100 is rare in normal sinus
-        pr_vals = pr_vals[(pr_vals >= 100) & (pr_vals <= 400)]
-        
-        if len(pr_vals) == 0:
-             return 0.0
-             
-        return float(np.nanmedian(pr_vals))
-        
+
+        if len(p_onsets) > 0 and len(r_onsets) > 0:
+            valid  = ~pd.isna(p_onsets) & ~pd.isna(r_onsets)
+            if np.sum(valid) > 0:
+                pr_vals = (r_onsets[valid] - p_onsets[valid]) * 1000.0 / fs
+                pr_vals = pr_vals[(pr_vals >= 80) & (pr_vals <= 400)]
+                if len(pr_vals) >= 2:
+                    return float(np.nanmedian(pr_vals))
     except Exception as e:
-        print(f"NK PR Failed: {e}")
-        return 0.0
+        print(f"NK PR delineation failed: {e}")
+
+    # --- Fallback: geometric P-wave search ---
+    return _geometric_pr(signal, r_peaks, fs)
 
 
 def _extract_segment_features(
@@ -643,10 +654,60 @@ def api_xai(segment_id: int):
 
 
 # =========================================================
-# Segment Fetch (ECG + Features + Annotation) for Dashboard
+# Morphology Feature Extraction Endpoint
 # =========================================================
 
+@app.route("/api/morphology/<int:segment_id>")
+def api_morphology(segment_id: int):
+    """
+    Returns detailed ECG morphology features (P wave, QRS, ST, T wave, QTc, etc.)
+    for a given segment. Used for XAI clinical reporting.
+    """
+    try:
+        from signal_processing.morphology import extract_morphology
 
+        meta = db_service.get_segment_new(segment_id)
+        if not meta:
+            return jsonify({"error": "Segment not found"}), 404
+
+        raw_signal = meta.get("signal")
+        if not raw_signal or len(raw_signal) == 0:
+            return jsonify({"error": "No signal data"}), 404
+
+        signal_arr = np.array(raw_signal, dtype=np.float32)
+        seg_fs = int(meta.get("segment_fs") or 125)
+
+        # Get R-peaks
+        features = meta.get("features") or {}
+        r_peaks = features.get("r_peaks", [])
+        if not r_peaks or len(r_peaks) < 2:
+            # Fallback: detect R-peaks
+            try:
+                from signal_processing.pan_tompkins import detect_r_peaks
+                r_peaks = detect_r_peaks(signal_arr, seg_fs).tolist()
+            except Exception:
+                from scipy.signal import find_peaks as _fp
+                height_thr = np.percentile(signal_arr, 75)
+                r_peaks, _ = _fp(signal_arr, distance=int(seg_fs * 0.4), height=height_thr)
+                r_peaks = r_peaks.tolist()
+
+        r_peaks_arr = np.array(r_peaks, dtype=int)
+        morph = extract_morphology(signal_arr, r_peaks_arr, seg_fs)
+
+        return jsonify({
+            "segment_id": segment_id,
+            "morphology": morph,
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# =========================================================
+# Segment Fetch (ECG + Features + Annotation) for Dashboard
+# =========================================================
 
 @app.route("/api/segment/<int:segment_id>")
 def get_segment_api(segment_id: int):
@@ -745,91 +806,126 @@ def get_segment_api(segment_id: int):
     # Extract events for dynamic detailed ledger
     events_json = meta.get("events_json") or {}
     raw_events = events_json.get("events", []) if isinstance(events_json, dict) else (events_json if isinstance(events_json, list) else [])
-    
+    # Check if cardiologist explicitly cleared this segment (CLEAR ALL button)
+    was_cleared = isinstance(events_json, dict) and events_json.get("cleared", False)
+
     # ---------------------------------------------------------
-    # NEW: AI EVENT AUTO-GENERATION FOR UNANNOTATED SEGMENTS
+    # AI EVENT AUTO-GENERATION FOR UNANNOTATED SEGMENTS
+    # Runs the full pipeline: ML models → RhythmOrchestrator.decide()
+    # Backend produces the final answer (PVC Bigeminy, NSVT, etc.)
+    # Skipped if cardiologist cleared annotations (they want a blank slate)
     # ---------------------------------------------------------
-    if not raw_events:
+    ml_decision = None
+    has_cardiologist_events = any(
+        isinstance(e, dict) and e.get("annotation_source") == "cardiologist"
+        for e in raw_events
+    )
+    if not has_cardiologist_events and not was_cleared:
         print(f"[API] No manual events for segment {segment_id}. Running ML inference...")
         try:
-            # We must run the actual ML models
             from xai import _load_model, _init_device, extract_fixed_window
             import torch
             import torch.nn.functional as F
-            
-            # Temporary lazy inference (similar to /api/xai)
+
             device = _init_device()
             model_rhythm = _load_model(task="rhythm")
             model_ectopy = _load_model(task="ectopy")
-            
+
             arr = np.array(raw_signal, dtype=np.float32)
-            # Center 2s window for rhythm
-            signal_2s = extract_fixed_window(arr, TARGET_FS, 0.0, 10.0) 
+            signal_2s = extract_fixed_window(arr, TARGET_FS, 0.0, 10.0)
             x = torch.from_numpy(signal_2s[None, None, :]).to(device)
-            
+
             with torch.no_grad():
                 r_logits = model_rhythm(x)
                 r_probs = F.softmax(r_logits, dim=1)[0].cpu().numpy()
-            
+
             r_idx = int(np.argmax(r_probs))
             r_label = RHYTHM_CLASS_NAMES[r_idx]
-            
-            generated_events = []
-            
-            # Multi-beat inference for ectopy
+
+            # Per-beat ectopy inference — build beat_events for the orchestrator
+            beat_records = []
             if len(r_peaks_arr) > 0:
-                import uuid
-                from decision_engine.models import Event, EventCategory, SegmentDecision, SegmentState
-                from decision_engine.rules import apply_ectopy_patterns, apply_display_rules
-                
-                for peak_idx in r_peaks_arr:
+                for beat_idx, peak_idx in enumerate(r_peaks_arr):
                     start_s = (peak_idx / seg_fs) - 1.0
                     end_s = (peak_idx / seg_fs) + 1.0
                     beat_window = extract_fixed_window(arr, TARGET_FS, start_s, end_s)
                     bx = torch.from_numpy(beat_window[None, None, :]).to(device)
-                    
+
                     with torch.no_grad():
                         be_logits = model_ectopy(bx)
                         be_probs = F.softmax(be_logits, dim=1)[0].cpu().numpy()
-                    
+
                     e_idx = int(np.argmax(be_probs))
-                    beat_label = ECTOPY_CLASS_NAMES[e_idx]
-                    
-                    if beat_label != "None":
-                         # High confidence threshold for UI display
-                         if be_probs[e_idx] > 0.4:
-                             generated_events.append(Event(
-                                 event_id=str(uuid.uuid4()),
-                                 start_time=max(0.0, (peak_idx/seg_fs) - 0.3),
-                                 end_time=(peak_idx/seg_fs) + 0.3,
-                                 event_type=beat_label,
-                                 event_category=EventCategory.ECTOPY,
-                                 beat_indices=[int(peak_idx)],
-                                 annotation_source="ml"  # VERY IMPORTANT: Mark as ML
-                             ))
-                
-                # Apply rules engine to ML events (Couplets, Runs, etc.)
-                apply_ectopy_patterns(generated_events)
-                final_ml_events = apply_display_rules(r_label, generated_events)
-                
-                # Convert back to dicts for JSON
-                raw_events = [e.to_dict() for e in final_ml_events]
-                
-                # Also update the primary label guess
-                labels["ai_prediction"] = r_label
-                
-                # Overwrite if current label is generic/missing
-                generic_labels = ["Unlabeled", "Normal", "Other Arrhythmia", "Unknown", "Sinus Rhythm"]
-                current_db_label = meta.get("background_rhythm")
-                if not current_db_label or current_db_label in generic_labels:
-                     meta["background_rhythm"] = r_label
-                     
+                    beat_records.append({
+                        "beat_idx": beat_idx,
+                        "peak_sample": int(peak_idx),
+                        "label": ECTOPY_CLASS_NAMES[e_idx],
+                        "conf": float(be_probs[e_idx]),
+                    })
+
+            # Build ml_prediction dict matching explain_segment() output format
+            ml_prediction = {
+                "rhythm": {
+                    "label": r_label,
+                    "confidence": float(r_probs[r_idx]),
+                    "probs": r_probs.tolist(),
+                },
+                "ectopy": {
+                    "label": "None",
+                    "confidence": 0.0,
+                    "beat_events": beat_records,
+                },
+            }
+
+            # Build clinical features for the rules engine
+            rr_intervals_ms = []
+            if len(r_peaks_arr) >= 2:
+                rr_intervals_ms = (np.diff(r_peaks_arr) * 1000.0 / seg_fs).tolist()
+
+            try:
+                qrs_dur_list = _compute_qrs_durations(np.array(raw_signal), r_peaks_arr, seg_fs).tolist()
+            except Exception:
+                qrs_dur_list = []
+
+            clinical_features = {
+                "mean_hr": mean_hr,
+                "pr_interval": pr_interval_ms,
+                "rr_intervals_ms": rr_intervals_ms,
+                "qrs_durations_ms": qrs_dur_list,
+                "fs": seg_fs,
+            }
+
+            sqi_result = {"is_acceptable": True, "overall_sqi": 1.0}
+
+            # Run the FULL orchestrator pipeline: rules + ML + pattern detection
+            orchestrator = RhythmOrchestrator()
+            ml_decision = orchestrator.decide(ml_prediction, clinical_features, sqi_result, segment_index=0)
+
+            # Mark all ML-generated events so the frontend knows they need cardiologist review
+            for evt in ml_decision.final_display_events:
+                if not hasattr(evt, 'annotation_source') or not evt.annotation_source:
+                    evt.annotation_source = "ml"
+
+            raw_events = [e.to_dict() for e in ml_decision.final_display_events]
+            labels["ai_prediction"] = r_label
+
+            # Update background if current DB label is generic
+            generic_labels = ["Unlabeled", "Normal", "Other Arrhythmia", "Unknown", "Sinus Rhythm"]
+            current_db_label = meta.get("background_rhythm")
+            if not current_db_label or current_db_label in generic_labels:
+                meta["background_rhythm"] = ml_decision.background_rhythm
+
         except Exception as e:
             import traceback
             traceback.print_exc()
             print(f"[API] Error running ML inference on unannotated segment: {e}")
 
     ledger_text = generate_detailed_ledger(labels["ai_prediction"], raw_events)
+
+    # Build background_rhythm for the response
+    bg_rhythm = meta.get("background_rhythm") or "Sinus Rhythm"
+    if ml_decision:
+        bg_rhythm = ml_decision.background_rhythm
 
     return jsonify(
         {
@@ -842,7 +938,8 @@ def get_segment_api(segment_id: int):
             "vitals": vitals,
             "labels": labels,
             "r_peaks": r_peaks_for_frontend,
-            "events": raw_events,  # Send the parsed/generated events directly to the frontend
+            "events": raw_events,
+            "background_rhythm": bg_rhythm,
             "notes": meta.get("cardiologist_notes") or "",
             "corrected_by": meta.get("corrected_by"),
             "corrected_at": meta.get("corrected_at"),
@@ -976,6 +1073,71 @@ def delete_annotation():
         return jsonify({"status": "ok", "message": "Annotation deleted"})
     else:
         return jsonify({"error": "Failed to delete or event not found"}), 500
+
+
+@app.route("/api/detect_patterns", methods=["POST"])
+def detect_patterns():
+    """
+    Run the backend rules engine on cardiologist beat annotations.
+    Accepts beat-level events, converts to Event objects, runs
+    apply_ectopy_patterns() + apply_display_rules(), returns updated events.
+
+    Payload: { "events": [...], "background_rhythm": "Sinus Rhythm" }
+    """
+    import uuid as _uuid
+    from decision_engine.models import Event, EventCategory
+    from decision_engine.rules import apply_ectopy_patterns, apply_display_rules
+
+    data = request.json or {}
+    raw_events = data.get("events", [])
+    bg_rhythm = data.get("background_rhythm", "Sinus Rhythm")
+
+    # Convert JSON dicts → Event objects
+    event_objects = []
+    for e in raw_events:
+        cat = EventCategory.ECTOPY if e.get("event_category", "").upper() == "ECTOPY" else EventCategory.RHYTHM
+        evt = Event(
+            event_id=e.get("event_id", str(_uuid.uuid4())),
+            event_type=e.get("event_type", "Unknown"),
+            event_category=cat,
+            start_time=float(e.get("start_time", 0)),
+            end_time=float(e.get("end_time", 10)),
+            beat_indices=e.get("beat_indices", []),
+            annotation_source=e.get("annotation_source", "cardiologist"),
+            priority=int(e.get("priority", 10)),
+            used_for_training=True
+        )
+        event_objects.append(evt)
+
+    # Run pattern detection (bigeminy, trigeminy, NSVT, couplet, etc.)
+    apply_ectopy_patterns(event_objects)
+
+    # Run display arbitration
+    display_events = apply_display_rules(bg_rhythm, event_objects)
+
+    # Promote highest-priority pattern to background rhythm
+    # IMPORTANT: Individual ectopy beats (PVC, PAC, None, Run) must NEVER
+    # become the background — they are beat-level labels, not rhythms.
+    # Only pattern events (PVC Bigeminy, NSVT, etc.) or rhythm events (AF, VT)
+    # can override the background. This matters for training: arrhythmia_label
+    # feeds the rhythm model (17 classes) which has no "PVC" class.
+    BEAT_ONLY_LABELS = {"PVC", "PAC", "None", "Run"}
+    SINUS_VARIANTS = {"Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia",
+                      "Artifact", "Unknown"}
+    if display_events:
+        # Find highest-priority event that is NOT a plain beat label
+        pattern_events = [e for e in display_events
+                          if e.event_type not in BEAT_ONLY_LABELS
+                          and e.event_type not in SINUS_VARIANTS]
+        if pattern_events:
+            top = max(pattern_events, key=lambda e: e.priority)
+            bg_rhythm = top.event_type
+
+    return jsonify({
+        "events": [e.to_dict() for e in event_objects],
+        "final_display_events": [e.to_dict() for e in display_events],
+        "background_rhythm": bg_rhythm
+    })
 
 
 @app.route("/api/clear_all_annotations", methods=["POST"])
@@ -1166,7 +1328,7 @@ def update_segment_events(segment_id: int):
             "event_category": evt.get("event_category", "ECTOPY"),
             "start_time": float(evt.get("start_time", 0.0)),
             "end_time": float(evt.get("end_time", 0.0)),
-            "beat_indices": [],
+            "beat_indices": evt.get("beat_indices", []),
             "annotation_source": evt.get("annotation_source", "cardiologist"),
             "annotation_status": "confirmed",
             "used_for_training": True

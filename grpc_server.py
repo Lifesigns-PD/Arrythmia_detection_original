@@ -237,7 +237,7 @@ class ECGServiceServicer(ecg_pb2_grpc.ECGServiceServicer):
                 ml_result = explain_segment(cleaned, features)
             except Exception as e:
                 self.logger.warning(f"ML inference failed, using rule-only: {e}")
-                ml_result = {"label": "Unknown", "confidence": 0.0, "probabilities": {}}
+                ml_result = {"rhythm": {"label": "Unknown", "confidence": 0.0}, "ectopy": {"label": "None", "beat_events": []}}
 
             # 6. Decision Engine
             orchestrator = _get_orchestrator()

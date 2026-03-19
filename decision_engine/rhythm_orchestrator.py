@@ -75,13 +75,33 @@ class RhythmOrchestrator:
         
         # B) ML-Derived Events
         ml_events = []
-        ml_label = ml_prediction.get("label", "Unknown")
-        ml_conf = ml_prediction.get("confidence", 0.0)
-        
+        # explain_segment() returns {"rhythm": {...}, "ectopy": {...}} — extract nested fields
+        _rhythm_block = ml_prediction.get("rhythm") or {}
+        ml_label = _rhythm_block.get("label") or ml_prediction.get("label", "Unknown")
+        ml_conf = _rhythm_block.get("confidence") or ml_prediction.get("confidence", 0.0)
+
         if ml_label not in ["Sinus Rhythm", "Unknown"]:
-             # This allows ML to create Artifact events which will then be arbitrated
-             ml_events.append(self._create_event_from_ml(ml_label, ml_conf, ml_prediction, clinical_features))
-        
+            ml_events.append(self._create_event_from_ml(ml_label, ml_conf, ml_prediction, clinical_features))
+
+        # C) Per-beat ectopy events — required for bigeminy/trigeminy pattern detection
+        #    xai.py now returns beat_events: [{beat_idx, peak_sample, label, conf}, ...]
+        beat_events = ml_prediction.get("ectopy", {}).get("beat_events", [])
+        seg_fs = float(clinical_features.get("fs", 125))
+        for b in beat_events:
+            if b.get("label", "None") in ("None",):
+                continue  # skip normal beats
+            t_center = b["peak_sample"] / seg_fs
+            ml_events.append(Event(
+                event_id=str(uuid.uuid4()),
+                event_type=b["label"],
+                event_category=EventCategory.ECTOPY,
+                start_time=max(0.0, t_center - 0.3),
+                end_time=min(10.0, t_center + 0.3),
+                beat_indices=[b["beat_idx"]],   # sequential index — rules use diffs to detect patterns
+                priority=10,
+                used_for_training=True,
+            ))
+
         # Combine
         decision.events = rule_events + ml_events
         
