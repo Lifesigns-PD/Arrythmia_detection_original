@@ -139,7 +139,7 @@
         #ecgCanvas {
             width: 100%;
             height: 100%;
-            background-color: #050505;
+            background-color: transparent;
             cursor: crosshair;
         }
 
@@ -287,18 +287,9 @@
             color: white;
         }
 
-        /* ECG Grid Background */
+        /* ECG paper — grid is drawn on-canvas for time-axis alignment */
         .ecg-background {
-            background-color: #fff;
-            background-image:
-                linear-gradient(#f0d0d0 1px, transparent 1px),
-                linear-gradient(90deg, #f0d0d0 1px, transparent 1px),
-                linear-gradient(#f8e8e8 1px, transparent 1px),
-                linear-gradient(90deg, #f8e8e8 1px, transparent 1px);
-            background-size:
-                50px 50px, 50px 50px,
-                10px 10px, 10px 10px;
-            background-position: -1px -1px;
+            background-color: #fff8f4;
         }
 
         canvas#ecgCanvas {
@@ -592,10 +583,6 @@
                             <option value="Bundle Branch Block">Bundle Branch Block</option>
                         </optgroup>
 
-                        <optgroup label="--- Other ---">
-                            <option value="Other Arrhythmia">Other Arrhythmia</option>
-                        </optgroup>
-
                         <optgroup label="--- Ectopy Patterns ---">
                             <option value="PAC">PAC (Single Atrial Ectopy)</option>
                             <option value="Atrial Couplet">Atrial Couplet</option>
@@ -736,8 +723,18 @@
             async function loadSegment(id) {
                 currentSegment = id;
                 document.getElementById("segmentID").innerText = id;
-                const res = await fetch(`/api/segment/${id}`);
-                const data = await res.json();
+                let data;
+                try {
+                    const res = await fetch(`/api/segment/${id}`);
+                    if (!res.ok) {
+                        console.error(`Failed to load segment ${id}: HTTP ${res.status}`);
+                        return;
+                    }
+                    data = await res.json();
+                } catch (err) {
+                    console.error(`Network error loading segment ${id}:`, err);
+                    return;
+                }
 
                 ecgSignal = data.raw_signal || [];
                 // Use per-segment fs from API for coordinate sync
@@ -773,7 +770,7 @@
 
                 // Reset Primary Dropdown to match background, without triggering save
                 const diagnosisSelect = document.getElementById("diagnosis-select");
-                if (diagnosisSelect && data.labels.ai_prediction) {
+                if (diagnosisSelect && data.labels && data.labels.ai_prediction) {
                     diagnosisSelect.value = data.labels.ai_prediction;
                 }
 
@@ -800,7 +797,8 @@
                 if (headerIcon) {
                     // Check if segment is in sidebar and has status 'confirmed'
                     const sidebarRow = document.getElementById(`row-${id}`);
-                    const isVerified = sidebarRow ? sidebarRow.querySelector('.badge-success').style.display !== 'none' : false;
+                    const successBadge = sidebarRow ? sidebarRow.querySelector('.badge-success') : null;
+                    const isVerified = successBadge ? successBadge.style.display !== 'none' : false;
                     headerIcon.style.display = isVerified ? 'inline' : 'none';
                 }
 
@@ -841,8 +839,15 @@
             }
 
             async function runAnalysis() {
-                const res = await fetch(`/api/xai/${currentSegment}`);
-                const data = await res.json();
+                let data;
+                try {
+                    const res = await fetch(`/api/xai/${currentSegment}`);
+                    if (!res.ok) { console.warn(`XAI fetch failed: HTTP ${res.status}`); return; }
+                    data = await res.json();
+                } catch (err) {
+                    console.warn("XAI network error:", err);
+                    return;
+                }
                 console.log("XAI Result:", data);
 
                 // Preserve ML-generated events from /api/segment/ if /api/xai/ returns empty
@@ -974,9 +979,74 @@
                 const smpX = (s) => PAD_L + ((s - start) / (visible.length - 1)) * pw;
                 const ampY = (v) => ph / 2 - (v - mid) * scaleY;
 
-                // Axis labels removed — clean waveform view
+                // ── ECG PAPER BACKGROUND (white) ──
+                ctx.fillStyle = "#fff8f4";
+                ctx.fillRect(0, 0, w, h);
 
-                // --- EVENT SPAN BANDS (behind trace) ---
+                // ── ECG PAPER GRID ──
+                // Standard: minor grid every 40ms (1mm @ 25mm/s), major every 200ms (5mm)
+                const tStart = start / segmentFs;
+                const tEnd   = end   / segmentFs;
+
+                // Pixels per minor square (40ms) — used for both X and Y spacing
+                const minorPx = pw / ((tEnd - tStart) / 0.04);
+
+                // Minor grid lines (light pink)
+                ctx.lineWidth = 0.5;
+                ctx.strokeStyle = "rgba(220, 160, 160, 0.45)";
+                // Vertical (time axis)
+                let t0 = Math.ceil(tStart / 0.04) * 0.04;
+                for (let t = t0; t <= tEnd + 0.001; t = Math.round((t + 0.04) * 1000) / 1000) {
+                    const x = smpX(t * segmentFs);
+                    if (x < PAD_L - 0.5 || x > PAD_L + pw + 0.5) continue;
+                    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, ph); ctx.stroke();
+                }
+                // Horizontal (amplitude axis) — same spacing as vertical minor grid
+                if (minorPx >= 3) {
+                    const midY = ph / 2;
+                    for (let dy = 0; dy <= Math.max(midY, ph - midY) + minorPx; dy += minorPx) {
+                        [midY - dy, midY + dy].forEach(y => {
+                            if (y < 0 || y > ph || (dy === 0)) return;
+                            ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + pw, y); ctx.stroke();
+                        });
+                    }
+                    // Draw centre horizontal line once
+                    ctx.beginPath(); ctx.moveTo(PAD_L, midY); ctx.lineTo(PAD_L + pw, midY); ctx.stroke();
+                }
+
+                // Major grid lines (darker pink, every 5 minor = 200ms)
+                ctx.lineWidth = 1;
+                ctx.strokeStyle = "rgba(190, 100, 100, 0.6)";
+                t0 = Math.ceil(tStart / 0.2) * 0.2;
+                for (let t = t0; t <= tEnd + 0.001; t = Math.round((t + 0.2) * 100) / 100) {
+                    const x = smpX(t * segmentFs);
+                    if (x < PAD_L - 0.5 || x > PAD_L + pw + 0.5) continue;
+                    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, ph); ctx.stroke();
+                }
+                const majorPx = minorPx * 5;
+                if (majorPx >= 8) {
+                    const midY = ph / 2;
+                    for (let dy = 0; dy <= Math.max(midY, ph - midY) + majorPx; dy += majorPx) {
+                        [midY - dy, midY + dy].forEach(y => {
+                            if (y < 0 || y > ph) return;
+                            ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(PAD_L + pw, y); ctx.stroke();
+                        });
+                    }
+                }
+
+                // Time labels along bottom (every 1 second)
+                ctx.fillStyle = "rgba(140, 80, 80, 0.75)";
+                ctx.font = "9px monospace";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "bottom";
+                for (let t = Math.ceil(tStart); t <= tEnd; t++) {
+                    const x = smpX(t * segmentFs);
+                    if (x >= PAD_L && x <= PAD_L + pw) ctx.fillText(t + "s", x, ph);
+                }
+                ctx.textAlign = "left";
+                ctx.textBaseline = "alphabetic";
+
+                // ── EVENT SPAN BANDS (behind trace) ──
                 const evList = editingEvents || (currentDecision && currentDecision.final_display_events) || [];
                 evList.forEach(ev => {
                     const sIdx = ev.start_time * segmentFs;
@@ -986,15 +1056,17 @@
                     const xE = Math.min(PAD_L + pw, smpX(eIdx));
                     const isCardio = ev.annotation_source === "cardiologist";
                     ctx.fillStyle = ev.event_category === "ECTOPY"
-                        ? (isCardio ? "rgba(255,60,60,0.22)" : "rgba(255,80,80,0.13)")
-                        : (isCardio ? "rgba(0,200,255,0.20)" : "rgba(0,200,255,0.10)");
+                        ? (isCardio ? "rgba(200, 0, 0, 0.12)" : "rgba(200, 60, 60, 0.07)")
+                        : (isCardio ? "rgba(0, 80, 180, 0.12)" : "rgba(0, 80, 180, 0.06)");
                     ctx.setLineDash([]);
                     ctx.fillRect(xS, 0, xE - xS, ph);
                 });
 
-                // Draw Trace
-                ctx.strokeStyle = "#000000";
-                ctx.lineWidth = 2;
+                // ── ECG TRACE ──
+                ctx.strokeStyle = "#1a1a2e";
+                ctx.lineWidth = 1.5;
+                ctx.lineJoin = "round";
+                ctx.setLineDash([]);
                 ctx.beginPath();
                 for (let i = 0; i < visible.length; i++) {
                     const x = PAD_L + (i / (visible.length - 1)) * pw;
@@ -1002,6 +1074,7 @@
                     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
                 }
                 ctx.stroke();
+                ctx.lineJoin = "miter";
 
                 // Draw R Peaks — normal beats get small red tick; ectopy beats get distinct markers
                 // First, build a map of which R-peaks are ectopy beats
@@ -1023,7 +1096,7 @@
                         const isPVC = type.includes("PVC") || type.includes("VENTRICULAR");
                         ectopyPeaks.set(closest, {
                             type: ev.event_type,
-                            color: isPVC ? "#ff3333" : "#ffcc00"  // red for PVC, gold for PAC
+                            color: isPVC ? "#cc0000" : "#cc7700"  // red for PVC, dark amber for PAC
                         });
                     }
                 });
@@ -1034,21 +1107,21 @@
                     const y = ampY(ecgSignal[idx]);
 
                     if (ectopyPeaks.has(idx)) {
-                        // ECTOPY BEAT: draw a filled diamond marker at the R-peak
+                        // ECTOPY BEAT: filled diamond at R-peak
                         const info = ectopyPeaks.get(idx);
-                        const sz = 8;
+                        const sz = 7;
                         ctx.fillStyle = info.color;
-                        ctx.strokeStyle = "#ffffff";
-                        ctx.lineWidth = 1.5;
+                        ctx.strokeStyle = "rgba(255,255,255,0.8)";
+                        ctx.lineWidth = 1.2;
                         ctx.beginPath();
-                        ctx.moveTo(x, y - sz);       // top
-                        ctx.lineTo(x + sz, y);       // right
-                        ctx.lineTo(x, y + sz);       // bottom
-                        ctx.lineTo(x - sz, y);       // left
+                        ctx.moveTo(x, y - sz);
+                        ctx.lineTo(x + sz, y);
+                        ctx.lineTo(x, y + sz);
+                        ctx.lineTo(x - sz, y);
                         ctx.closePath();
                         ctx.fill();
                         ctx.stroke();
-                        // Small label above diamond
+                        // Label above diamond
                         ctx.fillStyle = info.color;
                         ctx.font = "bold 9px sans-serif";
                         ctx.textAlign = "center";
@@ -1057,15 +1130,15 @@
                         ctx.textAlign = "left";
                         ctx.textBaseline = "alphabetic";
                     } else {
-                        // Normal beat: small red tick above peak
-                        ctx.fillStyle = "#ff4444";
-                        ctx.fillRect(Math.round(x) - 2, Math.round(y) - 20, 4, 10);
+                        // Normal beat: small green tick above peak
+                        ctx.fillStyle = "#1a7a30";
+                        ctx.fillRect(Math.round(x) - 1, Math.round(y) - 16, 3, 8);
                     }
                 });
 
-                // Draw Selected Beat Highlights (±150 samples visually)
-                ctx.fillStyle = "rgba(255, 0, 0, 0.25)";
-                ctx.strokeStyle = "red";
+                // Draw Selected Beat Highlights (±150 ms)
+                ctx.fillStyle = "rgba(200, 0, 0, 0.12)";
+                ctx.strokeStyle = "#cc0000";
                 ctx.setLineDash([]);
                 selectedBeats.forEach(idx => {
                     const highlightHalfWidth = Math.floor(0.15 * segmentFs);
@@ -1094,26 +1167,32 @@
                     ctx.lineTo(x, ph);
 
                     if (e.annotation_source === "cardiologist") {
-                        ctx.lineWidth = 3;
-                        ctx.setLineDash([4, 4]);
-                        if (e.event_type.includes("PVC")) evColor = "red";
-                        else if (e.event_type.includes("PAC")) evColor = "#ffcc00";
-                        else if (e.event_type.includes("Sinus")) evColor = "#00ff00";
-                        else evColor = "#ff00ff";
+                        ctx.lineWidth = 2.5;
+                        ctx.setLineDash([5, 4]);
+                        if (e.event_type.includes("PVC"))        evColor = "#cc0000";
+                        else if (e.event_type.includes("PAC"))  evColor = "#cc7700";
+                        else if (e.event_type.includes("Sinus")) evColor = "#1a7a30";
+                        else                                      evColor = "#7700aa";
                     } else {
                         ctx.lineWidth = 1;
-                        ctx.setLineDash([2, 2]);
-                        evColor = e.event_category === "ECTOPY" ? "red" : "cyan";
+                        ctx.setLineDash([3, 3]);
+                        evColor = e.event_category === "ECTOPY" ? "#cc0000" : "#0055aa";
                     }
                     ctx.strokeStyle = evColor;
                     ctx.stroke();
                     ctx.setLineDash([]);
                     ctx.lineWidth = 1;
 
-                    // Label at top
+                    // Label at top — white outline for readability on paper background
+                    ctx.font = "bold 11px sans-serif";
+                    ctx.textBaseline = "top";
+                    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+                    ctx.lineWidth = 3;
+                    ctx.strokeText(e.event_type, x + 4, 4);
                     ctx.fillStyle = evColor;
-                    ctx.font = "bold 12px sans-serif";
-                    ctx.fillText(e.event_type, x + 4, 15);
+                    ctx.fillText(e.event_type, x + 4, 4);
+                    ctx.textBaseline = "alphabetic";
+                    ctx.lineWidth = 1;
 
                     // Small marker at bottom of plot
                     ctx.beginPath();
@@ -1175,7 +1254,7 @@
                 const rect = canvas.getBoundingClientRect();
                 const x = e.clientX - rect.left;
 
-                const PAD_L = 52;
+                const PAD_L = 8;  // must match redraw()
                 const startIdx = Math.floor(viewStart);
                 const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
                 const pw = rect.width - PAD_L;
@@ -1209,7 +1288,7 @@
 
                 const rect = canvas.getBoundingClientRect();
                 const x = e.clientX - rect.left;
-                const PAD_L = 52;
+                const PAD_L = 8;  // must match redraw()
                 const startIdx = Math.floor(viewStart);
                 const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
                 const clickSample = startIdx + ((x - PAD_L) / (rect.width - PAD_L)) * (visibleLen - 1);
@@ -1271,7 +1350,7 @@
                 if (e.button !== 0) return;
                 const rect = canvas.getBoundingClientRect();
                 const x = e.clientX - rect.left;
-                const PAD_L = 52;
+                const PAD_L = 8;  // must match redraw()
                 const pw = rect.width - PAD_L;
                 const startIdx = Math.floor(viewStart);
                 const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
@@ -1301,7 +1380,7 @@
             canvas.addEventListener("mousemove", function(e) {
                 const rect = canvas.getBoundingClientRect();
                 const x = e.clientX - rect.left;
-                const PAD_L = 52;
+                const PAD_L = 8;  // must match redraw()
                 const pw = rect.width - PAD_L;
                 const startIdx = Math.floor(viewStart);
                 const visibleLen = Math.ceil(viewEnd) - startIdx + 1;
@@ -1370,34 +1449,36 @@
 
             async function detectPatternsFromBackend() {
                 if (!currentDecision || !currentDecision.final_display_events) return;
-                const bg = currentDecision.background_rhythm || "Sinus Rhythm";
+
+                // Always use the DROPDOWN value as the rhythm background sent to the
+                // rules engine. The dropdown is the cardiologist's explicit rhythm choice
+                // (Sinus Rhythm, AF, etc.) and must NOT be overridden by ectopy patterns
+                // (PVC Bigeminy, NSVT, etc.) that pattern detection returns.
+                const sel = document.getElementById("diagnosis-select");
+                const rhythmBg = (sel && sel.value) ? sel.value : (currentDecision.background_rhythm || "Sinus Rhythm");
+
                 try {
                     const resp = await fetch("/api/detect_patterns", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
                             events: currentDecision.final_display_events,
-                            background_rhythm: bg
+                            background_rhythm: rhythmBg
                         })
                     });
                     const data = await resp.json();
                     if (data.final_display_events) {
                         currentDecision.final_display_events = data.final_display_events;
-                        currentDecision.background_rhythm = data.background_rhythm || bg;
-                        // Update background rhythm label in the UI
+                        // Store the ectopy pattern result separately for PRIMARY CONCLUSION display.
+                        // Do NOT write it back to currentDecision.background_rhythm — that must
+                        // stay as the cardiologist's rhythm selection so VERIFY saves the right label.
+                        currentDecision.ectopy_pattern = data.background_rhythm || rhythmBg;
+
+                        // Update "Background: ..." label (shows the rhythm, not the ectopy pattern)
                         const bgLabel = document.getElementById("backgroundLabel");
-                        if (bgLabel) bgLabel.innerText = "Background: " + currentDecision.background_rhythm;
-                        // Auto-sync the diagnosis dropdown so VERIFY saves the correct label
-                        // This prevents the rhythm model from training on a wrong label
-                        const sel = document.getElementById("diagnosis-select");
-                        if (sel && currentDecision.background_rhythm) {
-                            for (let i = 0; i < sel.options.length; i++) {
-                                if (sel.options[i].value === currentDecision.background_rhythm) {
-                                    sel.selectedIndex = i;
-                                    break;
-                                }
-                            }
-                        }
+                        if (bgLabel) bgLabel.innerText = "Background: " + rhythmBg;
+                        // Keep currentDecision.background_rhythm in sync with the dropdown
+                        currentDecision.background_rhythm = rhythmBg;
                     }
                 } catch (err) {
                     console.warn("Pattern detection failed:", err);
@@ -1459,10 +1540,26 @@
                     }
                 }
 
-                // 3. Update the PRIMARY CONCLUSION badge
+                // 3. Update both PRIMARY CONCLUSION displays
+                // #arrLabel = large text in the AI Engine panel (main conclusion)
+                // #ui-ai-pred = small badge at the top of the page (AI suggestion)
+                const arrLabelEl = document.getElementById("arrLabel");
                 const aiBadge = document.getElementById("ui-ai-pred");
-                if (aiBadge) {
-                    if (autoLabel) {
+
+                if (autoLabel) {
+                    const isEctopy = events.find(e => e.event_type === autoLabel &&
+                        (e.event_category === "ECTOPY" || e.event_category === "PATTERN"));
+                    const labelColor = isEctopy ? "#ff4444" : "var(--accent-secondary)";
+
+                    if (arrLabelEl) {
+                        if (isLockedRhythm) {
+                            arrLabelEl.innerText = `${currentRhythm} + ${autoLabel}`;
+                        } else {
+                            arrLabelEl.innerText = autoLabel;
+                        }
+                        arrLabelEl.style.color = labelColor;
+                    }
+                    if (aiBadge) {
                         if (isLockedRhythm) {
                             aiBadge.innerText = `AI Deduction: ${currentRhythm} + ${autoLabel}`;
                             aiBadge.style.color = "#00ff99";
@@ -1470,11 +1567,21 @@
                             aiBadge.innerText = autoLabel;
                             aiBadge.style.color = "white";
                         }
-                    } else {
+                    }
+                } else {
+                    if (arrLabelEl) {
+                        arrLabelEl.innerText = currentRhythm;
+                        arrLabelEl.style.color = "white";
+                    }
+                    if (aiBadge) {
                         aiBadge.innerText = currentRhythm;
                         aiBadge.style.color = "#00ffd0";
                     }
                 }
+
+                // Always keep the "Background: ..." label in sync with the rhythm dropdown
+                const bgLabelEl = document.getElementById("backgroundLabel");
+                if (bgLabelEl) bgLabelEl.innerText = "Background: " + currentRhythm;
 
                 checkAutomationGuard();
             }
@@ -1646,14 +1753,20 @@
             };
 
             document.getElementById("nextBtn").onclick = async () => {
-                const res = await fetch(`/api/next_segment/${currentSegment}`);
-                const d = await res.json();
-                if (d.ok) loadSegment(d.next);
+                try {
+                    const res = await fetch(`/api/next_segment/${currentSegment}`);
+                    if (!res.ok) return;
+                    const d = await res.json();
+                    if (d.ok) loadSegment(d.next);
+                } catch (err) { console.warn("Next segment error:", err); }
             };
             document.getElementById("prevBtn").onclick = async () => {
-                const res = await fetch(`/api/prev_segment/${currentSegment}`);
-                const d = await res.json();
-                if (d.ok) loadSegment(d.prev);
+                try {
+                    const res = await fetch(`/api/prev_segment/${currentSegment}`);
+                    if (!res.ok) return;
+                    const d = await res.json();
+                    if (d.ok) loadSegment(d.prev);
+                } catch (err) { console.warn("Prev segment error:", err); }
             };
             document.getElementById("analyzeBtn").onclick = () => runAnalysis();
 

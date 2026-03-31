@@ -25,10 +25,10 @@ import psycopg2
 import subprocess
 
 # XAI – Option A (clinical text + model prediction)
-from xai import explain_segment, explain_decision, reset_model, generate_detailed_ledger
+from xai import explain_decision, generate_detailed_ledger
 from decision_engine.rhythm_orchestrator import RhythmOrchestrator
 from decision_engine.models import SegmentDecision
-from models_training.data_loader import CLASS_NAMES, RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES
+from models_training.data_loader import RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES
 
 # Suppress harmless scipy warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -1027,6 +1027,8 @@ def annotate_beats():
     Each beat is converted to a strict ±0.3s (0.6s total) window.
     """
     data = request.json
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
     segment_id = data.get("segment_id")
     beat_indices = data.get("beat_indices", [])
     label = data.get("label")
@@ -1101,6 +1103,8 @@ def delete_annotation():
     Payload: { "segment_id": int, "event_id": str }
     """
     data = request.json
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
     segment_id = data.get("segment_id")
     event_id = data.get("event_id")
 
@@ -1182,6 +1186,8 @@ def detect_patterns():
 def api_clear_all_annotations():
     """Wipes all annotation events and resets verification status for a segment."""
     data = request.json
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
     segment_id = data.get("segment_id")
 
     if not segment_id:
@@ -1307,6 +1313,8 @@ def api_retrain_model():
 @app.route("/api/update_rpeaks", methods=["POST"])
 def update_rpeaks():
     data = request.json
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
     segment_id = data.get("segment_id")
     new_peaks = data.get("r_peaks", [])
 
@@ -1329,6 +1337,8 @@ def update_rpeaks():
 @app.route("/api/verify_segment", methods=["POST"])
 def verify_segment():
     data = request.json
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
     segment_id = data.get("segment_id")
     bg_rhythm = data.get("background_rhythm")
     events = data.get("events")  # May be None, that's fine
@@ -1349,7 +1359,7 @@ def update_segment_events(segment_id: int):
     """
     Overwrites the saved events for a segment with a new array from the UI.
     """
-    data = request.json
+    data = request.json or {}
     events = data.get("events", [])
     
     # 1. Clear existing annotations

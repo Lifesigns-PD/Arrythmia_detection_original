@@ -10,7 +10,6 @@ Loads ECG JSON dataset for training CNN+Transformer model.
 ✔ Ensures every signal = 125 Hz, 10 sec (1250 samples)
 """
 
-import json
 import numpy as np
 import psycopg2
 from pathlib import Path
@@ -199,7 +198,8 @@ RHYTHM_CLASS_NAMES = [
     "Bundle Branch Block",           # 10
     "Artifact",                      # 11
     "Pause",                         # 12
-    "Other Arrhythmia"               # 13
+    # "Other Arrhythmia" removed — catch-all label with no clinical definition,
+    # its DB segments are excluded from training (get_rhythm_label_idx returns None).
 ]
 
 # Hard Safety Assertion
@@ -234,9 +234,12 @@ def get_rhythm_label_idx(original_label_name):
     - Sinus + PVC -> Sinus -> None (DROPPED)
     - PVCs -> None (DROPPED - Ectopy is not a rhythm)
     - Sinus Bradycardia/Tachycardia -> Sinus Rhythm (class 0)
+    - Other Arrhythmia -> None (DROPPED - catch-all, not a real class)
     """
     if original_label_name is None: return None
     label = normalize_label(original_label_name)
+    # Explicitly exclude the catch-all — it has no clinical meaning
+    if label == "Other Arrhythmia": return None
 
     # 1. Strip everything after ' + ' to find the base rhythm
     if " + " in label:
@@ -264,8 +267,6 @@ def get_ectopy_label_idx(original_label_name):
     # because clinical datasets like MITDB provide per-beat 'V'/'A' labels
     # alongside the global rhythm.
     
-    label_upper = label.upper()
-
     # Priority 1: Map run-derived labels to their base beat type
     # (Run/NSVT/VT are rules-only; train ectopy model on individual PVC/PAC beats)
     if any(t in label for t in ["VENTRICULAR RUN", "NSVT", "VENTRICULAR TRIPLET", "VT"]):

@@ -526,7 +526,8 @@ def clear_all_annotations(segment_id: int) -> bool:
                     cardiologist_notes = '',
                     is_corrected = FALSE,
                     used_for_training = FALSE,
-                    corrected_at = NULL
+                    corrected_at = NULL,
+                    corrected_by = NULL
                 WHERE segment_id = %s
             """, (segment_id,))
             

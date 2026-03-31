@@ -57,7 +57,7 @@ class CNNTransformerClassifier(nn.Module):
     """
     TARGET_LEN = 1250 # 10 seconds at 125Hz
     
-    def __init__(self, num_classes=14, cnn_channels=[32, 64, 128],
+    def __init__(self, num_classes=13, cnn_channels=[32, 64, 128],
                  nhead=8, num_layers=2, dim_feedforward=256):
         super().__init__()
 

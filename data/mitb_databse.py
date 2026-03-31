@@ -37,8 +37,11 @@ def determine_label(symbols):
     # Priority 2: Supraventricular Ectopics
     elif 'A' in symbols_set or 'a' in symbols_set or 'S' in symbols_set or 'J' in symbols_set:
         return "PAC"
-    # Priority 3: Normal
-    elif 'N' in symbols_set or 'L' in symbols_set or 'R' in symbols_set:
+    # Priority 3: Bundle Branch Block (L=LBBB beat, R=RBBB beat in MIT-BIH AAMI coding)
+    elif 'L' in symbols_set or 'R' in symbols_set:
+        return "Bundle Branch Block"
+    # Priority 4: Normal sinus
+    elif 'N' in symbols_set:
         return "Sinus Rhythm"
     else:
         return "Other Arrhythmia"

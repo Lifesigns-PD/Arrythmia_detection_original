@@ -43,9 +43,13 @@ data/input_segments/
 raw_data/
 models_training/outputs/checkpoints/
 models_training/outputs/logs/
+outputs/
 *.pth
 *.log
-
+*.json
+*.png
+*.pdf
+*.pyc
 # Database
 *.sql.gz
 *.backup
