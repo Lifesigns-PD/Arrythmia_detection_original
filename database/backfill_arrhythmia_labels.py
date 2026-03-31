@@ -30,6 +30,9 @@ ECTOPY_LABELS = {
     "PAC Bigeminy", "PAC Trigeminy", "PAC Couplet", "PAC Quadrigeminy",
     "NSVT", "PSVT", "Ventricular Triplet", "Atrial Triplet",
     "Atrial Couplet", "Ventricular Run", "Atrial Run",
+    # SVT/VT are now rules-only — must never be arrhythmia_label
+    "SVT", "Supraventricular Tachycardia",
+    "VT", "Ventricular Tachycardia",
 }
 
 DEFAULT_FS = 125

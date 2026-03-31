@@ -100,9 +100,57 @@ def _extract_features(segment: np.ndarray, r_peaks: np.ndarray) -> dict:
     else:
         features.update({"rr_intervals_ms": [], "mean_rr": 0, "mean_hr": 0, "SDNN": 0, "RMSSD": 0, "pNN50": 0})
 
-    # QRS durations (simplified)
-    features["qrs_durations_ms"] = []
+    # PR interval and per-beat PR via NeuroKit2 DWT delineation
+    # Safe fallback to empty/zero if delineation fails (short segment, noisy signal, AF)
     features["pr_interval"] = 0.0
+    features["per_beat_pr_ms"] = []
+    features["qrs_durations_ms"] = []
+
+    if len(r_peaks) >= 2:
+        try:
+            import neurokit2 as nk
+            import pandas as pd
+            from scipy.signal import butter, filtfilt
+            nyq = 0.5 * TARGET_FS
+            b, a = butter(2, 40 / nyq, btype="low")
+            smooth = filtfilt(b, a, segment.astype(np.float64))
+            _, waves = nk.ecg_delineate(smooth, r_peaks, sampling_rate=TARGET_FS,
+                                         method="dwt", show=False)
+            p_onsets = waves.get("ECG_P_Onsets", [])
+            r_onsets = waves.get("ECG_R_Onsets", [])
+            r_offsets = waves.get("ECG_R_Offsets", [])
+
+            # Per-beat PR intervals
+            per_beat_pr = []
+            n = min(len(p_onsets), len(r_onsets))
+            for i in range(n):
+                po, ro = p_onsets[i], r_onsets[i]
+                if po is None or ro is None:
+                    continue
+                if pd.isna(po) or pd.isna(ro):
+                    continue
+                pr_ms = (float(ro) - float(po)) * 1000.0 / TARGET_FS
+                if 80.0 <= pr_ms <= 400.0:
+                    per_beat_pr.append(pr_ms)
+            features["per_beat_pr_ms"] = per_beat_pr
+            if len(per_beat_pr) >= 2:
+                features["pr_interval"] = float(np.median(per_beat_pr))
+
+            # Per-beat QRS durations
+            qrs_durs = []
+            n2 = min(len(r_onsets), len(r_offsets))
+            for i in range(n2):
+                ro, roff = r_onsets[i], r_offsets[i]
+                if ro is None or roff is None:
+                    continue
+                if pd.isna(ro) or pd.isna(roff):
+                    continue
+                qrs_ms = (float(roff) - float(ro)) * 1000.0 / TARGET_FS
+                if 40.0 <= qrs_ms <= 250.0:
+                    qrs_durs.append(qrs_ms)
+            features["qrs_durations_ms"] = qrs_durs
+        except Exception:
+            pass  # safe defaults already set above
 
     return features
 

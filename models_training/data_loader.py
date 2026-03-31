@@ -182,27 +182,24 @@ CLASS_INDEX = {name: i for i, name in enumerate(CLASS_NAMES)}
 ECTOPY_TERMS = [
     "PVC", "PAC",
     "Bigeminy", "Trigeminy",
-    "Couplet", "Run", "NSVT"
+    "Couplet",
 ]
 
 RHYTHM_CLASS_NAMES = [
-    "Sinus Rhythm",
-    "Supraventricular Tachycardia",
-    "Atrial Fibrillation",
-    "Atrial Flutter",
-    "Junctional Rhythm",
-    "Idioventricular Rhythm",
-    "Ventricular Tachycardia",
-    "Ventricular Fibrillation",
-    "1st Degree AV Block",
-    "2nd Degree AV Block Type 1",
-    "2nd Degree AV Block Type 2",
-    "3rd Degree AV Block",
-    "Bundle Branch Block",
-    "Artifact",
-    "PSVT",
-    "Pause",
-    "Other Arrhythmia"
+    "Sinus Rhythm",                  # 0
+    "Atrial Fibrillation",           # 1
+    "Atrial Flutter",                # 2
+    "Junctional Rhythm",             # 3
+    "Idioventricular Rhythm",        # 4
+    "Ventricular Fibrillation",      # 5
+    "1st Degree AV Block",           # 6
+    "2nd Degree AV Block Type 1",    # 7
+    "2nd Degree AV Block Type 2",    # 8
+    "3rd Degree AV Block",           # 9
+    "Bundle Branch Block",           # 10
+    "Artifact",                      # 11
+    "Pause",                         # 12
+    "Other Arrhythmia"               # 13
 ]
 
 # Hard Safety Assertion
@@ -211,12 +208,11 @@ for name in RHYTHM_CLASS_NAMES:
         assert term not in name, f"ECTOPY LEAK in Rhythm model: {name}"
 
 # Reverse Safety Check: No Rhythm terms in Ectopy model
-RHYTHM_TERMS = ["AF", "Atrial Fibrillation", "Atrial Flutter", "Block", "SVT", "AFib"]
+RHYTHM_TERMS = ["AF", "Atrial Fibrillation", "Atrial Flutter", "Block", "AFib"]
 ECTOPY_CLASS_NAMES = [
     "None",   # 0
     "PVC",    # 1
     "PAC",    # 2
-    "Run"     # 3
 ]
 
 for name in ECTOPY_CLASS_NAMES:
@@ -270,10 +266,13 @@ def get_ectopy_label_idx(original_label_name):
     
     label_upper = label.upper()
 
-    # Priority 1: Runs (Highest severity ectopy)
-    if any(t in label for t in ["RUN", "NSVT", "TRIPLET", "PSVT"]):
-        return ECTOPY_INDEX["Run"]
-        
+    # Priority 1: Map run-derived labels to their base beat type
+    # (Run/NSVT/VT are rules-only; train ectopy model on individual PVC/PAC beats)
+    if any(t in label for t in ["VENTRICULAR RUN", "NSVT", "VENTRICULAR TRIPLET", "VT"]):
+        return ECTOPY_INDEX["PVC"]
+    if any(t in label for t in ["ATRIAL RUN", "PSVT", "ATRIAL TRIPLET", "SVT"]):
+        return ECTOPY_INDEX["PAC"]
+
     # Priority 2: PACs (including Atrial Couplet/Bigeminy/Trigeminy/Quadrigeminy)
     if any(t in label for t in ["PAC", "ATRIAL"]):
         return ECTOPY_INDEX["PAC"]

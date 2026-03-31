@@ -366,6 +366,38 @@ def _calculate_pr_interval(signal: np.ndarray, r_peaks: np.ndarray, fs: int) -> 
     return _geometric_pr(signal, r_peaks, fs)
 
 
+def _get_per_beat_pr_ms(signal: np.ndarray, r_peaks: np.ndarray, fs: int) -> list:
+    """
+    Return per-beat PR intervals (ms) via NeuroKit2 DWT delineation.
+    Each entry corresponds to one R-peak; None values (failed delineation) are excluded.
+    Used by the rules engine for 2nd/3rd degree AV block detection.
+    """
+    if r_peaks is None or len(r_peaks) == 0:
+        return []
+    try:
+        nyq = 0.5 * fs
+        b, a = butter(2, 40 / nyq, btype="low")
+        smooth_sig = filtfilt(b, a, signal.astype(np.float64))
+        _, waves = nk.ecg_delineate(smooth_sig, r_peaks, sampling_rate=fs, method="dwt", show=False)
+        p_onsets = waves.get("ECG_P_Onsets", [])
+        r_onsets = waves.get("ECG_R_Onsets", [])
+        result = []
+        n = min(len(p_onsets), len(r_onsets))
+        for i in range(n):
+            po = p_onsets[i]
+            ro = r_onsets[i]
+            if po is None or ro is None:
+                continue
+            if pd.isna(po) or pd.isna(ro):
+                continue
+            pr_ms = (float(ro) - float(po)) * 1000.0 / fs
+            if 80.0 <= pr_ms <= 400.0:
+                result.append(pr_ms)
+        return result
+    except Exception:
+        return []
+
+
 def _extract_segment_features(
     segment: np.ndarray, segment_r_peaks: np.ndarray, segment_idx: int
 ) -> Dict[str, Any]:
@@ -887,9 +919,15 @@ def get_segment_api(segment_id: int):
             except Exception:
                 qrs_dur_list = []
 
+            try:
+                per_beat_pr_ms = _get_per_beat_pr_ms(np.array(raw_signal), r_peaks_arr, seg_fs)
+            except Exception:
+                per_beat_pr_ms = []
+
             clinical_features = {
                 "mean_hr": mean_hr,
                 "pr_interval": pr_interval_ms,
+                "per_beat_pr_ms": per_beat_pr_ms,
                 "rr_intervals_ms": rr_intervals_ms,
                 "qrs_durations_ms": qrs_dur_list,
                 "fs": seg_fs,
@@ -1121,7 +1159,7 @@ def detect_patterns():
     # Only pattern events (PVC Bigeminy, NSVT, etc.) or rhythm events (AF, VT)
     # can override the background. This matters for training: arrhythmia_label
     # feeds the rhythm model (17 classes) which has no "PVC" class.
-    BEAT_ONLY_LABELS = {"PVC", "PAC", "None", "Run"}
+    BEAT_ONLY_LABELS = {"PVC", "PAC", "None"}
     SINUS_VARIANTS = {"Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia",
                       "Artifact", "Unknown"}
     if display_events:

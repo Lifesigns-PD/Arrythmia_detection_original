@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ECG Arrhythmia Pipeline — Full Flowchart</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', monospace; padding: 30px; }
+  h1 { text-align: center; color: #58a6ff; font-size: 24px; margin-bottom: 6px; }
+  h2 { color: #58a6ff; font-size: 16px; margin: 24px 0 10px 0; border-bottom: 1px solid #30363d; padding-bottom: 6px; }
+  h3 { color: #79c0ff; font-size: 13px; margin: 14px 0 6px 0; }
+  .subtitle { text-align: center; color: #8b949e; font-size: 13px; margin-bottom: 30px; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+
+  /* ── Architecture Flow ── */
+  .flow { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+  .box { background: #1f2937; border: 1px solid #374151; border-radius: 6px; padding: 8px 14px; font-size: 12px; text-align: center; }
+  .box.input  { border-color: #3b82f6; color: #93c5fd; }
+  .box.proc   { border-color: #8b5cf6; color: #c4b5fd; }
+  .box.model  { border-color: #10b981; color: #6ee7b7; }
+  .box.rule   { border-color: #f59e0b; color: #fcd34d; }
+  .box.output { border-color: #ef4444; color: #fca5a5; }
+  .box.orch   { border-color: #06b6d4; color: #67e8f9; }
+  .arrow { color: #6b7280; font-size: 18px; }
+
+  /* ── Tables ── */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+  th { background: #21262d; color: #8b949e; padding: 8px 10px; text-align: left; border-bottom: 2px solid #30363d; }
+  td { padding: 7px 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  tr:hover td { background: #1c2128; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: bold; }
+  .tag.rule   { background: #78350f; color: #fcd34d; }
+  .tag.ml     { background: #1e3a5f; color: #93c5fd; }
+  .tag.both   { background: #14532d; color: #6ee7b7; }
+  .tag.rhythm { background: #2d1b69; color: #c4b5fd; }
+  .tag.ectopy { background: #4a1d1d; color: #fca5a5; }
+  .tag.yes    { background: #14532d; color: #6ee7b7; }
+  .tag.no     { background: #3f1e1e; color: #fca5a5; }
+  .tag.guard  { background: #2d3748; color: #9ca3af; }
+  .pri-high   { color: #ef4444; font-weight: bold; }
+  .pri-mid    { color: #f59e0b; font-weight: bold; }
+  .pri-low    { color: #6ee7b7; }
+  .cond       { color: #c9d1d9; }
+  .note       { color: #8b949e; font-size: 11px; }
+
+  /* ── Rule cards ── */
+  .rule-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; margin-top: 10px; }
+  .rule-card { background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 14px; }
+  .rule-card h4 { color: #f0c27f; font-size: 12px; margin-bottom: 8px; }
+  .rule-card .threshold { color: #79c0ff; font-size: 11px; font-family: monospace; background: #0d1117; padding: 6px 10px; border-radius: 4px; margin: 4px 0; line-height: 1.6; }
+  .rule-card .fires { color: #6ee7b7; font-size: 11px; margin-top: 6px; }
+  .rule-card .guard-note { color: #8b949e; font-size: 10px; margin-top: 4px; font-style: italic; }
+
+  /* ── Outcome combos ── */
+  .outcome-grid td:first-child { font-weight: bold; color: #e6edf3; }
+  .outcome { color: #fcd34d; }
+
+  /* ── Checklist ── */
+  .checklist { list-style: none; padding: 0; }
+  .checklist li { padding: 5px 0; font-size: 12px; }
+  .checklist li::before { content: '✅ '; }
+  .checklist li.warn::before { content: '⚠️ '; }
+  .checklist li.info::before { content: 'ℹ️ '; }
+
+  /* ── Class index ── */
+  .class-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-top: 10px; }
+  .class-card { background: #1c2128; border: 1px solid #30363d; border-radius: 4px; padding: 10px 12px; font-size: 11px; }
+  .class-card .idx { color: #8b949e; font-size: 10px; }
+  .class-card .name { color: #e6edf3; font-weight: bold; }
+  .class-card .trained { color: #6ee7b7; font-size: 10px; }
+  .class-card .suppressed { color: #ef4444; font-size: 10px; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 11px; }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+</style>
+</head>
+<body>
+
+<h1>ECG Arrhythmia Pipeline — Full Flowchart</h1>
+<p class="subtitle">Signal → Models → Rules Engine → Orchestrator → Display Events</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 1: SYSTEM ARCHITECTURE
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>1. System Architecture</h2>
+
+  <h3>Ingestion Path (Dashboard + gRPC)</h3>
+  <div class="flow">
+    <div class="box input">ECG Upload /<br>gRPC Stream</div>
+    <div class="arrow">→</div>
+    <div class="box proc">Resample → 125 Hz<br>clean_signal()</div>
+    <div class="arrow">→</div>
+    <div class="box proc">R-peak detection<br>(NeuroKit2)</div>
+    <div class="arrow">→</div>
+    <div class="box proc">Feature Extraction<br>HR · PR · QRS · RR<br>per_beat_pr_ms</div>
+    <div class="arrow">→</div>
+    <div class="box proc">Signal Quality<br>SQI check</div>
+  </div>
+  <div class="flow" style="margin-top:8px;">
+    <div class="box proc">Features</div>
+    <div class="arrow">→</div>
+    <div class="box model">Rhythm CNN-Transformer<br>14 classes</div>
+    <div class="arrow">+</div>
+    <div class="box model">Ectopy CNN-Transformer<br>3 classes (per beat)</div>
+    <div class="arrow">→</div>
+    <div class="box proc">xai.py explain_segment()<br>Confidence thresholding</div>
+    <div class="arrow">→</div>
+    <div class="box orch">RhythmOrchestrator<br>.decide()</div>
+    <div class="arrow">→</div>
+    <div class="box rule">rules.py<br>derive_rule_events()<br>apply_ectopy_patterns()</div>
+    <div class="arrow">→</div>
+    <div class="box rule">apply_display_rules()<br>Priority sort</div>
+    <div class="arrow">→</div>
+    <div class="box output">final_display_events<br>→ Dashboard / gRPC Alert</div>
+  </div>
+
+  <h3 style="margin-top:16px;">Rules &gt; ML Hierarchy</h3>
+  <div class="flow">
+    <div class="box rule" style="min-width:200px;">Rule events<br>(priority 65–100)</div>
+    <div class="arrow">always shown above</div>
+    <div class="box ml" style="min-width:200px;background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;">ML events<br>(default priority 50)</div>
+  </div>
+  <p class="note" style="margin-top:8px;">Priority never suppresses — it only controls display ORDER. All AI events are force-displayed.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 2: COMPLETE EVENT PRIORITY TABLE
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>2. All Events — Priority, Source, Category, Training</h2>
+  <div class="legend">
+    <div class="legend-item"><span class="tag rule">RULE</span> Rule-derived only</div>
+    <div class="legend-item"><span class="tag ml">ML</span> ML-derived only</div>
+    <div class="legend-item"><span class="tag both">BOTH</span> Both paths create it</div>
+    <div class="legend-item"><span class="tag rhythm">RHYTHM</span> Rhythm category</div>
+    <div class="legend-item"><span class="tag ectopy">ECTOPY</span> Ectopy category</div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Priority</th>
+        <th>Event Type</th>
+        <th>Source</th>
+        <th>Category</th>
+        <th>Trains ML</th>
+        <th>Trigger Condition (summary)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="pri-high">100</td>
+        <td>VT (Ventricular Tachycardia)</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag no">NO</span></td>
+        <td class="cond">≥11 consecutive PVC beats (more than 10) in a 10s strip</td>
+      </tr>
+      <tr>
+        <td class="pri-high">90</td>
+        <td>AF / Atrial Fibrillation</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Rule: RR CV&gt;20% + no regular P. ML: rhythm model class 1</td>
+      </tr>
+      <tr>
+        <td class="pri-high">90</td>
+        <td>Atrial Flutter</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Rule: RR very regular + rate ~300bpm atrial. ML: class 2</td>
+      </tr>
+      <tr>
+        <td class="pri-high">90</td>
+        <td>NSVT (Non-Sustained VT)</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag no">NO</span></td>
+        <td class="cond">4–10 consecutive PVC beats in a 10s strip</td>
+      </tr>
+      <tr>
+        <td class="pri-high">85</td>
+        <td>Pause</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Any RR interval &gt;2.5 s (3× median)</td>
+      </tr>
+      <tr>
+        <td class="pri-high">85</td>
+        <td>PSVT</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag no">NO</span></td>
+        <td class="cond">6–10 consecutive PAC beats in a 10s strip</td>
+      </tr>
+      <tr>
+        <td class="pri-high">80</td>
+        <td>SVT (Supraventricular Tachycardia)</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag no">NO</span></td>
+        <td class="cond">≥11 consecutive PAC beats (more than 10) in a 10s strip</td>
+      </tr>
+      <tr>
+        <td class="pri-high">80</td>
+        <td>3rd Degree AV Block</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">HR&lt;50 + pr&gt;0 + std(per_beat_pr)&gt;40ms + not AF</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">70</td>
+        <td>Bundle Branch Block</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Rule: mean(qrs_dur)&gt;120ms + not AF. ML: rhythm model class 10</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">70</td>
+        <td>2nd Degree AV Block Type 2</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Rule: CV(PR)&lt;10% + max(RR)&gt;1.7×median(RR) + not AF. ML: class 8</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">65</td>
+        <td>2nd Degree AV Block Type 1</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Rule: ≥50% PR diffs&gt;10ms + max(RR)&gt;1.5×median. ML: class 7</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">55</td>
+        <td>PVC Bigeminy</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">≥3 PVC beats with alternating normal–PVC pattern in 10s window</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">55</td>
+        <td>PVC Trigeminy</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">≥3 PVC beats with every-3rd pattern</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">55</td>
+        <td>PVC Quadrigeminy</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">≥3 PVC beats with every-4th pattern</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">55</td>
+        <td>PAC Bigeminy</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">≥3 PAC beats with alternating normal–PAC pattern</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">55</td>
+        <td>PAC Trigeminy</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">≥3 PAC beats with every-3rd pattern</td>
+      </tr>
+      <tr>
+        <td class="pri-mid">55</td>
+        <td>PAC Quadrigeminy</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">≥3 PAC beats with every-4th pattern</td>
+      </tr>
+      <tr>
+        <td class="pri-low">50</td>
+        <td>1st Degree AV Block</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Rule: median(PR)&gt;200ms + no higher block + not AF. ML: class 6</td>
+      </tr>
+      <tr>
+        <td class="pri-low">50</td>
+        <td>ML Rhythm Events (generic)</td>
+        <td><span class="tag ml">ML</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Any rhythm model class not in ["Sinus Rhythm","Unknown"] — default priority 50</td>
+      </tr>
+      <tr>
+        <td class="pri-low">40</td>
+        <td>Ventricular Run (Ventricular Triplet)</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag no">NO</span></td>
+        <td class="cond">Exactly 3 consecutive PVC beats</td>
+      </tr>
+      <tr>
+        <td class="pri-low">40</td>
+        <td>Atrial Run (Atrial Triplet)</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag no">NO</span></td>
+        <td class="cond">3–5 consecutive PAC beats</td>
+      </tr>
+      <tr>
+        <td class="pri-low">30</td>
+        <td>PVC Couplet</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">2 consecutive PVC beats (count-based in 10s segment)</td>
+      </tr>
+      <tr>
+        <td class="pri-low">30</td>
+        <td>Atrial Couplet</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">2 consecutive PAC beats</td>
+      </tr>
+      <tr>
+        <td class="pri-low">10</td>
+        <td>PVC (single)</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Ectopy model: beat labeled PVC, confidence ≥ 0.70</td>
+      </tr>
+      <tr>
+        <td class="pri-low">10</td>
+        <td>PAC (single)</td>
+        <td><span class="tag both">BOTH</span></td>
+        <td><span class="tag ectopy">ECTOPY</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">Ectopy model: beat labeled PAC, confidence ≥ 0.70</td>
+      </tr>
+      <tr>
+        <td class="pri-low">0</td>
+        <td>Artifact</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag no">NO</span></td>
+        <td class="cond">SQI check fails (overall_sqi &lt; threshold or HR=0)</td>
+      </tr>
+      <tr>
+        <td class="pri-low">—</td>
+        <td>Sinus Rhythm / Sinus Bradycardia / Sinus Tachycardia</td>
+        <td><span class="tag rule">RULE</span></td>
+        <td><span class="tag rhythm">RHYTHM</span></td>
+        <td><span class="tag yes">YES</span></td>
+        <td class="cond">background_rhythm from HR: &lt;60=Brady, 60–100=Sinus, &gt;100=Tachy</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 3: RULE CONDITIONS (DETAILED)
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>3. Rule Conditions — Exact Thresholds</h2>
+
+  <h3>Signal-Level Rules (derive_rule_events)</h3>
+  <div class="rule-grid">
+
+    <div class="rule-card">
+      <h4>AF / Atrial Fibrillation</h4>
+      <div class="threshold">
+        rr_cv = std(RR) / mean(RR)<br>
+        rr_cv &gt; 0.20<br>
+        AND beats ≥ 6<br>
+        AND not is_af (guard)
+      </div>
+      <div class="fires">Fires: "AF" event (priority 90)</div>
+      <div class="guard-note">Also promotes background_rhythm → "AF"</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>Bundle Branch Block</h4>
+      <div class="threshold">
+        qrs_vals = [qrs for qrs in qrs_durations_ms if qrs &gt; 0]<br>
+        mean(qrs_vals) &gt; 120 ms<br>
+        AND not is_af
+      </div>
+      <div class="fires">Fires: "Bundle Branch Block" event (priority 70)</div>
+      <div class="guard-note">Independent of AV block rules — can co-fire with any block level</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>3rd Degree AV Block (Complete)</h4>
+      <div class="threshold">
+        HR &lt; 50 bpm<br>
+        AND pr &gt; 0 ms  (P-waves detected)<br>
+        AND len(per_beat_pr_ms) ≥ 3<br>
+        AND std(per_beat_pr_ms) &gt; 40 ms<br>
+        AND not is_af
+      </div>
+      <div class="fires">Fires: "3rd Degree AV Block" event (priority 80)</div>
+      <div class="guard-note">Sets block_fired=True → prevents lower-grade blocks firing</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>2nd Degree AV Block Type 2 (Mobitz II)</h4>
+      <div class="threshold">
+        len(per_beat_pr_ms) ≥ 2<br>
+        AND len(rr_arr) ≥ 3<br>
+        AND CV(PR) = std(PR)/mean(PR) &lt; 0.10<br>
+        AND max(RR) &gt; 1.7 × median(RR)<br>
+        AND not is_af AND not block_fired
+      </div>
+      <div class="fires">Fires: "2nd Degree AV Block Type 2" event (priority 70)</div>
+      <div class="guard-note">Fixed PR (no lengthening) + sudden dropped beat</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>2nd Degree AV Block Type 1 (Wenckebach)</h4>
+      <div class="threshold">
+        len(per_beat_pr_ms) ≥ 3<br>
+        AND len(rr_arr) ≥ 3<br>
+        AND ≥50% of PR diffs &gt; +10 ms  (increasing trend)<br>
+        AND max(RR) &gt; 1.5 × median(RR)<br>
+        AND not is_af AND not block_fired
+      </div>
+      <div class="fires">Fires: "2nd Degree AV Block Type 1" event (priority 65)</div>
+      <div class="guard-note">Progressive PR lengthening + dropped beat</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>1st Degree AV Block</h4>
+      <div class="threshold">
+        median(per_beat_pr_ms) &gt; 200 ms<br>
+        &nbsp;&nbsp;— OR —<br>
+        pr_interval (scalar) &gt; 200 ms<br>
+        AND not is_af AND not block_fired
+      </div>
+      <div class="fires">Fires: "1st Degree AV Block" event (priority 50)</div>
+      <div class="guard-note">Lowest-grade block — only fires if no higher block detected</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>Pause</h4>
+      <div class="threshold">
+        max(RR) &gt; 2.5 s<br>
+        &nbsp;&nbsp;— equivalently —<br>
+        max(RR) &gt; 3 × median(RR)
+      </div>
+      <div class="fires">Fires: "Pause" event (priority 85)</div>
+      <div class="guard-note">Independent of all other rules; can co-fire</div>
+    </div>
+
+  </div>
+
+  <h3 style="margin-top:20px;">Beat-Pattern Rules (apply_ectopy_patterns)</h3>
+  <div class="rule-grid">
+
+    <div class="rule-card">
+      <h4>VT — Ventricular Tachycardia</h4>
+      <div class="threshold">
+        consecutive PVC count ≥ 11 beats<br>
+        (more than 10 PVCs in 10s strip)
+      </div>
+      <div class="fires">Fires: "VT" event (priority 100)</div>
+      <div class="guard-note">Also promotes background_rhythm → "VT"</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>NSVT — Non-Sustained VT</h4>
+      <div class="threshold">
+        consecutive PVC count = 4 to 10 beats<br>
+        (more than 3, up to 10 in 10s strip)
+      </div>
+      <div class="fires">Fires: "NSVT" event (priority 90)</div>
+      <div class="guard-note">Promotes background_rhythm → "NSVT"</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>Ventricular Run (Ventricular Triplet)</h4>
+      <div class="threshold">
+        consecutive PVC count = exactly 3 beats
+      </div>
+      <div class="fires">Fires: "Ventricular Run" event (priority 40)</div>
+      <div class="guard-note">Promotes background_rhythm → "Ventricular Run"</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>SVT — Supraventricular Tachycardia</h4>
+      <div class="threshold">
+        consecutive PAC count ≥ 11 beats<br>
+        (more than 10 PACs in 10s strip)
+      </div>
+      <div class="fires">Fires: "SVT" event (priority 80)</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>PSVT — Paroxysmal SVT</h4>
+      <div class="threshold">
+        consecutive PAC count = 6 to 10 beats<br>
+        (more than 5, up to 10 in 10s strip)
+      </div>
+      <div class="fires">Fires: "PSVT" event (priority 85)</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>Atrial Run (Atrial Triplet)</h4>
+      <div class="threshold">
+        consecutive PAC count = 3 to 5 beats
+      </div>
+      <div class="fires">Fires: "Atrial Run" event (priority 40)</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>PVC Bigeminy / Trigeminy / Quadrigeminy</h4>
+      <div class="threshold">
+        PVC beat_indices sorted, diff analysis:<br>
+        bigeminy: diffs = 1 (alt every beat)<br>
+        trigeminy: diffs = 2 (every 3rd)<br>
+        quadrigeminy: diffs = 3 (every 4th)<br>
+        AND ≥ 3 PVC beats in window
+      </div>
+      <div class="fires">Fires: "PVC Bigeminy/Trigeminy/Quadrigeminy" (priority 55)</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>PVC Couplet</h4>
+      <div class="threshold">
+        Exactly 2 PVC beats adjacent<br>
+        AND no consecutive run &gt; 2
+      </div>
+      <div class="fires">Fires: "PVC Couplet" event (priority 30)</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>PAC Bigeminy / Trigeminy / Quadrigeminy</h4>
+      <div class="threshold">
+        Same diff-based logic as PVC variants<br>
+        applied to PAC beat_indices
+      </div>
+      <div class="fires">Fires: "PAC Bigeminy/Trigeminy/Quadrigeminy" (priority 55)</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>Atrial Couplet</h4>
+      <div class="threshold">
+        Exactly 2 PAC beats adjacent
+      </div>
+      <div class="fires">Fires: "Atrial Couplet" event (priority 30)</div>
+    </div>
+
+    <div class="rule-card">
+      <h4>Single PVC / PAC</h4>
+      <div class="threshold">
+        Ectopy model confidence ≥ 0.70<br>
+        beat_label in ["PVC", "PAC"]
+      </div>
+      <div class="fires">Fires: individual beat events (priority 10 each)</div>
+      <div class="guard-note">Below 0.70 → defaults to "None" class (ignored)</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 4: MUTUAL EXCLUSION GUARDS
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>4. Mutual Exclusion Guards</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Guard</th>
+        <th>Variable</th>
+        <th>Prevents</th>
+        <th>Logic</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>AF Guard</td>
+        <td><code>is_af</code></td>
+        <td>BBB, all AV Block rules, Pause</td>
+        <td>Checked before each block/BBB rule fires. AF's irregular RR would produce false positives in block detectors.</td>
+      </tr>
+      <tr>
+        <td>Block Grade Guard</td>
+        <td><code>block_fired</code></td>
+        <td>Lower-grade blocks co-firing</td>
+        <td>3rd Degree → sets block_fired=True → Mobitz II skipped → Wenckebach skipped → 1st Degree skipped. Only highest-grade fires.</td>
+      </tr>
+      <tr>
+        <td>VT Escalation</td>
+        <td>run length comparison</td>
+        <td>NSVT and VT co-firing</td>
+        <td>apply_ectopy_patterns() replaces NSVT event with VT when run ≥5. Only one fires.</td>
+      </tr>
+      <tr>
+        <td>SVT Escalation</td>
+        <td>run length comparison</td>
+        <td>PSVT and SVT co-firing</td>
+        <td>Same mechanism — PSVT replaced by SVT when PAC run ≥5.</td>
+      </tr>
+      <tr>
+        <td>Ectopy Threshold</td>
+        <td><code>BEAT_ECTOPY_THRESHOLD = 0.70</code></td>
+        <td>Low-confidence PVC/PAC false positives</td>
+        <td>xai.py: if per-beat confidence &lt; 0.70, beat_label forced to "None". No ectopy event created.</td>
+      </tr>
+      <tr>
+        <td>Normal Sinus Skip</td>
+        <td>label check in orchestrator + gRPC</td>
+        <td>Sinus Rhythm sent as alert</td>
+        <td>orchestrator: ML events not created for "Sinus Rhythm"/"Unknown". gRPC: alerts skipped for those types.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 5: OUTPUT COMBINATIONS TABLE
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>5. Common Output Combinations</h2>
+  <p class="note" style="margin-bottom:10px;">What the clinician sees in final_display_events, ordered by priority (highest first)</p>
+  <table class="outcome-grid">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Input Signal Characteristics</th>
+        <th>background_rhythm</th>
+        <th>final_display_events (in order)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>Normal sinus, HR 72, no ectopy</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">Sinus Rhythm (background only, no events)</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>HR 45, otherwise clean</td>
+        <td>Sinus Bradycardia</td>
+        <td class="outcome">Sinus Bradycardia</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>HR 120, otherwise clean</td>
+        <td>Sinus Tachycardia</td>
+        <td class="outcome">Sinus Tachycardia</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>Irregular RR (CV&gt;20%), no clear P waves</td>
+        <td>AF</td>
+        <td class="outcome">AF → (ML rhythm if detected)</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>AF + single PVC beats</td>
+        <td>AF</td>
+        <td class="outcome">AF → PVC (ectopy model)</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td>Normal HR, PR=240ms, regular P waves</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">1st Degree AV Block → Sinus Rhythm</td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td>Progressive PR lengthening + dropped beat, RR gap &gt;1.5×</td>
+        <td>Sinus Bradycardia</td>
+        <td class="outcome">2nd Degree AV Block Type 1 → Sinus Bradycardia</td>
+      </tr>
+      <tr>
+        <td>8</td>
+        <td>Fixed PR=180ms, sudden RR gap &gt;1.7×</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">2nd Degree AV Block Type 2 → Sinus Rhythm</td>
+      </tr>
+      <tr>
+        <td>9</td>
+        <td>HR=38, P waves present, PR highly variable (std&gt;40ms)</td>
+        <td>Sinus Bradycardia</td>
+        <td class="outcome">3rd Degree AV Block → Sinus Bradycardia</td>
+      </tr>
+      <tr>
+        <td>10</td>
+        <td>Wide QRS (mean 138ms), sinus rhythm</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">Bundle Branch Block → Sinus Rhythm</td>
+      </tr>
+      <tr>
+        <td>11</td>
+        <td>BBB + prolonged PR (rule detects both)</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">Bundle Branch Block (pri 70) → 1st Degree AV Block (pri 50)</td>
+      </tr>
+      <tr>
+        <td>12</td>
+        <td>RR gap &gt;2.5s (pause)</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">Pause → Sinus Rhythm</td>
+      </tr>
+      <tr>
+        <td>13</td>
+        <td>Pause + 1st Degree Block (both present)</td>
+        <td>Sinus Bradycardia</td>
+        <td class="outcome">Pause (pri 85) → 1st Degree AV Block (pri 50)</td>
+      </tr>
+      <tr>
+        <td>14</td>
+        <td>2 consecutive PVCs</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">PVC Couplet → Sinus Rhythm</td>
+      </tr>
+      <tr>
+        <td>15</td>
+        <td>2 PVCs + several singles (alternating)</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">PVC Bigeminy (pri 55) → PVC Couplet (pri 30) → PVC ×N (pri 10)</td>
+      </tr>
+      <tr>
+        <td>16</td>
+        <td>Exactly 3 consecutive PVCs</td>
+        <td>Ventricular Run</td>
+        <td class="outcome">Ventricular Run → individual PVC beats</td>
+      </tr>
+      <tr>
+        <td>17</td>
+        <td>4–10 consecutive PVCs</td>
+        <td>NSVT</td>
+        <td class="outcome">NSVT → individual PVC beats</td>
+      </tr>
+      <tr>
+        <td>17b</td>
+        <td>≥11 consecutive PVCs</td>
+        <td>VT</td>
+        <td class="outcome">VT → individual PVC beats</td>
+      </tr>
+      <tr>
+        <td>18</td>
+        <td>3–5 consecutive PAC beats</td>
+        <td>Sinus Tachycardia</td>
+        <td class="outcome">Atrial Run → individual PAC beats</td>
+      </tr>
+      <tr>
+        <td>19</td>
+        <td>6–10 consecutive PAC beats</td>
+        <td>Sinus Tachycardia</td>
+        <td class="outcome">PSVT → individual PAC beats</td>
+      </tr>
+      <tr>
+        <td>19b</td>
+        <td>≥11 consecutive PAC beats</td>
+        <td>Sinus Tachycardia</td>
+        <td class="outcome">SVT → individual PAC beats</td>
+      </tr>
+      <tr>
+        <td>20</td>
+        <td>Isolated PVCs (no pattern)</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">PVC ×N (priority 10 each)</td>
+      </tr>
+      <tr>
+        <td>21</td>
+        <td>Isolated PACs</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">PAC ×N (priority 10 each)</td>
+      </tr>
+      <tr>
+        <td>22</td>
+        <td>Mix: PAC trigeminy + BBB</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">Bundle Branch Block (70) → PAC Trigeminy (55) → PAC ×N (10)</td>
+      </tr>
+      <tr>
+        <td>23</td>
+        <td>Mix: AF + Pause</td>
+        <td>AF</td>
+        <td class="outcome">Pause (85) → AF (90 — shown next)</td>
+      </tr>
+      <tr>
+        <td>24</td>
+        <td>Poor signal quality (SQI fails)</td>
+        <td>Unknown / Sinus</td>
+        <td class="outcome">Artifact (priority 0)</td>
+      </tr>
+      <tr>
+        <td>25</td>
+        <td>BBB detected by both rule AND ML model</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">Bundle Branch Block ×2 (one rule event + one ML event, both priority 70)</td>
+      </tr>
+      <tr>
+        <td>26</td>
+        <td>VT + PVC bigeminy in same segment</td>
+        <td>VT</td>
+        <td class="outcome">VT (100) → PVC Bigeminy (55) → PVC ×N (10)</td>
+      </tr>
+      <tr>
+        <td>27</td>
+        <td>3rd Degree Block + BBB (wide escape rhythm)</td>
+        <td>Sinus Bradycardia</td>
+        <td class="outcome">3rd Degree AV Block (80) → Bundle Branch Block (70)</td>
+      </tr>
+      <tr>
+        <td>28</td>
+        <td>VF / Ventricular Fibrillation (ML class 5)</td>
+        <td>Sinus Rhythm</td>
+        <td class="outcome">Ventricular Fibrillation (ML priority 100)</td>
+      </tr>
+      <tr>
+        <td>29</td>
+        <td>Junctional rhythm (ML class 3)</td>
+        <td>Sinus Bradycardia</td>
+        <td class="outcome">Junctional Rhythm (ML priority 50) → Sinus Bradycardia</td>
+      </tr>
+      <tr>
+        <td>30</td>
+        <td>IVR / Idioventricular (ML class 4)</td>
+        <td>Sinus Bradycardia</td>
+        <td class="outcome">Idioventricular Rhythm (ML priority 50)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 6: RHYTHM MODEL CLASS INDEX
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>6. Rhythm Model — 14 Class Index</h2>
+  <div class="class-grid">
+    <div class="class-card">
+      <div class="idx">Index 0</div>
+      <div class="name">Sinus Rhythm</div>
+      <div class="trained">Trains ML ✓</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 1</div>
+      <div class="name">Atrial Fibrillation</div>
+      <div class="trained">Trains ML ✓ (+ rule)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 2</div>
+      <div class="name">Atrial Flutter</div>
+      <div class="trained">Trains ML ✓ (+ rule)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 3</div>
+      <div class="name">Junctional Rhythm</div>
+      <div class="trained">Trains ML ✓</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 4</div>
+      <div class="name">Idioventricular Rhythm</div>
+      <div class="trained">Trains ML ✓</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 5</div>
+      <div class="name">Ventricular Fibrillation</div>
+      <div class="trained">Trains ML ✓</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 6</div>
+      <div class="name">1st Degree AV Block</div>
+      <div class="trained">Trains ML ✓ (+ rule)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 7</div>
+      <div class="name">2nd Degree AV Block Type 1</div>
+      <div class="trained">Trains ML ✓ (+ rule)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 8</div>
+      <div class="name">2nd Degree AV Block Type 2</div>
+      <div class="trained">Trains ML ✓ (+ rule)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 9</div>
+      <div class="name">3rd Degree AV Block</div>
+      <div class="trained">Trains ML ✓ (+ rule)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 10</div>
+      <div class="name">Bundle Branch Block</div>
+      <div class="trained">Trains ML ✓ (suppression REMOVED)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 11</div>
+      <div class="name">Artifact</div>
+      <div class="trained">Trains ML ✓</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 12</div>
+      <div class="name">Pause</div>
+      <div class="trained">Trains ML ✓ (+ rule)</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 13</div>
+      <div class="name">Other Arrhythmia</div>
+      <div class="trained">Trains ML ✓</div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:16px;">Ectopy Model — 3 Class Index</h3>
+  <div class="class-grid">
+    <div class="class-card">
+      <div class="idx">Index 0</div>
+      <div class="name">None (Normal Beat)</div>
+      <div class="trained">Default when conf &lt; 0.70</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 1</div>
+      <div class="name">PVC</div>
+      <div class="trained">Trains ML ✓ · conf ≥ 0.70</div>
+    </div>
+    <div class="class-card">
+      <div class="idx">Index 2</div>
+      <div class="name">PAC</div>
+      <div class="trained">Trains ML ✓ · conf ≥ 0.70</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 7: RETRAIN READINESS
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>7. Retrain Readiness Checklist</h2>
+  <ul class="checklist">
+    <li>14 rhythm classes defined in data_loader.py RHYTHM_CLASS_NAMES (indices 0–13)</li>
+    <li>3 ectopy classes defined in ECTOPY_CLASS_NAMES (None / PVC / PAC)</li>
+    <li>BBB suppression removed from xai.py and rhythm_orchestrator.py</li>
+    <li>training_set in apply_training_flags() includes: Bundle Branch Block, 2nd Degree AV Block Type 2</li>
+    <li>Naming: rules create "Atrial Couplet" (not "PAC Couplet") — training_set updated accordingly</li>
+    <li>grpc_server.py now computes PR + QRS features — block rules fire on streaming path</li>
+    <li>per_beat_pr_ms added to clinical_features in app.py — 2nd/3rd degree rules have required data</li>
+    <li>Old checkpoints deleted — clean retraining from scratch</li>
+    <li class="info">Retrain rhythm model: python models_training/retrain.py --task rhythm --mode initial</li>
+    <li class="info">Retrain ectopy model: python models_training/retrain.py --task ectopy --mode initial</li>
+    <li class="warn">Verify annotated dataset has ECG examples for all 14 rhythm classes before retraining</li>
+    <li class="warn">Test: python evaluation_and_checks/test_pattern_detection.py — expect all tests to pass</li>
+  </ul>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SECTION 8: DATA FLOW SUMMARY
+     ═══════════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <h2>8. Data Flow — What Each Feature Enables</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th>Source</th>
+        <th>Used By Rules</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>mean_hr</code></td>
+        <td>60000 / mean(RR)</td>
+        <td>background_rhythm, AF, 3rd Degree</td>
+        <td>Primary HR from detected R-peaks</td>
+      </tr>
+      <tr>
+        <td><code>rr_intervals_ms</code></td>
+        <td>diff(r_peaks) × 1000 / fs</td>
+        <td>AF (CV), Pause, 2nd Degree Type 1 &amp; 2</td>
+        <td>All RR-based rules depend on this list</td>
+      </tr>
+      <tr>
+        <td><code>pr_interval</code></td>
+        <td>median(per_beat_pr_ms) via NK2 DWT</td>
+        <td>1st Degree AV Block</td>
+        <td>Scalar fallback when per-beat list is short</td>
+      </tr>
+      <tr>
+        <td><code>per_beat_pr_ms</code></td>
+        <td>NK2 DWT P-onset → R-onset per beat</td>
+        <td>2nd Degree Type 1, Type 2, 3rd Degree, 1st Degree</td>
+        <td>NEW — required for Wenckebach / Mobitz II / Complete Block detection</td>
+      </tr>
+      <tr>
+        <td><code>qrs_durations_ms</code></td>
+        <td>NK2 DWT R-onset → R-offset per beat</td>
+        <td>Bundle Branch Block</td>
+        <td>mean &gt; 120ms triggers BBB rule</td>
+      </tr>
+      <tr>
+        <td><code>SDNN, RMSSD, pNN50</code></td>
+        <td>HRV metrics from RR intervals</td>
+        <td>XAI explanations (informational)</td>
+        <td>Not used in rule logic directly</td>
+      </tr>
+      <tr>
+        <td><code>beat_events</code></td>
+        <td>xai.py ectopy model, per beat</td>
+        <td>apply_ectopy_patterns() — all PVC/PAC pattern rules</td>
+        <td>Each beat: {label, confidence, beat_idx, peak_sample}</td>
+      </tr>
+      <tr>
+        <td><code>sqi.is_acceptable</code></td>
+        <td>Signal Quality Index check</td>
+        <td>Artifact event creation</td>
+        <td>False → SegmentState.UNRELIABLE, Artifact event fired</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p style="text-align:center; color:#30363d; font-size:11px; margin-top:30px;">
+  Generated 2026-03-30 · ECG Arrhythmia Pipeline · Project_Submission_Clean
+</p>
+
+</body>
+</html>

@@ -1,12 +1,11 @@
 """
-Test: Updated Pattern Detection Thresholds
-===========================================
+Test: Count-Based Pattern Detection Rules
+==========================================
 Verifies:
-- 2 consecutive PVCs/PACs = Couplet
-- 3 consecutive PVCs/PACs = Run (Ventricular/Atrial Run)
-- 4+ consecutive PVCs fast = NSVT/PSVT
-- 4+ consecutive PVCs slow = Ventricular/Atrial Run
+- PVC: 2=Couplet, 3=Ventricular Run, 4-10=NSVT, 11+=VT
+- PAC: 2=Atrial Couplet, 3-5=Atrial Run, 6-10=PSVT, 11+=SVT
 - Bigeminy/Trigeminy = alternating (needs beat_indices)
+- No rate guard — count alone determines the label
 """
 import sys, os, uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,72 +27,80 @@ results = []
 
 def run_test(name, events, expected_type, should_exist=True):
     apply_ectopy_patterns(events)
-    new_events = [e for e in events if e.event_category == EventCategory.RHYTHM or
-                  (e.event_category == EventCategory.ECTOPY and e.pattern_label)]
-    
-    # Check for the expected event type
     found = any(expected_type.lower() in (getattr(e, 'event_type', '')).lower() for e in events)
-    
+
     print(f"\n{'='*60}")
     print(f"TEST: {name}")
     print(f"{'='*60}")
-    print(f"  Input: {len([e for e in events if e.event_category == EventCategory.ECTOPY])} ectopy events")
-    print(f"  Expected: {expected_type} = {'YES' if should_exist else 'NO'}")
-    
     all_types = [e.event_type for e in events]
     print(f"  All event types: {all_types}")
-    
+
     status = "PASS" if found == should_exist else "FAIL"
     print(f"  Result: [{status}] {expected_type} {'found' if found else 'NOT found'}")
     results.append((name, status))
 
 
-# ── Test 1: 2 PVCs = Couplet ──
+# ── PVC: 2 = Couplet ──
 events = [make_event("PVC", 1.0), make_event("PVC", 1.2)]
 run_test("2 PVCs -> PVC Couplet", events, "PVC Couplet")
 
-# ── Test 2: 2 PACs = Atrial Couplet ──
-events = [make_event("PAC", 1.0), make_event("PAC", 1.3)]
-run_test("2 PACs -> Atrial Couplet", events, "Atrial Couplet")
-
-# ── Test 3: 3 PVCs = Ventricular Run (NOT NSVT) ──
+# ── PVC: 3 = Ventricular Run ──
 events = [make_event("PVC", 1.0), make_event("PVC", 1.2), make_event("PVC", 1.4)]
 run_test("3 PVCs -> Ventricular Run", events, "Ventricular Run")
 
-# ── Test 4: 3 PVCs should NOT be NSVT ──
+# ── PVC: 3 should NOT be NSVT ──
 events = [make_event("PVC", 1.0), make_event("PVC", 1.2), make_event("PVC", 1.4)]
 run_test("3 PVCs -> NOT NSVT", events, "NSVT", should_exist=False)
 
-# ── Test 5: 3 PACs = Atrial Run ──
-events = [make_event("PAC", 1.0), make_event("PAC", 1.3), make_event("PAC", 1.6)]
-run_test("3 PACs -> Atrial Run", events, "Atrial Run")
-
-# ── Test 6: 3 PACs should NOT be PSVT ──
-events = [make_event("PAC", 1.0), make_event("PAC", 1.3), make_event("PAC", 1.6)]
-run_test("3 PACs -> NOT PSVT", events, "PSVT", should_exist=False)
-
-# ── Test 7: 4 PVCs fast = NSVT ──
+# ── PVC: 4 = NSVT (fast — with rate guard removed, count alone matters) ──
 events = [make_event("PVC", 1.0), make_event("PVC", 1.2), make_event("PVC", 1.4), make_event("PVC", 1.6)]
 run_test("4 PVCs fast -> NSVT", events, "NSVT")
 
-# ── Test 8: 5 PVCs fast = NSVT ──
-events = [make_event("PVC", 1.0), make_event("PVC", 1.15), make_event("PVC", 1.3),
-          make_event("PVC", 1.45), make_event("PVC", 1.6)]
-run_test("5 PVCs fast -> NSVT", events, "NSVT")
-
-# ── Test 9: 4 PACs fast = PSVT ──
-events = [make_event("PAC", 2.0), make_event("PAC", 2.3), make_event("PAC", 2.6), make_event("PAC", 2.9)]
-run_test("4 PACs fast -> PSVT", events, "PSVT")
-
-# ── Test 10: 4 PVCs slow = Ventricular Run (not NSVT) ──
+# ── PVC: 4 slow = NSVT (no rate guard!) ──
 events = [make_event("PVC", 1.0), make_event("PVC", 2.0), make_event("PVC", 3.0), make_event("PVC", 4.0)]
-run_test("4 PVCs slow -> Ventricular Run", events, "Ventricular Run")
+run_test("4 PVCs slow -> NSVT (no rate guard)", events, "NSVT")
 
-# ── Test 11: Bigeminy (beat indices 5,7,9 = diff of 2) ──
+# ── PVC: 10 = NSVT (upper boundary) ──
+events = [make_event("PVC", i * 0.3) for i in range(10)]
+run_test("10 PVCs -> NSVT", events, "NSVT")
+
+# ── PVC: 11 = VT ──
+events = [make_event("PVC", i * 0.3) for i in range(11)]
+run_test("11 PVCs -> VT", events, "VT")
+
+# ── PVC: 11 should NOT be NSVT ──
+events = [make_event("PVC", i * 0.3) for i in range(11)]
+run_test("11 PVCs -> NOT NSVT", events, "NSVT", should_exist=False)
+
+# ── PAC: 2 = Atrial Couplet ──
+events = [make_event("PAC", 1.0), make_event("PAC", 1.3)]
+run_test("2 PACs -> Atrial Couplet", events, "Atrial Couplet")
+
+# ── PAC: 3 = Atrial Run ──
+events = [make_event("PAC", 1.0), make_event("PAC", 1.3), make_event("PAC", 1.6)]
+run_test("3 PACs -> Atrial Run", events, "Atrial Run")
+
+# ── PAC: 5 = Atrial Run (upper boundary) ──
+events = [make_event("PAC", i * 0.4) for i in range(5)]
+run_test("5 PACs -> Atrial Run", events, "Atrial Run")
+
+# ── PAC: 6 = PSVT ──
+events = [make_event("PAC", i * 0.4) for i in range(6)]
+run_test("6 PACs -> PSVT", events, "PSVT")
+
+# ── PAC: 10 = PSVT (upper boundary) ──
+events = [make_event("PAC", i * 0.4) for i in range(10)]
+run_test("10 PACs -> PSVT", events, "PSVT")
+
+# ── PAC: 11 = SVT ──
+events = [make_event("PAC", i * 0.4) for i in range(11)]
+run_test("11 PACs -> SVT", events, "SVT")
+
+# ── Bigeminy (beat indices 5,7,9 = diff of 2) ──
 events = [make_event("PVC", 1.0, 5), make_event("PVC", 2.0, 7), make_event("PVC", 3.0, 9)]
 run_test("PVC Bigeminy (indices 5,7,9)", events, "PVC Bigeminy")
 
-# ── Test 12: Trigeminy (beat indices 3,6,9 = diff of 3) ──
+# ── Trigeminy (beat indices 3,6,9 = diff of 3) ──
 events = [make_event("PVC", 1.0, 3), make_event("PVC", 2.0, 6), make_event("PVC", 3.0, 9)]
 run_test("PVC Trigeminy (indices 3,6,9)", events, "PVC Trigeminy")
 

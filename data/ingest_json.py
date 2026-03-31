@@ -191,11 +191,21 @@ def _run_inference(window: np.ndarray):
             rhythm_label = RHYTHM_CLASS_NAMES[idx_r]
             rhythm_conf  = float(probs_r[idx_r])
 
+            # Temporarily suppress BBB — not trained/validated yet
+            if rhythm_label == "Bundle Branch Block":
+                probs_r[idx_r] = 0.0
+                idx_r = int(probs_r.argmax())
+                rhythm_label = RHYTHM_CLASS_NAMES[idx_r]
+                rhythm_conf = float(probs_r[idx_r])
+
             # Ectopy
             m_ectopy = _load_model("ectopy")
             logits_e  = m_ectopy(x)
             probs_e   = F.softmax(logits_e, dim=-1).squeeze()
             idx_e     = int(probs_e.argmax())
+            # Apply ectopy threshold — require confidence >= 0.6
+            if idx_e != 0 and float(probs_e[idx_e]) < 0.6:
+                idx_e = 0  # Default to "None"
             ectopy_label = ECTOPY_CLASS_NAMES[idx_e]
             ectopy_conf  = float(probs_e[idx_e])
 

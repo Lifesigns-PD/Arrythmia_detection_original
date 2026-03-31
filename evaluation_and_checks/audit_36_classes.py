@@ -86,11 +86,11 @@ def test_class_list():
     print("[1/7] CLASS LIST COVERAGE")
     print(f"{'='*60}")
     
-    expected = 37  # indices 0-36
+    expected = 42  # indices 0-41
     actual = len(CLASS_NAMES)
-    
+
     if actual == expected:
-        log_pass(f"CLASS_NAMES has exactly {expected} entries (indices 0-36).")
+        log_pass(f"CLASS_NAMES has exactly {expected} entries (indices 0-{expected-1}).")
     else:
         log_fail(f"CLASS_NAMES has {actual} entries, expected {expected}.")
     
@@ -212,27 +212,19 @@ def test_rules():
     else:
         log_fail("PVC Trigeminy NOT detected.")
 
-    # 3e. PSVT (3+ consecutive PACs, tachycardic rate)
-    events = [
-        make_ectopy_event("PAC", 1.0, 100),
-        make_ectopy_event("PAC", 1.4, 101),
-        make_ectopy_event("PAC", 1.8, 102),
-    ]
+    # 3e. PSVT (6+ consecutive PACs — count-based, no rate guard)
+    events = [make_ectopy_event("PAC", 1.0 + i * 0.4, 100 + i) for i in range(6)]
     apply_ectopy_patterns(events)
     if any(e.event_type == "PSVT" for e in events):
-        log_pass("PSVT detected (3 consecutive PACs, rate >= 100).")
+        log_pass("PSVT detected (6 consecutive PACs).")
     else:
         log_fail("PSVT NOT detected.")
 
-    # 3f. NSVT (3+ consecutive PVCs, tachycardic rate)
-    events = [
-        make_ectopy_event("PVC", 4.0, 200),
-        make_ectopy_event("PVC", 4.5, 201),
-        make_ectopy_event("PVC", 5.0, 202),
-    ]
+    # 3f. NSVT (4+ consecutive PVCs — count-based, no rate guard)
+    events = [make_ectopy_event("PVC", 4.0 + i * 0.5, 200 + i) for i in range(4)]
     apply_ectopy_patterns(events)
     if any(e.event_type == "NSVT" for e in events):
-        log_pass("NSVT detected (3 consecutive PVCs, rate >= 100).")
+        log_pass("NSVT detected (4 consecutive PVCs).")
     else:
         log_fail("NSVT NOT detected.")
 
@@ -416,15 +408,15 @@ def test_training_pipeline():
     else:
         log_fail(f"RHYTHM_CLASS_NAMES contains Sinus: {sinus_in_rhythm}")
 
-    # 6b. Ectopy model classes (beat-level): PVC, PAC, Run
-    # NOTE: Bigeminy/Trigeminy are RULE-BASED patterns, NOT model predictions.
-    # The ectopy model classifies individual beats, then rules.py upgrades them.
-    required_ectopy = ["None", "PVC", "PAC", "Run"]
+    # 6b. Ectopy model classes (beat-level): None, PVC, PAC
+    # NOTE: "Run" removed — now purely rules-derived from consecutive beat counts.
+    required_ectopy = ["None", "PVC", "PAC"]
     missing = [r for r in required_ectopy if r not in ECTOPY_CLASS_NAMES]
-    if not missing:
-        log_pass(f"ECTOPY_CLASS_NAMES includes all beat-level types: {ECTOPY_CLASS_NAMES}")
+    extra = [e for e in ECTOPY_CLASS_NAMES if e not in required_ectopy]
+    if not missing and not extra:
+        log_pass(f"ECTOPY_CLASS_NAMES = {list(ECTOPY_CLASS_NAMES)} (Run removed, rules-only)")
     else:
-        log_fail(f"ECTOPY_CLASS_NAMES missing: {missing}")
+        log_fail(f"ECTOPY_CLASS_NAMES mismatch. Missing: {missing}, Extra: {extra}")
     
     # 6b2. Verify that Bigeminy/Trigeminy are in the FULL CLASS_NAMES (for training)
     pattern_classes = ["PVC Bigeminy", "PAC Bigeminy", "PVC Trigeminy"]
@@ -447,14 +439,16 @@ def test_training_pipeline():
     ]
     apply_training_flags(test_events)
     
-    # PVC, PAC Bigeminy, PSVT, NSVT, PVC Bigeminy, PVC Trigeminy should be True
+    # PVC, PAC Bigeminy, PVC Bigeminy, PVC Trigeminy should be True (ML-trained)
+    # PSVT, NSVT should be False (rules-only, not ML-trained)
+    # Sinus Rhythm, Artifact should be False
     for e in test_events:
-        if e.event_type in ["Sinus Rhythm", "Artifact"]:
+        if e.event_type in ["Sinus Rhythm", "Artifact", "PSVT", "NSVT"]:
             if not e.used_for_training:
                 log_pass(f"Training flag: '{e.event_type}' correctly EXCLUDED.")
             else:
                 log_fail(f"Training flag: '{e.event_type}' should be excluded but is included!")
-        elif e.event_type in ["PVC", "PAC Bigeminy", "PSVT", "NSVT", "PVC Bigeminy", "PVC Trigeminy"]:
+        elif e.event_type in ["PVC", "PAC Bigeminy", "PVC Bigeminy", "PVC Trigeminy"]:
             if e.used_for_training:
                 log_pass(f"Training flag: '{e.event_type}' correctly INCLUDED.")
             else:
@@ -476,17 +470,19 @@ def test_dashboard_dropdown():
     html_content = html_path.read_text(encoding="utf-8")
     
     # Critical labels that MUST be in the dropdown
+    # NOTE: SVT/VT/NSVT/PSVT removed — auto-detected from consecutive beats
+    # Triplet renamed to Run
     critical_labels = [
         "Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia",
         "Atrial Fibrillation", "Atrial Flutter",
-        "Supraventricular Tachycardia", "PSVT",
-        "Ventricular Tachycardia", "NSVT", "Ventricular Fibrillation",
+        "Ventricular Fibrillation",
         "Junctional Rhythm", "Idioventricular Rhythm",
-        "1st Degree AV Block", "2nd Degree AV Block Type 1", 
-        "2nd Degree AV Block Type 2","3rd Degree AV Block",
+        "1st Degree AV Block", "2nd Degree AV Block Type 1",
+        "2nd Degree AV Block Type 2", "3rd Degree AV Block",
         "Bundle Branch Block",
         "PAC", "PVC Bigeminy", "PVC Trigeminy",
         "PAC Bigeminy",
+        "Ventricular Run", "Atrial Run",
         "Artifact", "Pause"
     ]
     

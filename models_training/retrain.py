@@ -262,12 +262,20 @@ class ECGEventDataset(torch.utils.data.Dataset):
                         ))
                         total_windows += 1
 
+
         print(f"[Dataset] {total_windows} windows extracted")
         print(f"          skipped: null={skipped_null} short={skipped_short} no_label={skipped_label}")
 
         # Print cardiologist vs trusted_source breakdown
         sources = Counter(s[2] for s in self.samples)
         print(f"          sources: {dict(sources)}")
+
+        # Print class distribution
+        label_counts = Counter(s[1] for s in self.samples)
+        cls_names = ECTOPY_CLASS_NAMES if self.task == "ectopy" else RHYTHM_CLASS_NAMES
+        print(f"          class distribution:")
+        for idx, name in enumerate(cls_names):
+            print(f"            {idx}: {name} = {label_counts.get(idx, 0)}")
 
     # -- Window helpers --------------------------------------------------------
 

@@ -576,14 +576,10 @@
                         <optgroup label="--- Atrial Rhythms ---">
                             <option value="Atrial Fibrillation">Atrial Fibrillation</option>
                             <option value="Atrial Flutter">Atrial Flutter</option>
-                            <option value="Supraventricular Tachycardia">SVT (Sustained)</option>
-                            <option value="PSVT">PSVT (Paroxysmal)</option>
                             <option value="Junctional Rhythm">Junctional Rhythm</option>
                         </optgroup>
 
                         <optgroup label="--- Ventricular Rhythms ---">
-                            <option value="Ventricular Tachycardia">Ventricular Tachycardia (VT)</option>
-                            <option value="NSVT">NSVT (Non-Sustained VT)</option>
                             <option value="Ventricular Fibrillation">Ventricular Fibrillation (VF)</option>
                             <option value="Idioventricular Rhythm">Idioventricular Rhythm (IVR)</option>
                         </optgroup>
@@ -596,17 +592,21 @@
                             <option value="Bundle Branch Block">Bundle Branch Block</option>
                         </optgroup>
 
+                        <optgroup label="--- Other ---">
+                            <option value="Other Arrhythmia">Other Arrhythmia</option>
+                        </optgroup>
+
                         <optgroup label="--- Ectopy Patterns ---">
                             <option value="PAC">PAC (Single Atrial Ectopy)</option>
                             <option value="Atrial Couplet">Atrial Couplet</option>
-                            <option value="Atrial Triplet">Atrial Triplet</option>
+                            <option value="Atrial Run">Atrial Run (3-5 PACs)</option>
                             <option value="PAC Bigeminy">PAC Bigeminy</option>
                             <option value="PAC Trigeminy">PAC Trigeminy</option>
                             <option value="PAC Quadrigeminy">PAC Quadrigeminy</option>
                             <hr>
                             <option value="PVC">PVC (Single Ventricular Ectopy)</option>
                             <option value="PVC Couplet">Ventricular Couplet</option>
-                            <option value="Ventricular Triplet">Ventricular Triplet</option>
+                            <option value="Ventricular Run">Ventricular Run (3 PVCs)</option>
                             <option value="PVC Bigeminy">Ventricular Bigeminy</option>
                             <option value="PVC Trigeminy">Ventricular Trigeminy</option>
                             <option value="PVC Quadrigeminy">Ventricular Quadrigeminy</option>
@@ -1696,8 +1696,9 @@
                     const ECTOPY_LABELS = new Set([
                         "PVC", "PAC", "PVC Bigeminy", "PVC Trigeminy", "PVC Couplet",
                         "PVC Quadrigeminy", "PAC Bigeminy", "PAC Trigeminy", "PAC Quadrigeminy",
-                        "PAC Couplet", "NSVT", "PSVT", "Ventricular Triplet", "Atrial Triplet",
-                        "Atrial Couplet", "Ventricular Run", "Atrial Run", "Run", "None"
+                        "PAC Couplet", "Atrial Couplet", "Ventricular Run", "Atrial Run", "None",
+                        "NSVT", "PSVT", "SVT", "Supraventricular Tachycardia",
+                        "VT", "Ventricular Tachycardia"
                     ]);
                     const dropdownLabel = label || "Sinus Rhythm";
                     const rhythmForTraining = ECTOPY_LABELS.has(dropdownLabel)

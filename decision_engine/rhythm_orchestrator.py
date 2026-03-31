@@ -108,10 +108,17 @@ class RhythmOrchestrator:
         # 5. Apply Complex Logic (Phase 2)
         apply_ectopy_patterns(decision.events)
         
-        # FIX: AF Dominance - Promote to background rhythm if detected
+        # Promote high-priority rule events to background_rhythm
+        # AF, VT, NSVT replace the HR-derived sinus background entirely
         af_event = next((e for e in decision.events if e.event_type in ["AF", "Atrial Fibrillation", "Atrial Flutter"]), None)
         if af_event:
             decision.background_rhythm = af_event.event_type
+        else:
+            # VT/NSVT: ventricular rhythm replaces sinus background
+            for vt_type in ["VT", "NSVT", "Ventricular Run"]:
+                if any(e.event_type == vt_type for e in decision.events):
+                    decision.background_rhythm = vt_type
+                    break
         
         decision.final_display_events = apply_display_rules(
             decision.background_rhythm,
@@ -152,17 +159,16 @@ class RhythmOrchestrator:
         # Determine Category
         category = EventCategory.RHYTHM
         # Simple heuristic list - to be expanded
-        if label in ["PVC", "PAC", "Bigeminy", "Trigeminy", "Couplet", "Run", "Ventricular Run", "Atrial Run"]:
+        if label in ["PVC", "PAC", "Bigeminy", "Trigeminy", "Couplet"]:
              category = EventCategory.ECTOPY
-        
-        # Determine Priority (Stub)
+
+        # Determine Priority
+        # NOTE: SVT/VT/PSVT/NSVT/Run are rules-only, never from ML
         priority = 50
-        if label in ["VT", "Ventricular Tachycardia", "VF", "Ventricular Fibrillation"]:
+        if label in ["VF", "Ventricular Fibrillation"]:
             priority = 100
         elif label in ["Atrial Fibrillation", "AFib", "AF", "Atrial Flutter"]:
             priority = 90
-        elif label in ["SVT", "PSVT", "Supraventricular Tachycardia"]:
-            priority = 80
         elif "Block" in label:
             priority = 70
         elif label in ["PVC", "PAC"]:

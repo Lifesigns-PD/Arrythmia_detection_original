@@ -484,31 +484,27 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
         model_ectopy = _load_model(task="ectopy")
 
         arr = np.asarray(signal_1d, dtype=np.float32)
-        
-        # 🔒 WORKSTREAM 1: Explicit 2s windowing (Centered on 10s segment)
+
         # Target FS is 125Hz as per system standards
         fs = 125
-        signal_2s = extract_fixed_window(arr, fs, 0.0, 10.0)
-        x = torch.from_numpy(signal_2s[None, None, :]).to(device)
 
-        # 1. Inference: Rhythm
-        with torch.no_grad():
-            r_logits = model_rhythm(x)
-            r_probs = F.softmax(r_logits, dim=1)[0].cpu().numpy()
-        
-        r_idx = int(np.argmax(r_probs))
-        r_label = RHYTHM_CLASS_NAMES[r_idx]
+        # ── 1. Inference: Ectopy (Beat-by-Beat) — runs FIRST so we can
+        #    identify non-ectopic beats for clean rhythm-model windowing.
+        BEAT_ECTOPY_THRESHOLD = 0.7  # per-beat confidence floor — model over-predicts ectopy
 
-        # 2. Inference: Ectopy (Beat-by-Beat)
         r_peaks = features.get("r_peaks", [])
         if not r_peaks:
-            # Fallback to center if no peaks found
+            # Fallback: no R-peaks available — run ectopy on default window
+            default_window = extract_fixed_window(arr, fs, 0.0, 10.0)
+            x_default = torch.from_numpy(default_window[None, None, :]).to(device)
             with torch.no_grad():
-                e_logits = model_ectopy(x)
+                e_logits = model_ectopy(x_default)
                 e_probs = F.softmax(e_logits, dim=1)[0].cpu().numpy()
             e_idx = int(np.argmax(e_probs))
+            if e_idx != 0 and e_probs[e_idx] < BEAT_ECTOPY_THRESHOLD:
+                e_idx = 0
             e_label = ECTOPY_CLASS_NAMES[e_idx]
-            beat_records = []  # no per-beat data without r_peaks
+            beat_records = []
         else:
             # Multi-beat inference — keep per-beat records for bigeminy/trigeminy detection
             all_e_probs  = []
@@ -526,6 +522,9 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
                 all_e_probs.append(be_probs)
 
                 b_idx_top = int(np.argmax(be_probs))
+                # Per-beat confidence threshold: require strong evidence for ectopy
+                if b_idx_top != 0 and be_probs[b_idx_top] < BEAT_ECTOPY_THRESHOLD:
+                    b_idx_top = 0  # Default to "None" (normal beat)
                 beat_records.append({
                     "beat_idx":    beat_idx,             # sequential position in r_peaks list
                     "peak_sample": int(peak_idx),        # sample index in the segment
@@ -538,14 +537,42 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
             all_e_probs = np.array(all_e_probs)  # (N_beats, N_classes)
             max_probs = np.max(all_e_probs, axis=0)
 
-            ectopy_indices = [1, 2, 3]  # PVC, PAC, Run
-            if np.max(max_probs[ectopy_indices]) > 0.4:
+            ectopy_indices = [1, 2]  # PVC, PAC (Run removed — rules-only)
+            if np.max(max_probs[ectopy_indices]) > 0.6:
                 e_idx = int(np.argmax(max_probs))
             else:
                 e_idx = 0  # Default to "None"
 
             e_probs = max_probs
             e_label = ECTOPY_CLASS_NAMES[e_idx]
+
+        # ── 2. Inference: Rhythm — select a clean window excluding PVC/PAC beats
+        #    PVC beats have wide QRS (high variance) which biases the variance-based
+        #    window selection toward ectopic morphology, causing false BBB detections.
+        has_ectopy_beats = any(rec["label"] != "None" for rec in beat_records) if beat_records else False
+        normal_peaks = [
+            r_peaks[rec["beat_idx"]]
+            for rec in beat_records
+            if rec["label"] == "None"
+        ] if beat_records else []
+
+        if has_ectopy_beats and normal_peaks:
+            # Center rhythm window on the normal beat closest to segment center
+            seg_center = len(arr) / 2
+            best_peak = min(normal_peaks, key=lambda p: abs(p - seg_center))
+            center_s = best_peak / fs
+            rhythm_window = extract_fixed_window(arr, fs, center_s - 1.0, center_s + 1.0)
+        else:
+            # No ectopy found OR no normal beats — use default variance-based window
+            rhythm_window = extract_fixed_window(arr, fs, 0.0, 10.0)
+
+        x = torch.from_numpy(rhythm_window[None, None, :]).to(device)
+        with torch.no_grad():
+            r_logits = model_rhythm(x)
+            r_probs = F.softmax(r_logits, dim=1)[0].cpu().numpy()
+
+        r_idx = int(np.argmax(r_probs))
+        r_label = RHYTHM_CLASS_NAMES[r_idx]
 
         # 3. Evidence Gathering
         saliency = _compute_saliency(model_rhythm, x, r_idx)

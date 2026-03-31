@@ -61,38 +61,94 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
             ))
 
     # ---------------------------------------------------------
-    # 2. SVT (Regular + Fast + Narrow + Not AF/VT)
+    # 2. SVT / VT — REMOVED from rules. Now purely derived from
+    #    consecutive PAC/PVC beat counts in apply_ectopy_patterns().
     # ---------------------------------------------------------
-    # Criteria: Regular (CV < 0.08) + Narrow QRS (< 120ms) + HR > 130 + Not AF
-    if hr > 130 and qrs_mean < 120 and cv < 0.08 and not is_af:
+
+    # Per-beat PR intervals (needed for 2nd/3rd degree block detection)
+    per_beat_pr = []
+    raw_pbpr = features.get("per_beat_pr_ms", [])
+    if isinstance(raw_pbpr, list):
+        per_beat_pr = [x for x in raw_pbpr if isinstance(x, (int, float)) and x > 0]
+
+    # ---------------------------------------------------------
+    # 3a. Bundle Branch Block (QRS > 120 ms)
+    # ---------------------------------------------------------
+    if qrs_mean > 120 and not is_af:
         events.append(Event(
             event_id=str(uuid.uuid4()),
-            event_type="SVT",
+            event_type="Bundle Branch Block",
             event_category=EventCategory.RHYTHM,
             start_time=0.0, end_time=10.0,
-            rule_evidence={"rule": "SVT_Strict", "hr": hr, "qrs": qrs_mean, "cv": cv},
+            rule_evidence={"rule": "BBB_WideQRS", "qrs_mean_ms": round(qrs_mean, 1)},
+            priority=70,
+            used_for_training=False
+        ))
+
+    # ---------------------------------------------------------
+    # 3b. AV Blocks (1st, 2nd Type 1/2, 3rd)
+    # Only fire when not AF (AF has no organised P-waves → PR is meaningless)
+    # ---------------------------------------------------------
+    block_fired = False  # track highest-grade block to avoid dual firing
+
+    # 3rd Degree (Complete AV Block) — most specific, check first
+    # Criteria: very slow escape HR, P-waves present, PR intervals highly variable (AV dissociation)
+    if (not is_af and hr > 0 and hr < 50 and pr > 0
+            and len(per_beat_pr) >= 3
+            and float(np.std(per_beat_pr)) > 40):
+        events.append(Event(
+            event_id=str(uuid.uuid4()),
+            event_type="3rd Degree AV Block",
+            event_category=EventCategory.RHYTHM,
+            start_time=0.0, end_time=10.0,
+            rule_evidence={"rule": "3rdDegBlock_AVDissociation",
+                           "hr": round(hr, 1), "pr_std": round(float(np.std(per_beat_pr)), 1)},
             priority=80,
-            used_for_training=True
+            used_for_training=False
         ))
+        block_fired = True
 
-    # ---------------------------------------------------------
-    # 3. VT (Wide QRS + HR > 100)
-    # ---------------------------------------------------------
-    if hr > 100 and qrs_mean >= 120:
-        events.append(Event(
-            event_id=str(uuid.uuid4()),
-            event_type="VT",
-            event_category=EventCategory.RHYTHM,
-            start_time=0.0, end_time=10.0,
-            rule_evidence={"rule": "VT_Rule", "hr": hr, "qrs": qrs_mean},
-            priority=100,
-            used_for_training=True
-        ))
+    # 2nd Degree Type 2 (Mobitz II) — fixed PR + sudden dropped beat
+    # Criteria: PR intervals constant (CV < 10%), RR gap ≥ 1.7× median (dropped beat without warning)
+    if (not is_af and not block_fired and len(per_beat_pr) >= 2 and len(rr_arr) >= 3):
+        pr_mean = float(np.mean(per_beat_pr))
+        pr_cv = float(np.std(per_beat_pr)) / pr_mean if pr_mean > 0 else 1.0
+        median_rr = float(np.median(rr_arr))
+        if pr_cv < 0.10 and float(np.max(rr_arr)) > 1.7 * median_rr:
+            events.append(Event(
+                event_id=str(uuid.uuid4()),
+                event_type="2nd Degree AV Block Type 2",
+                event_category=EventCategory.RHYTHM,
+                start_time=0.0, end_time=10.0,
+                rule_evidence={"rule": "2ndDegBlock_MobitzII",
+                               "pr_cv": round(pr_cv, 3), "max_rr_ms": round(float(np.max(rr_arr)), 1)},
+                priority=70,
+                used_for_training=False
+            ))
+            block_fired = True
 
-    # ---------------------------------------------------------
-    # 4. AV Blocks
-    # ---------------------------------------------------------
-    if pr > 200:
+    # 2nd Degree Type 1 (Wenckebach) — progressive PR lengthening + dropped beat
+    # Criteria: majority of consecutive PR diffs > +10 ms AND one RR gap > 1.5× median
+    if (not is_af and not block_fired and len(per_beat_pr) >= 3 and len(rr_arr) >= 3):
+        pr_diffs = np.diff(per_beat_pr)
+        increasing = int(np.sum(pr_diffs > 10)) >= len(pr_diffs) // 2
+        median_rr = float(np.median(rr_arr))
+        if increasing and float(np.max(rr_arr)) > 1.5 * median_rr:
+            events.append(Event(
+                event_id=str(uuid.uuid4()),
+                event_type="2nd Degree AV Block Type 1",
+                event_category=EventCategory.RHYTHM,
+                start_time=0.0, end_time=10.0,
+                rule_evidence={"rule": "2ndDegBlock_Wenckebach",
+                               "pr_increasing_beats": int(np.sum(pr_diffs > 10)),
+                               "max_rr_ms": round(float(np.max(rr_arr)), 1)},
+                priority=65,
+                used_for_training=False
+            ))
+            block_fired = True
+
+    # 1st Degree AV Block — only if no higher-grade block already fired
+    if not is_af and not block_fired and pr > 200:
         events.append(Event(
             event_id=str(uuid.uuid4()),
             event_type="1st Degree AV Block",
@@ -100,7 +156,7 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
             start_time=0.0, end_time=10.0,
             rule_evidence={"rule": "1stDegBlock", "pr": pr},
             priority=50,
-            used_for_training=False # Never train on AV block
+            used_for_training=False
         ))
 
     # ---------------------------------------------------------
@@ -127,20 +183,17 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
 def apply_ectopy_patterns(events: List[Event]) -> None:
     """
     Scans ECTOPY events and applies pattern labels.
-    
-    Clinical Rules:
-    - Couplet:    2 consecutive PVCs/PACs
-    - Run:        3 consecutive (Ventricular Run / Atrial Run)
-    - NSVT:       >3 (4+) consecutive PVCs, rate >= 100
-    - PSVT:       >3 (4+) consecutive PACs, rate >= 100  
-    - Bigeminy:   Every other beat is PVC/PAC (needs beat_indices)
-    - Trigeminy:  Every 3rd beat is PVC/PAC (needs beat_indices)
+
+    Count-Based Rules (no rate guard):
+    PVC: 2=Couplet, 3=Ventricular Run, 4-10=NSVT, 11+=VT
+    PAC: 2=Atrial Couplet, 3-5=Atrial Run, 6-10=PSVT, 11+=SVT
+    Bigeminy/Trigeminy/Quadrigeminy: interspersed patterns via beat_indices diffs
     """
     ectopy = sorted(
         [e for e in events if e.event_category == EventCategory.ECTOPY],
         key=lambda e: e.start_time
     )
-    
+
     if len(ectopy) < 2:
         return
 
@@ -150,9 +203,9 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
         clusters = []
         current_cluster = []
         MAX_GAP = 2.0 # seconds
-        
+
         target_events = [e for e in ectopy if target_type in e.event_type]
-        
+
         for e in target_events:
             if not current_cluster:
                 current_cluster.append(e)
@@ -169,14 +222,14 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
             count = len(cluster)
             duration = cluster[-1].start_time - cluster[0].start_time
             rate = (count - 1) * (60.0 / duration) if duration > 0 else 0
-            
+
             # Pattern Recognition via Beat Indices
             indices = []
             for e in cluster:
                 if e.beat_indices: indices.append(e.beat_indices[0])
-            
+
             has_indices = len(indices) == count  # All events have beat_indices
-            
+
             if has_indices and len(indices) >= 2:
                 # Primary path: use beat indices for precise pattern detection
                 diffs = np.diff(indices)
@@ -187,27 +240,18 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                 is_quadrigeminy = len(diffs) >= 2 and all(d == 4 for d in diffs)
             else:
                 # Fallback path: use TIME intervals when beat_indices are missing
-                # (common with manual cardiologist annotations)
-                #
-                # IMPORTANT: Without beat_indices, we CANNOT distinguish Bigeminy
-                # (every other beat) from a slow Run (consecutive beats at ~60bpm).
-                # Both look like events spaced ~1s apart.
-                #
+                # Without beat_indices, we CANNOT distinguish Bigeminy from a slow Run.
                 # SAFE DEFAULT: Treat all clusters as consecutive runs.
-                # Bigeminy/Trigeminy can ONLY be detected via beat_indices.
                 time_gaps = [cluster[i+1].start_time - cluster[i].start_time for i in range(count - 1)]
-                
+
                 if len(time_gaps) >= 1:
                     mean_gap = np.mean(time_gaps)
                     std_gap = np.std(time_gaps)
                     cv = std_gap / mean_gap if mean_gap > 0 else float('inf')
-                    
-                    # All events with consistent spacing are treated as consecutive
-                    # The rate calculation will determine Run vs NSVT/PSVT
                     is_consecutive = (cv < 0.35) if count >= 3 else (cv < 0.25)
                 else:
-                    is_consecutive = (count == 2)  # Pairs are always consecutive
-                
+                    is_consecutive = (count == 2)
+
                 # Never detect Bigeminy/Trigeminy without beat_indices
                 is_bigeminy = False
                 is_trigeminy = False
@@ -219,8 +263,8 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                 if is_bigeminy: pattern_name = "Bigeminy"
                 elif is_trigeminy: pattern_name = "Trigeminy"
                 else: pattern_name = "Quadrigeminy"
-                priority = 55 # Greater than isolated (10), less than Run (80)
-                
+                priority = 55
+
                 new_event = Event(
                     event_id=str(uuid.uuid4()),
                     event_type=f"{target_type} {pattern_name}",
@@ -233,60 +277,133 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                     used_for_training=True
                 )
                 events.append(new_event)
-                # Label individual beats for dashboard highlight
                 for e in cluster: e.pattern_label = pattern_name
 
-            # Rule 2: NSVT / PSVT (>3 consecutive beats, i.e. 4+, rate >= 100 bpm)
-            # Rate guard: bigeminy PVC-to-PVC rate ~35 bpm, NSVT requires >= 100 bpm by definition
-            elif is_consecutive and count > 3 and rate >= 100:
-                event_type = "NSVT" if target_type == "PVC" else "PSVT"
-                priority = 90 if target_type == "PVC" else 85
-                
-                new_event = Event(
-                    event_id=str(uuid.uuid4()),
-                    event_type=event_type,
-                    event_category=EventCategory.RHYTHM,
-                    start_time=cluster[0].start_time,
-                    end_time=cluster[-1].end_time,
-                    pattern_label="Run",
-                    rule_evidence={"rule": f"{event_type}_Detected", "count": count, "rate": round(rate, 1)},
-                    priority=priority,
-                    used_for_training=True
-                )
-                events.append(new_event)
+            # ── PVC consecutive count rules ──
+            elif is_consecutive and target_type == "PVC":
+                if count >= 11:
+                    # VT: 11+ consecutive PVCs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="VT",
+                        event_category=EventCategory.RHYTHM,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Run",
+                        rule_evidence={"rule": "VT_Detected", "count": count, "rate": round(rate, 1)},
+                        priority=100,
+                        used_for_training=False,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Run"
+                elif count >= 4:
+                    # NSVT: 4-10 consecutive PVCs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="NSVT",
+                        event_category=EventCategory.RHYTHM,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Run",
+                        rule_evidence={"rule": "NSVT_Detected", "count": count, "rate": round(rate, 1)},
+                        priority=90,
+                        used_for_training=False,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Run"
+                elif count == 3:
+                    # Ventricular Run: exactly 3 consecutive PVCs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="Ventricular Run",
+                        event_category=EventCategory.RHYTHM,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Run",
+                        rule_evidence={"rule": "Ventricular_Run_Detected", "count": 3, "rate": round(rate, 1)},
+                        priority=40,
+                        used_for_training=False,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Run"
+                elif count == 2:
+                    # PVC Couplet: exactly 2 consecutive PVCs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="PVC Couplet",
+                        event_category=EventCategory.ECTOPY,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Couplet",
+                        rule_evidence={"rule": "PVC_Couplet_Detected", "count": 2},
+                        priority=30,
+                        used_for_training=True,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Couplet"
 
-            # Rule 3: Triplet (exactly 3 consecutive beats)
-            elif is_consecutive and count == 3:
-                event_type = "Ventricular Triplet" if target_type == "PVC" else "Atrial Triplet"
-                new_event = Event(
-                    event_id=str(uuid.uuid4()),
-                    event_type=event_type,
-                    event_category=EventCategory.RHYTHM,
-                    start_time=cluster[0].start_time,
-                    end_time=cluster[-1].end_time,
-                    pattern_label="Run",
-                    rule_evidence={"rule": f"{event_type}_Detected", "count": 3, "rate": round(rate, 1)},
-                    priority=40,
-                    used_for_training=True
-                )
-                events.append(new_event)
-
-            # Rule 4: Couplet (exactly 2 consecutive beats)
-            elif is_consecutive and count == 2:
-                couplet_type = "PVC Couplet" if target_type == "PVC" else "Atrial Couplet"
-                new_event = Event(
-                    event_id=str(uuid.uuid4()),
-                    event_type=couplet_type,
-                    event_category=EventCategory.ECTOPY,
-                    start_time=cluster[0].start_time,
-                    end_time=cluster[-1].end_time,
-                    pattern_label="Couplet",
-                    rule_evidence={"rule": f"{couplet_type}_Detected", "count": 2},
-                    priority=30,
-                    used_for_training=True
-                )
-                events.append(new_event)
-                for e in cluster: e.pattern_label = "Couplet"
+            # ── PAC consecutive count rules ──
+            elif is_consecutive and target_type == "PAC":
+                if count >= 11:
+                    # SVT: 11+ consecutive PACs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="SVT",
+                        event_category=EventCategory.RHYTHM,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Run",
+                        rule_evidence={"rule": "SVT_Detected", "count": count, "rate": round(rate, 1)},
+                        priority=80,
+                        used_for_training=False,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Run"
+                elif count >= 6:
+                    # PSVT: 6-10 consecutive PACs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="PSVT",
+                        event_category=EventCategory.RHYTHM,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Run",
+                        rule_evidence={"rule": "PSVT_Detected", "count": count, "rate": round(rate, 1)},
+                        priority=85,
+                        used_for_training=False,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Run"
+                elif count >= 3:
+                    # Atrial Run: 3-5 consecutive PACs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="Atrial Run",
+                        event_category=EventCategory.RHYTHM,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Run",
+                        rule_evidence={"rule": "Atrial_Run_Detected", "count": count, "rate": round(rate, 1)},
+                        priority=40,
+                        used_for_training=False,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Run"
+                elif count == 2:
+                    # Atrial Couplet: exactly 2 consecutive PACs
+                    new_event = Event(
+                        event_id=str(uuid.uuid4()),
+                        event_type="Atrial Couplet",
+                        event_category=EventCategory.ECTOPY,
+                        start_time=cluster[0].start_time,
+                        end_time=cluster[-1].end_time,
+                        pattern_label="Couplet",
+                        rule_evidence={"rule": "Atrial_Couplet_Detected", "count": 2},
+                        priority=30,
+                        used_for_training=True,
+                    )
+                    events.append(new_event)
+                    for e in cluster: e.pattern_label = "Couplet"
             
 
 
@@ -305,9 +422,9 @@ def apply_display_rules(background_rhythm: str, events: List[Event]) -> List[Eve
     has_manual_sinus = False # FORCE DISABLE VETO
     
     # Pass 1: Global Hierarchy & Veto
-    has_af = any(e.event_type in ["Atrial Fibrillation", "Atrial Flutter"] for e in events)
-    has_svt = any(e.event_type in ["SVT", "Atrial Run (PSVT)", "Atrial Triplet", "PSVT"] for e in events)
-    has_vt = any(e.event_type in ["VT", "NSVT", "Ventricular Triplet"] for e in events)
+    has_af = any(e.event_type in ["AF", "Atrial Fibrillation", "Atrial Flutter"] for e in events)
+    has_svt = any(e.event_type in ["SVT", "PSVT", "Atrial Run"] for e in events)
+    has_vt = any(e.event_type in ["VT", "NSVT", "Ventricular Run"] for e in events)
 
     for event in events:
         should_display = True
@@ -388,18 +505,23 @@ def apply_training_flags(events: List[Event]) -> None:
     and the Rhythm specialist on Runs/Rhythms.
     """
     training_set = {
-        # Atrial
-        "PAC", "PAC Couplet", "Atrial Triplet", "PSVT",
+        # Atrial (beat-level ectopy — trains ectopy model)
+        "PAC", "Atrial Couplet",           # "PAC Couplet" renamed to "Atrial Couplet" in rules
         "PAC Bigeminy", "PAC Trigeminy", "PAC Quadrigeminy",
-        "AF", "Atrial Fibrillation", "Atrial Flutter", "SVT",
-        
-        # Ventricular
-        "PVC", "PVC Couplet", "Ventricular Triplet", "NSVT",
+        "AF", "Atrial Fibrillation", "Atrial Flutter",
+
+        # Ventricular (beat-level ectopy — trains ectopy model)
+        "PVC", "PVC Couplet",
         "PVC Bigeminy", "PVC Trigeminy", "PVC Quadrigeminy",
-        "VT", "Ventricular Tachycardia", "Ventricular Fibrillation",
-        
-        # Blocks
-        "1st Degree AV Block", "2nd Degree AV Block Type 1", "3rd Degree AV Block"
+        "Ventricular Fibrillation",
+
+        # Blocks — train the rhythm model (indices 6-10 in RHYTHM_CLASS_NAMES)
+        "1st Degree AV Block", "2nd Degree AV Block Type 1",
+        "2nd Degree AV Block Type 2", "3rd Degree AV Block",
+        "Bundle Branch Block",
+
+        # NOTE: SVT, VT, NSVT, PSVT, Ventricular Run, Atrial Run are
+        # RULES-ONLY and should NOT train the ML models.
     }
     for event in events:
         # Never train on Sinus or Artifact as primary labels to avoid baseline bias
