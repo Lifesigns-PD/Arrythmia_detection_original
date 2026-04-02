@@ -225,13 +225,14 @@ ECTOPY_INDEX = {name: i for i, name in enumerate(ECTOPY_CLASS_NAMES)}
 RHYTHM_LABEL_ALIASES = {
     "Sinus Bradycardia": "Sinus Rhythm",
     "Sinus Tachycardia": "Sinus Rhythm",
+    "Sinus": "Sinus Rhythm",  # bare "Sinus" from DB entries like "Sinus + PVC"
 }
 
 def get_rhythm_label_idx(original_label_name):
     """
     RHYTHM TASK: Focuses on the base pathology.
     - AF + PVC -> AF (KEEP)
-    - Sinus + PVC -> Sinus -> None (DROPPED)
+    - Sinus + PVC -> Sinus -> Sinus Rhythm (KEEP — ectopy handled by ectopy model)
     - PVCs -> None (DROPPED - Ectopy is not a rhythm)
     - Sinus Bradycardia/Tachycardia -> Sinus Rhythm (class 0)
     - Other Arrhythmia -> None (DROPPED - catch-all, not a real class)

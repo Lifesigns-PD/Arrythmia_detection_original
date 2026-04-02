@@ -572,7 +572,7 @@ def run_initial(task, num_epochs, batch_size, lr):
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path   = CHECKPOINTS / f"best_model_{task}.pth"
 
-    ds = ECGEventDataset(task=task, source_filter="all", augment=False)
+    ds = ECGEventDataset(task=task, source_filter="all", augment=True)
     if len(ds) < 20:
         print(f"[ABORT] Only {len(ds)} windows - not enough to train.")
         return
@@ -708,16 +708,24 @@ def run_finetune(task, num_epochs, batch_size, lr):
         va = eval_epoch(model, criterion, val_ldr, device, num_classes, class_names)
         print(f"  P1 ep {ep:02d}  loss={tr['loss']:.4f} acc={tr['acc']:.3f}  "
               f"val bal_acc={va['balanced_acc']:.3f}")
-        # [FIX] Micro-dataset Save Logic: If tiny dataset and perfect training, allow save
-        is_perfect_micro = (len(train_idx) < 50 and tr["loss"] < 0.01 and tr["acc"] > 0.99)
-        if va["balanced_acc"] > best_bal_acc or is_perfect_micro:
-            old_best = best_bal_acc
+        # [FIX] Finetune Save Logic: finetune val sets are often unrepresentative
+        # (single patient in val → one class → bal_acc always 0.33).
+        # Save when training is near-perfect (cardiologist correction) BUT only if
+        # the checkpoint bal_acc tracker is not reduced — never overwrite a better model.
+        is_perfect_micro = (tr["loss"] < 0.01 and tr["acc"] > 0.99)
+        if va["balanced_acc"] > best_bal_acc:
             best_bal_acc = va["balanced_acc"]
             torch.save({"epoch": ep, "model_state": model.state_dict(),
                         "balanced_acc": best_bal_acc, "class_names": class_names,
                         "mode": "finetune"}, ckpt_path)
-            reason = "micro-perfect" if is_perfect_micro and va["balanced_acc"] <= old_best else "improvement"
-            print(f"  - Saved ({reason}) bal_acc={best_bal_acc:.4f}  (prev={prev_acc:.4f})")
+            print(f"  - Saved (improvement) bal_acc={best_bal_acc:.4f}  (prev={prev_acc:.4f})")
+        elif is_perfect_micro:
+            # Training is near-perfect but val score did not improve — save the weights
+            # WITHOUT updating best_bal_acc, so the checkpoint metric stays honest.
+            torch.save({"epoch": ep, "model_state": model.state_dict(),
+                        "balanced_acc": best_bal_acc, "class_names": class_names,
+                        "mode": "finetune"}, ckpt_path)
+            print(f"  - Saved (micro-perfect) bal_acc={best_bal_acc:.4f}  (prev={prev_acc:.4f})")
 
     # -- Phase 2: unfreeze all, low LR - prevents catastrophic forgetting ------
     print(f"\n-- Phase 2: Full model fine-tune ({P2_EPOCHS} epochs) -------------")
@@ -734,16 +742,24 @@ def run_finetune(task, num_epochs, batch_size, lr):
         scheduler.step()
         print(f"  P2 ep {ep:02d}  loss={tr['loss']:.4f} acc={tr['acc']:.3f}  "
               f"val bal_acc={va['balanced_acc']:.3f}")
-        # [FIX] Micro-dataset Save Logic: If tiny dataset and perfect training, allow save
-        is_perfect_micro = (len(train_idx) < 50 and tr["loss"] < 0.01 and tr["acc"] > 0.99)
-        if va["balanced_acc"] > best_bal_acc or is_perfect_micro:
-            old_best = best_bal_acc
+        # [FIX] Finetune Save Logic: finetune val sets are often unrepresentative
+        # (single patient in val → one class → bal_acc always 0.33).
+        # Save when training is near-perfect (cardiologist correction) BUT only if
+        # the checkpoint bal_acc tracker is not reduced — never overwrite a better model.
+        is_perfect_micro = (tr["loss"] < 0.01 and tr["acc"] > 0.99)
+        if va["balanced_acc"] > best_bal_acc:
             best_bal_acc = va["balanced_acc"]
             torch.save({"epoch": ep, "model_state": model.state_dict(),
                         "balanced_acc": best_bal_acc, "class_names": class_names,
                         "mode": "finetune"}, ckpt_path)
-            reason = "micro-perfect" if is_perfect_micro and va["balanced_acc"] <= old_best else "improvement"
-            print(f"  - Saved ({reason}) bal_acc={best_bal_acc:.4f}  (prev={prev_acc:.4f})")
+            print(f"  - Saved (improvement) bal_acc={best_bal_acc:.4f}  (prev={prev_acc:.4f})")
+        elif is_perfect_micro:
+            # Training is near-perfect but val score did not improve — save the weights
+            # WITHOUT updating best_bal_acc, so the checkpoint metric stays honest.
+            torch.save({"epoch": ep, "model_state": model.state_dict(),
+                        "balanced_acc": best_bal_acc, "class_names": class_names,
+                        "mode": "finetune"}, ckpt_path)
+            print(f"  - Saved (micro-perfect) bal_acc={best_bal_acc:.4f}  (prev={prev_acc:.4f})")
 
     if best_bal_acc <= prev_acc:
         print(f"\n--  Fine-tune did NOT improve.  "

@@ -20,7 +20,8 @@ import json
 import math
 import sys
 import warnings
-from datetime import datetime, timezone
+import statistics
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -172,6 +173,129 @@ def _parse_extract_json(
 
 
 # ---------------------------------------------------------------------------
+# SP sinus rhythm detection — multi-feature (RR regularity + P-wave + PR)
+# ---------------------------------------------------------------------------
+# RR regularity thresholds
+_SINUS_FILTER_LOW   = 0.85   # remove RR < 0.85 × median (premature beat)
+_SINUS_FILTER_HIGH  = 1.15   # remove RR > 1.15 × median (compensatory pause)
+_SINUS_MIN_BEATS    = 3
+_SINUS_MIN_FRACTION = 0.40
+
+# Sinus score thresholds
+_SINUS_SCORE_PREMODEL  = 0.75  # strict: skip rhythm model (needs RR + P-wave)
+_SINUS_SCORE_POSTMODEL = 0.60  # moderate: override bad model labels
+
+# Post-model override fires on these model outputs
+_SINUS_CANDIDATES = {
+    "Atrial Fibrillation", "Atrial Flutter", "Unknown",
+    "Junctional Rhythm", "Idioventricular Rhythm",
+    "Ventricular Fibrillation",
+}
+
+
+def _detect_sinus_cv(r_peaks: list, cv_threshold: float = 0.10) -> tuple[bool, float | None]:
+    """
+    Filter ectopic beats from RR intervals and check regularity.
+    Returns (is_regular, hr_bpm).
+    """
+    if len(r_peaks) < 4:
+        return False, None
+    rr = np.diff(np.array(r_peaks, dtype=np.float64)) * (1000.0 / TARGET_FS)
+    if len(rr) < 3:
+        return False, None
+    median_rr = float(np.median(rr))
+    if median_rr <= 0:
+        return False, None
+    sinus_rr = rr[(rr >= _SINUS_FILTER_LOW * median_rr) & (rr <= _SINUS_FILTER_HIGH * median_rr)]
+    if len(sinus_rr) < _SINUS_MIN_BEATS or len(sinus_rr) / len(rr) < _SINUS_MIN_FRACTION:
+        return False, None
+    mean_s = float(np.mean(sinus_rr))
+    cv = float(np.std(sinus_rr)) / mean_s if mean_s > 0 else 1.0
+    if cv < cv_threshold:
+        return True, 60_000.0 / mean_s if mean_s > 0 else None
+    return False, None
+
+
+def _compute_sinus_score(r_peaks: list, morph_data: dict) -> tuple[float, str]:
+    """
+    Multi-feature sinus confidence score combining:
+      1. Filtered RR regularity   (0.40 weight) — regular underlying rhythm
+      2. P-wave presence ratio    (0.35 weight) — P-waves confirm atrial sinus origin
+      3. Normal PR interval       (0.25 weight) — normal AV conduction = sinus pathway
+
+    Returns (score 0.0-1.0, human-readable reason string).
+    """
+    score = 0.0
+    reasons = []
+    summary = morph_data.get("summary", {})
+
+    # Feature 1: Filtered RR regularity (CV < 0.10 relaxed)
+    is_regular, hr = _detect_sinus_cv(r_peaks, 0.10)
+    if is_regular:
+        score += 0.40
+        hr_str = f"{hr:.0f}" if hr else "?"
+        reasons.append(f"regular_RR(HR={hr_str})")
+
+    # Feature 2: P-wave presence ratio (>= 0.5 = majority of beats have P-waves)
+    p_ratio = summary.get("p_wave_present_ratio", 0.0) or 0.0
+    if p_ratio >= 0.5:
+        score += 0.35
+        reasons.append(f"P_waves({p_ratio:.0%})")
+
+    # Feature 3: Normal PR interval (80-220ms = sinus AV conduction)
+    pr = summary.get("pr_interval_ms")
+    if pr and 80 <= pr <= 220:
+        score += 0.25
+        reasons.append(f"PR={pr:.0f}ms")
+
+    return score, " + ".join(reasons) if reasons else "no sinus features"
+
+
+def _sinus_label_from_hr(hr: float | None) -> str:
+    if hr is not None and hr < 60:
+        return "Sinus Bradycardia"
+    if hr is not None and hr > 100:
+        return "Sinus Tachycardia"
+    return "Sinus Rhythm"
+
+
+def _sp_sinus_premodel(r_peaks: list, morph_data: dict) -> tuple[bool, str | None, float | None]:
+    """
+    Pre-model sinus gate (strict score >= 0.75).
+
+    Requires morphology to be extracted first (for P-wave + PR features).
+    If SP confirms sinus → skip rhythm model, set label from SP.
+
+    Returns (is_sinus, rhythm_label, hr_bpm).
+    """
+    score, reasons = _compute_sinus_score(r_peaks, morph_data)
+    if score >= _SINUS_SCORE_PREMODEL:
+        _, hr = _detect_sinus_cv(r_peaks, 0.10)
+        label = _sinus_label_from_hr(hr)
+        print(f"    [SINUS_GATE] pre-model: score={score:.2f} ({reasons}) -> {label} (rhythm model skipped)")
+        return True, label, hr
+    return False, None, None
+
+
+def _sp_sinus_postmodel(rhythm_label: str, r_peaks: list, morph_data: dict) -> str:
+    """
+    Post-model sinus gate (moderate score >= 0.60).
+
+    Only fires if rhythm model output is in _SINUS_CANDIDATES.
+    Overrides to sinus variant when SP detects sinus features.
+    """
+    if rhythm_label not in _SINUS_CANDIDATES:
+        return rhythm_label
+    score, reasons = _compute_sinus_score(r_peaks, morph_data)
+    if score >= _SINUS_SCORE_POSTMODEL:
+        _, hr = _detect_sinus_cv(r_peaks, 0.10)
+        new_label = _sinus_label_from_hr(hr)
+        print(f"    [SINUS_GATE] post-model: score={score:.2f} ({reasons}) -> '{rhythm_label}' overridden to '{new_label}'")
+        return new_label
+    return rhythm_label
+
+
+# ---------------------------------------------------------------------------
 # Rules engine wrapper
 # ---------------------------------------------------------------------------
 
@@ -183,6 +307,7 @@ def _run_rules_engine(
     ectopy_label: Optional[str],
     ectopy_conf: Optional[float],
     fs: int = 125,
+    morph_data: Optional[dict] = None,
 ) -> dict:
     """
     Run the full RhythmOrchestrator pipeline on a single window.
@@ -208,11 +333,22 @@ def _run_rules_engine(
             mean_rr = np.mean(rr_intervals_ms)
             mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 0.0
 
+        # Populate clinical features from morphology if available
+        morph_summary = (morph_data or {}).get("summary", {})
+        pr_val = morph_summary.get("pr_interval_ms", 0.0) or 0.0
+        qrs_list = [b.get("qrs_duration_ms") for b in (morph_data or {}).get("per_beat", [])
+                     if b.get("qrs_duration_ms") is not None]
+        per_beat_pr = [b.get("pr_interval_ms") for b in (morph_data or {}).get("per_beat", [])
+                       if b.get("pr_interval_ms") is not None]
+        p_wave_ratio = morph_summary.get("p_wave_present_ratio")
+
         clinical_features = {
             "mean_hr": mean_hr,
-            "pr_interval": 0.0,
+            "pr_interval": pr_val,
             "rr_intervals_ms": rr_intervals_ms,
-            "qrs_durations_ms": [],
+            "qrs_durations_ms": qrs_list,
+            "per_beat_pr_ms": per_beat_pr,
+            "p_wave_present_ratio": p_wave_ratio,
             "fs": fs,
         }
 
@@ -247,6 +383,20 @@ def _run_rules_engine(
                         "conf": conf,
                     })
 
+        # Full event detail with start/end times for PDF annotation
+        events_detail = [
+            {
+                "event_type": e.event_type,
+                "event_category": e.event_category.value,
+                "start_time": e.start_time,
+                "end_time": e.end_time,
+                "beat_indices": e.beat_indices,
+                "priority": e.priority,
+            }
+            for e in decision.final_display_events
+            if hasattr(e, "display_state") and e.display_state.value == "DISPLAYED"
+        ]
+
         return {
             "background_rhythm": decision.background_rhythm,
             "final_events": final_events,
@@ -255,6 +405,7 @@ def _run_rules_engine(
             "ml_prediction": ml_prediction,
             "rr_intervals_ms": rr_intervals_ms,
             "mean_hr": mean_hr,
+            "events_detail": events_detail,
         }
 
     except Exception as exc:
@@ -267,6 +418,7 @@ def _run_rules_engine(
             "ml_prediction": {},
             "rr_intervals_ms": [],
             "mean_hr": 0.0,
+            "events_detail": [],
         }
 
 
@@ -613,48 +765,115 @@ def _generate_pdf_report(
         diagnoses = ["No abnormal diagnosis reported"]
     _pdf_bullet_section(pdf, "Diagnoses", diagnoses)
 
-    # Per-segment results table
-    seg_rows = []
+    # Per-segment results table — two-row layout per segment
+    _pdf_section_header(pdf, "Segment Analysis")
+    usable = pdf.w - pdf.l_margin - pdf.r_margin
+    lh = 5.4
     for seg in all_segments:
+        if pdf.get_y() > 255:
+            pdf.add_page()
         idx = seg["seg_idx"]
         r_lbl = seg.get("rhythm_label") or "N/A"
         r_conf = seg.get("rhythm_conf")
         e_lbl = seg.get("ectopy_label") or "-"
         e_conf = seg.get("ectopy_conf")
-        primary = seg["rules_result"].get("primary_conclusion", "Unknown")
-        events = ", ".join(seg["rules_result"].get("final_events", [])) or "None"
+        rules = seg.get("rules_result", {})
+        primary = rules.get("primary_conclusion", "Unknown")
+        bg_rhythm = rules.get("background_rhythm", "")
 
         r_text = f"{r_lbl} ({r_conf:.0%})" if r_conf is not None else r_lbl
-        e_text = f"{e_lbl} ({e_conf:.0%})" if e_conf is not None and e_lbl != "None" else e_lbl
+        e_text = f"{e_lbl} ({e_conf:.0%})" if e_conf is not None and e_lbl not in (None, "None", "-") else (e_lbl if e_lbl not in (None, "-") else "None")
 
-        seg_rows.append((f"Seg {idx}", f"Rhythm: {r_text}  |  Ectopy: {e_text}  |  Rules: {primary}"))
-    _pdf_section_table(pdf, "Segment Analysis", seg_rows)
+        # Compute segment clock window
+        try:
+            seg_t = seg.get("t_start") or t_start_all
+            dt_s = datetime.fromisoformat(str(seg_t))
+            dt_e = dt_s + timedelta(seconds=10)
+            clock_range = f"{dt_s.strftime('%H:%M:%S')} - {dt_e.strftime('%H:%M:%S')}"
+        except Exception:
+            clock_range = f"Seg {idx}"
+
+        # Per-seg morphology
+        ms = seg.get("morph_data", {}).get("summary", {})
+        hr_v = ms.get("heart_rate_bpm", 0)
+        pr_v = ms.get("pr_interval_ms", 0)
+        qrs_v = ms.get("qrs_duration_ms", 0)
+        qtc_v = ms.get("qtc_bazett_ms", 0)
+        morph_str = ""
+        if ms and ms.get("num_beats", 0) > 0:
+            morph_str = f"  HR:{hr_v:.0f}bpm  PR:{pr_v:.0f}ms  QRS:{qrs_v:.0f}ms  QTc:{qtc_v:.0f}ms"
+
+        # Row A — bold, Primary Conclusion
+        row_a = f"Seg {idx}  [{clock_range}]   PRIMARY: {primary}"
+        if bg_rhythm:
+            row_a += f"   BG: {bg_rhythm}"
+
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(248, 250, 252)
+        pdf.multi_cell(usable, lh, row_a, border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+
+        # Row B — lighter, ML outputs + morphology
+        row_b = f"  ML Rhythm: {r_text}   |   ML Ectopy: {e_text}{morph_str}"
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(60, 70, 80)
+        pdf.multi_cell(usable, lh, row_b, border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(0.5)
+    pdf.ln(2)
 
     # HR Info
     hr_rows = [("Average Heart Rate", avg_hr), ("Min Heart Rate", min_hr), ("Max Heart Rate", max_hr)]
     _pdf_section_table(pdf, "HR Info", hr_rows)
 
-    # Morphology summary (from first segment with valid data)
-    morph_summary = {}
+    # Aggregate morphology summary — median across all valid segments
+    _agg: dict[str, list] = {
+        "heart_rate_bpm": [], "pr_interval_ms": [], "qrs_duration_ms": [],
+        "qtc_bazett_ms": [], "st_deviation_mv": [], "rr_interval_ms": [],
+        "sdnn_ms": [], "rmssd_ms": [], "p_wave_duration_ms": [],
+        "p_wave_present_ratio": [], "num_beats": [],
+    }
+    _agg_flags: dict[str, list] = {
+        "pr_interval_flag": [], "qrs_flag": [], "qtc_flag": [],
+        "st_flag": [], "rr_flag": [], "p_wave_flag": [],
+    }
     for seg in all_segments:
         ms = seg.get("morph_data", {}).get("summary", {})
-        if ms and ms.get("num_beats", 0) > 0:
-            morph_summary = ms
-            break
-    if morph_summary:
+        if not ms or ms.get("num_beats", 0) == 0:
+            continue
+        for k in _agg:
+            v = ms.get(k)
+            if v is not None and v > 0:
+                _agg[k].append(v)
+        for k in _agg_flags:
+            v = ms.get(k)
+            if v:
+                _agg_flags[k].append(v)
+
+    def _median(lst):
+        return statistics.median(lst) if lst else 0.0
+
+    def _majority_flag(lst):
+        if not lst:
+            return "N/A"
+        counts: dict[str, int] = {}
+        for f in lst:
+            counts[f] = counts.get(f, 0) + 1
+        return max(counts, key=lambda x: counts[x])
+
+    if any(_agg["heart_rate_bpm"]):
         morph_rows = [
-            ("P Wave Duration", f"{morph_summary.get('p_wave_duration_ms', 0):.1f} ms ({morph_summary.get('p_wave_flag', 'N/A')})"),
-            ("PR Interval", f"{morph_summary.get('pr_interval_ms', 0):.1f} ms ({morph_summary.get('pr_interval_flag', 'N/A')})"),
-            ("QRS Duration", f"{morph_summary.get('qrs_duration_ms', 0):.1f} ms ({morph_summary.get('qrs_flag', 'N/A')})"),
-            ("QTc (Bazett)", f"{morph_summary.get('qtc_bazett_ms', 0):.1f} ms ({morph_summary.get('qtc_flag', 'N/A')})"),
-            ("ST Deviation", f"{morph_summary.get('st_deviation_mv', 0):.3f} mV ({morph_summary.get('st_flag', 'N/A')})"),
-            ("RR Interval", f"{morph_summary.get('rr_interval_ms', 0):.1f} ms ({morph_summary.get('rr_flag', 'N/A')})"),
-            ("Heart Rate", f"{morph_summary.get('heart_rate_bpm', 0):.1f} bpm"),
-            ("SDNN", f"{morph_summary.get('sdnn_ms', 0):.1f} ms"),
-            ("RMSSD", f"{morph_summary.get('rmssd_ms', 0):.1f} ms"),
-            ("Beats Analyzed", str(morph_summary.get("num_beats", 0))),
+            ("Heart Rate (median)", f"{_median(_agg['heart_rate_bpm']):.1f} bpm"),
+            ("PR Interval (median)", f"{_median(_agg['pr_interval_ms']):.1f} ms  ({_majority_flag(_agg_flags['pr_interval_flag'])})"),
+            ("QRS Duration (median)", f"{_median(_agg['qrs_duration_ms']):.1f} ms  ({_majority_flag(_agg_flags['qrs_flag'])})"),
+            ("QTc Bazett (median)", f"{_median(_agg['qtc_bazett_ms']):.1f} ms  ({_majority_flag(_agg_flags['qtc_flag'])})"),
+            ("ST Deviation (median)", f"{_median(_agg['st_deviation_mv']):.3f} mV  ({_majority_flag(_agg_flags['st_flag'])})"),
+            ("RR Interval (median)", f"{_median(_agg['rr_interval_ms']):.1f} ms  ({_majority_flag(_agg_flags['rr_flag'])})"),
+            ("P Wave Duration (median)", f"{_median(_agg['p_wave_duration_ms']):.1f} ms  ({_majority_flag(_agg_flags['p_wave_flag'])})"),
+            ("SDNN (mean)", f"{_median(_agg['sdnn_ms']):.1f} ms"),
+            ("RMSSD (mean)", f"{_median(_agg['rmssd_ms']):.1f} ms"),
+            ("Segments with data", str(len(_agg["heart_rate_bpm"]))),
         ]
-        _pdf_section_table(pdf, "Morphology Summary", morph_rows)
+        _pdf_section_table(pdf, "Morphology Summary (Aggregate - All Segments)", morph_rows)
 
     # ── LANDSCAPE ECG STRIP PAGES ──
     _pdf_ecg_strips(pdf, all_samples, event_spans, beat_markers, diagnoses, t_start_all, all_segments)
@@ -723,10 +942,29 @@ def _pdf_bullet_section(pdf, title: str, items: list):
     pdf.ln(1)
 
 
+_SKIP_EVENT_LABELS = {
+    "Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia",
+    "Artifact", "Unknown", "None", "Normal", "Normal Sinus Rhythm",
+}
+
+
+def _compute_clock(seg_t_start: str, offset_s: float) -> str:
+    """Convert a segment start timestamp + offset seconds to HH:MM:SS string."""
+    try:
+        dt = datetime.fromisoformat(str(seg_t_start)) + timedelta(seconds=float(offset_s))
+        return dt.strftime("%H:%M:%S")
+    except Exception:
+        return f"{offset_s:.1f}s"
+
+
 def _build_event_spans(all_segments: list) -> list:
     """
     Build event spans from segment rules results for ECG strip overlay.
-    Each span: {start_idx, end_idx, label, color_idx}
+    Uses actual event start_time/end_time (from events_detail) so ectopy
+    clusters are highlighted only over their true beat range, not the full strip.
+    Normal sinus variants are skipped entirely — no highlight on clean strips.
+
+    Each span: {start_idx, end_idx, label, color_idx, clock_start, clock_end, category}
     """
     spans = []
     label_color = {}
@@ -734,28 +972,60 @@ def _build_event_spans(all_segments: list) -> list:
 
     for seg in all_segments:
         seg_idx = seg["seg_idx"]
-        start_sample = seg_idx * WINDOW_SAMPLES
-        end_sample = start_sample + WINDOW_SAMPLES - 1
+        seg_start_sample = seg_idx * WINDOW_SAMPLES
+        seg_t_start = seg.get("t_start", "")
 
-        events = seg["rules_result"].get("final_events", [])
-        primary = seg["rules_result"].get("primary_conclusion", "")
+        events_detail = seg["rules_result"].get("events_detail", [])
 
-        # Add primary conclusion as span if it's abnormal
-        all_events = list(events)
-        if primary and primary not in ("Normal Sinus Rhythm", "Sinus Rhythm", "Unknown", "None") and primary not in all_events:
-            all_events.insert(0, primary)
+        # Fall back to final_events strings if events_detail not populated
+        if not events_detail:
+            primary = seg["rules_result"].get("primary_conclusion", "")
+            fallback = list(seg["rules_result"].get("final_events", []))
+            if primary and primary not in fallback:
+                fallback.insert(0, primary)
+            for ev_label in fallback:
+                if not ev_label or ev_label in _SKIP_EVENT_LABELS:
+                    continue
+                if ev_label not in label_color:
+                    label_color[ev_label] = color_counter
+                    color_counter += 1
+                spans.append({
+                    "start_idx": seg_start_sample,
+                    "end_idx": seg_start_sample + WINDOW_SAMPLES - 1,
+                    "label": ev_label,
+                    "color_idx": label_color[ev_label],
+                    "clock_start": _compute_clock(seg_t_start, 0),
+                    "clock_end": _compute_clock(seg_t_start, 10),
+                    "category": "RHYTHM",
+                })
+            continue
 
-        for ev_label in all_events:
-            if not ev_label or ev_label in ("None", "Unknown"):
+        for ev in events_detail:
+            ev_label = ev.get("event_type", "")
+            if not ev_label or ev_label in _SKIP_EVENT_LABELS:
                 continue
+
+            start_s = float(ev.get("start_time", 0.0))
+            end_s = float(ev.get("end_time", 10.0))
+
+            # For rhythm events spanning the whole segment, use full strip width
+            # For ectopy patterns, use the actual cluster start/end
+            start_sample = seg_start_sample + int(start_s * TARGET_FS)
+            end_sample = seg_start_sample + int(end_s * TARGET_FS)
+            end_sample = min(end_sample, seg_start_sample + WINDOW_SAMPLES - 1)
+
             if ev_label not in label_color:
                 label_color[ev_label] = color_counter
                 color_counter += 1
+
             spans.append({
                 "start_idx": start_sample,
                 "end_idx": end_sample,
                 "label": ev_label,
                 "color_idx": label_color[ev_label],
+                "clock_start": _compute_clock(seg_t_start, start_s),
+                "clock_end": _compute_clock(seg_t_start, end_s),
+                "category": ev.get("event_category", "RHYTHM"),
             })
 
     return spans
@@ -850,7 +1120,6 @@ def _pdf_ecg_strips(
             seg_data = all_segments[row] if all_segments and row < len(all_segments) else None
             
             if seg_data and seg_data.get("t_start"):
-                from datetime import timedelta
                 try:
                     t_start_run = datetime.fromisoformat(str(seg_data["t_start"]))
                     offset_s = seg_data.get("seg_idx_in_run", 0) * 10
@@ -860,7 +1129,6 @@ def _pdf_ecg_strips(
                 except Exception:
                     line_label = f"Line {row + 1}  ({row * 10}s - {(row + 1) * 10}s)"
             elif t_start_dt:
-                from datetime import timedelta
                 ls = t_start_dt + timedelta(seconds=row * 10)
                 le = t_start_dt + timedelta(seconds=(row + 1) * 10)
                 line_label = f"Line {row + 1}  {ls.strftime('%H:%M:%S')} - {le.strftime('%H:%M:%S')}"
@@ -1006,7 +1274,7 @@ def _pdf_ecg_strips(
                     lbl_x = bx - tri_size * 0.8 - pdf.get_string_width(lbl)
                 pdf.text(lbl_x, lbl_y, lbl)
 
-            # LAYER 4: Annotation labels (topmost)
+            # LAYER 4: Annotation labels + event boundary lines
             seen_label = set()
             slot = 0
             for ev in event_spans:
@@ -1021,27 +1289,86 @@ def _pdf_ecg_strips(
                 if len(lbl) > 30:
                     lbl = lbl[:29] + "."
 
-                seg_start = max(ev["start_idx"], start_idx)
-                local_start = seg_start - start_idx
-                xs = strip_x + (local_start / (samples_per_row - 1)) * strip_w
+                # Compute exact x positions for event start/end within this strip
+                ev_local_start = max(ev["start_idx"], start_idx) - start_idx
+                ev_local_end = min(ev["end_idx"], end_idx - 1) - start_idx
+                xs = strip_x + (ev_local_start / (samples_per_row - 1)) * strip_w
+                xe = strip_x + (ev_local_end / (samples_per_row - 1)) * strip_w
 
+                # Dashed vertical lines at event boundaries
+                pdf.set_draw_color(*PDF_EVENT_PALETTE[ev["color_idx"] % len(PDF_EVENT_PALETTE)]["line"])
+                pdf.set_line_width(0.4)
+                dash_step = 1.2
+                yy = strip_y
+                while yy < strip_y + strip_h:
+                    pdf.line(xs, yy, xs, min(yy + 0.7, strip_y + strip_h))
+                    yy += dash_step
+                if xe > xs + 2:
+                    yy = strip_y
+                    while yy < strip_y + strip_h:
+                        pdf.line(xe, yy, xe, min(yy + 0.7, strip_y + strip_h))
+                        yy += dash_step
+
+                # Label box
                 pdf.set_font("Helvetica", "B", 5.5)
                 tw = pdf.get_string_width(lbl) + 2.4
                 lx = xs + 0.5
                 if lx + tw > strip_x + strip_w - 1:
                     lx = strip_x + strip_w - tw - 1
-                ly = strip_y + 1.0 + slot * 5.2
-                if ly + 4.0 > strip_y + strip_h - 0.5:
+
+                # Stack: name box (row A) + time range (row B)
+                box_h = 4.0
+                ly = strip_y + 1.0 + slot * 9.0
+                if ly + box_h + 4.5 > strip_y + strip_h - 0.5:
                     break
 
-                # White box with black border
+                # Row A — event name box
                 pdf.set_fill_color(255, 255, 255)
                 pdf.set_draw_color(0, 0, 0)
                 pdf.set_line_width(0.25)
-                pdf.rect(lx, ly, tw, 4.0, style="FD")
+                pdf.rect(lx, ly, tw, box_h, style="FD")
                 pdf.set_text_color(0, 0, 0)
                 pdf.text(lx + 1.2, ly + 3.1, lbl)
+
+                # Row B — clock time range in gray
+                clock_start = ev.get("clock_start", "")
+                clock_end = ev.get("clock_end", "")
+                if clock_start and clock_end:
+                    time_str = f"{clock_start} -> {clock_end}"
+                    pdf.set_font("Helvetica", "", 4.5)
+                    pdf.set_text_color(90, 90, 90)
+                    pdf.text(lx, ly + box_h + 3.2, time_str)
+
                 slot += 1
+
+            # LAYER 5: Per-strip morphology line (below strip border)
+            morph_line_y = strip_y + strip_h + 1.8
+            if seg_data and morph_line_y < strip_y + strip_h + row_gap - 0.5:
+                ms = seg_data.get("morph_data", {}).get("summary", {}) if seg_data else {}
+                if ms and ms.get("num_beats", 0) > 0:
+                    hr_v = ms.get("heart_rate_bpm")
+                    pr_v = ms.get("pr_interval_ms")
+                    qrs_v = ms.get("qrs_duration_ms")
+                    qtc_v = ms.get("qtc_bazett_ms")
+                    rr_v = ms.get("rr_interval_ms")
+
+                    pr_flag = ms.get("pr_interval_flag", "normal")
+                    qrs_flag = ms.get("qrs_flag", "normal")
+                    qtc_flag = ms.get("qtc_flag", "normal")
+
+                    parts = []
+                    if hr_v:  parts.append(f"HR:{hr_v:.0f}bpm")
+                    if pr_v:  parts.append(f"PR:{pr_v:.0f}ms{'*' if pr_flag != 'normal' else ''}")
+                    if qrs_v: parts.append(f"QRS:{qrs_v:.0f}ms{'*' if qrs_flag != 'normal' else ''}")
+                    if qtc_v: parts.append(f"QTc:{qtc_v:.0f}ms{'*' if qtc_flag != 'normal' else ''}")
+                    if rr_v:  parts.append(f"RR:{rr_v:.0f}ms")
+
+                    morph_text = "  |  ".join(parts)
+                    has_flag = any(f != "normal" for f in [pr_flag, qrs_flag, qtc_flag] if f)
+                    pdf.set_font("Helvetica", "", 5.0)
+                    pdf.set_text_color(180, 30, 30) if has_flag else pdf.set_text_color(70, 70, 70)
+                    pdf.text(strip_x + 1.0, morph_line_y, morph_text)
+                    pdf.set_text_color(0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,19 +1413,30 @@ def process_file(
             seg_name = f"{filename}{run_tag}"
             r_peaks = _detect_r_peaks(window)
 
-            # ML inference
-            rhythm_label, rhythm_conf, ectopy_label, ectopy_conf = _run_inference(window)
+            # Morphology FIRST — needed for multi-feature sinus gate (P-wave + PR)
+            morph_data = _extract_morphology(window, r_peaks)
 
-            # Rules engine
+            # SP sinus pre-model gate (score >= 0.75: RR regularity + P-waves + PR)
+            # If SP confirms sinus → skip rhythm model, run only ectopy model.
+            is_sinus_pre, sinus_label, _ = _sp_sinus_premodel(r_peaks, morph_data)
+            if is_sinus_pre:
+                rhythm_label = sinus_label
+                rhythm_conf = 1.0
+                _, _, ectopy_label, ectopy_conf = _run_inference(window)
+            else:
+                rhythm_label, rhythm_conf, ectopy_label, ectopy_conf = _run_inference(window)
+
+            # SP sinus post-model gate (score >= 0.60) — catches remaining mislabels
+            rhythm_label = _sp_sinus_postmodel(rhythm_label, r_peaks, morph_data)
+
+            # Rules engine (receives morph_data for P-wave ratio in AF detection)
             rules_result = _run_rules_engine(
                 window, r_peaks,
                 rhythm_label, rhythm_conf,
                 ectopy_label, ectopy_conf,
                 fs=TARGET_FS,
+                morph_data=morph_data,
             )
-
-            # Morphology
-            morph_data = _extract_morphology(window, r_peaks)
 
             # Determine primary conclusion for display
             primary = rules_result.get("primary_conclusion", rhythm_label or "Unknown")

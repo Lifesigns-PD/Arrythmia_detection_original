@@ -44,10 +44,22 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
 
     # ---------------------------------------------------------
     # 1. Atrial Fibrillation (Irregular + No P-wave)
+    #    Requires: enough beats for reliable CV (>5),
+    #              high RR variability (CV > 0.15),
+    #              AND absent P-waves (either PR < 10 OR p_wave_present_ratio < 0.3).
+    #    The P-wave ratio guard prevents false AF on sinus strips where
+    #    P-wave detection fails (returning PR=0) due to noise.
     # ---------------------------------------------------------
     is_af = False
-    if len(rr_arr) > 3:
-        p_waves_absent = (pr < 10)
+    p_wave_ratio = features.get("p_wave_present_ratio", None)
+    if len(rr_arr) > 5:
+        p_waves_absent_pr = (pr < 10)
+        p_waves_absent_ratio = (p_wave_ratio is not None and p_wave_ratio < 0.3)
+        # Both checks must agree, OR use ratio when available (more reliable)
+        if p_wave_ratio is not None:
+            p_waves_absent = p_waves_absent_ratio
+        else:
+            p_waves_absent = p_waves_absent_pr
         if cv > 0.15 and p_waves_absent:
             is_af = True
             events.append(Event(
@@ -55,7 +67,8 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
                 event_type="AF",
                 event_category=EventCategory.RHYTHM,
                 start_time=0.0, end_time=10.0,
-                rule_evidence={"rule": "AF_Strict", "cv": cv, "pr": pr},
+                rule_evidence={"rule": "AF_Strict", "cv": cv, "pr": pr,
+                               "p_wave_ratio": p_wave_ratio},
                 priority=90,
                 used_for_training=True
             ))
