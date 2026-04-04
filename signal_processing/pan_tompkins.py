@@ -246,8 +246,11 @@ def _adaptive_thresholding(integrated: np.ndarray,
                     is_qrs = False
                 elif time_since_last < int(0.36 * fs):
                     # Between 200-360 ms: possible T-wave check
-                    # If slope of current peak < half of previous QRS slope → T-wave
-                    if peak_val_i < 0.5 * integrated[qrs_peaks[-1]]:
+                    # MUCH stricter: if peak is within 150-360 ms of last QRS AND
+                    # current peak is > 30% of previous QRS → very likely a T-wave
+                    # Only accept if it's significantly larger than previous (rare arrhythmia)
+                    if peak_val_i > 0.30 * integrated[qrs_peaks[-1]]:
+                        # This is likely a tall T-wave or artifact, not a real QRS
                         is_qrs = False
                     else:
                         is_qrs = True
@@ -310,6 +313,22 @@ def _adaptive_thresholding(integrated: np.ndarray,
 
                 # Re-sort after insertion
                 qrs_peaks.sort()
+
+    # --- Final sanity check: reject peaks that break RR rhythm ---------------
+    # If any RR interval is <65% of median RR, it's likely a false positive
+    # (typically a T-wave detected as R-peak)
+    if len(qrs_peaks) >= 2:
+        rr_intervals = np.diff(qrs_peaks)
+        median_rr = np.median(rr_intervals)
+
+        # Keep only peaks that maintain proper RR timing
+        valid_qrs = [qrs_peaks[0]]
+        for i in range(1, len(qrs_peaks)):
+            rr = qrs_peaks[i] - valid_qrs[-1]
+            # Allow 65% of median (accounts for ectopy/PVCs) up to 150% (skipped beat)
+            if median_rr * 0.65 <= rr <= median_rr * 1.50:
+                valid_qrs.append(qrs_peaks[i])
+        qrs_peaks = valid_qrs
 
     return np.array(qrs_peaks, dtype=int)
 

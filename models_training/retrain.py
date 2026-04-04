@@ -47,6 +47,7 @@ from data_loader import (
     ECTOPY_CLASS_NAMES, get_ectopy_label_idx,
 )
 from models import CNNTransformerClassifier
+from signal_processing.cleaning import clean_signal
 
 # -----------------------------------------------------------------------------
 # Paths & DB
@@ -68,8 +69,9 @@ DB_PARAMS = {
 
 # How much extra weight cardiologist events get over trusted_source events.
 # If trusted_source has 6000 AFib events and cardiologist has 3,
-# these 3 corrections effectively compete as if there were 60 of them.
-CARDIOLOGIST_OVERSAMPLE = 20
+# these 3 corrections effectively compete as if there were 15 of them.
+# Reduced from 20x to 5x to avoid overfitting to small cardiologist corrections.
+CARDIOLOGIST_OVERSAMPLE = 5
 
 # -----------------------------------------------------------------------------
 # Logger
@@ -180,6 +182,9 @@ class ECGEventDataset(torch.utils.data.Dataset):
                 target_len = int(len(signal) * self.TARGET_FS / fs)
                 signal = sci_resample(signal, target_len).astype(np.float32)
                 fs = self.TARGET_FS
+
+            # Clean signal (baseline wander + powerline noise removal)
+            signal = clean_signal(signal, self.TARGET_FS).astype(np.float32)
 
             # Parse events
             try:
@@ -318,10 +323,34 @@ class ECGEventDataset(torch.utils.data.Dataset):
         return signal
 
     def _augment_signal(self, sig):
-        if not self.augment or np.random.rand() > 0.5:
+        if not self.augment:
             return sig
-        sig = sig * np.random.uniform(0.85, 1.15)
-        sig = sig + np.random.normal(0, 0.02 * max(np.std(sig), 1e-6), sig.shape)
+        sig = sig.copy()
+        n = len(sig)
+        t = np.arange(n, dtype=np.float32) / self.TARGET_FS
+        sig_std = max(float(np.std(sig)), 1e-6)
+
+        # Amplitude scaling (50%)
+        if np.random.rand() < 0.5:
+            sig = sig * np.random.uniform(0.85, 1.15)
+
+        # Gaussian noise (50%)
+        if np.random.rand() < 0.5:
+            sig = sig + np.random.normal(0, 0.02 * sig_std, sig.shape).astype(np.float32)
+
+        # Synthetic baseline wander (50%) — low-freq sinusoid simulating respiration/electrode drift
+        if np.random.rand() < 0.5:
+            freq = np.random.uniform(0.1, 0.5)
+            amp = np.random.uniform(0.05, 0.20) * sig_std
+            sig = sig + (amp * np.sin(2 * np.pi * freq * t + np.random.uniform(0, 2 * np.pi))).astype(np.float32)
+
+        # Synthetic powerline noise (30%) — 50/60 Hz interference
+        if np.random.rand() < 0.3:
+            freq = np.random.choice([50.0, 60.0])
+            if freq < 0.5 * self.TARGET_FS:  # below Nyquist
+                amp = np.random.uniform(0.01, 0.05) * sig_std
+                sig = sig + (amp * np.sin(2 * np.pi * freq * t + np.random.uniform(0, 2 * np.pi))).astype(np.float32)
+
         return sig.astype(np.float32)
 
     def __len__(self):
@@ -601,7 +630,7 @@ def run_initial(task, num_epochs, batch_size, lr):
     # Fresh model - no checkpoint for initial training
     model     = CNNTransformerClassifier(num_classes=num_classes).to(device)
     criterion = _build_criterion(train_labels, num_classes, device)
-    opt       = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    opt       = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=4)
 
     best_bal_acc = 0.0
@@ -701,7 +730,7 @@ def run_finetune(task, num_epochs, batch_size, lr):
 
     opt_p1 = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr * 2, weight_decay=1e-4,
+        lr=lr * 2, weight_decay=5e-4,
     )
     for ep in range(1, P1_EPOCHS + 1):
         tr = train_epoch(model, opt_p1, criterion, train_ldr, device)
@@ -733,7 +762,7 @@ def run_finetune(task, num_epochs, batch_size, lr):
         p.requires_grad = True
     print(f"   Trainable: {total_params:,} / {total_params:,} params")
 
-    opt_p2    = torch.optim.AdamW(model.parameters(), lr=lr * 0.1, weight_decay=1e-4)
+    opt_p2    = torch.optim.AdamW(model.parameters(), lr=lr * 0.1, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_p2, T_max=max(1, P2_EPOCHS))
 
     for ep in range(1, P2_EPOCHS + 1):

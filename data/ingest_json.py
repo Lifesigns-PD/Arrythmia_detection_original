@@ -38,6 +38,7 @@ import matplotlib.patches as mpatches
 import numpy as np
 import psycopg2
 from scipy.signal import resample_poly, find_peaks
+from signal_processing.cleaning import clean_signal
 
 # ---------------------------------------------------------------------------
 # Project root on sys.path so we can import internal modules
@@ -112,16 +113,41 @@ def _segment(signal: np.ndarray) -> list[np.ndarray]:
 
 
 def _detect_r_peaks(window: np.ndarray) -> list[int]:
-    """Detect R-peak indices within a single window using scipy find_peaks."""
+    """Detect R-peak indices within a single window using scipy find_peaks.
+
+    Improved: Uses adaptive thresholding + RR regularity check to avoid T-wave misdetection.
+    """
     try:
-        # Minimum distance between peaks: ~40 bpm → 125*60/40 = 187 samples
-        height_threshold = np.percentile(window, 75)
-        peaks, _ = find_peaks(
+        # Much stricter height threshold: only accept peaks above 85th percentile
+        # This avoids mistaking tall T-waves for R-peaks
+        height_threshold = np.percentile(window, 85)
+
+        # Tighter distance constraint: 0.35s (minimum for physiological HR ~170 bpm)
+        min_distance = int(TARGET_FS * 0.35)  # 43 samples at 125 Hz
+
+        peaks, properties = find_peaks(
             window,
-            distance=int(TARGET_FS * 0.4),   # min 0.4 s between peaks (150 bpm max)
+            distance=min_distance,
             height=height_threshold,
+            prominence=np.percentile(window, 60),  # Peaks must have distinct shoulders
         )
-        return peaks.tolist()
+        peaks = peaks.tolist()
+
+        if len(peaks) < 2:
+            return peaks  # Not enough to validate
+
+        # RR sanity check: reject outliers that suggest T-wave detection
+        rr_intervals = np.diff(peaks)
+        median_rr = np.median(rr_intervals)
+
+        # If any RR is <65% of median, it's likely a false positive (T-wave)
+        valid_peaks = [peaks[0]]
+        for i in range(1, len(peaks)):
+            rr = peaks[i] - valid_peaks[-1]
+            if rr >= median_rr * 0.65:
+                valid_peaks.append(peaks[i])
+
+        return valid_peaks
     except Exception:
         return []
 
@@ -335,6 +361,7 @@ def ingest(json_path: Path, output_dir: Path) -> None:
 
     inserted = 0
     for idx, window in enumerate(windows):
+        window = np.ascontiguousarray(clean_signal(window, TARGET_FS), dtype=np.float32)
         r_peaks = _detect_r_peaks(window)
         features = {"r_peaks": r_peaks}
 

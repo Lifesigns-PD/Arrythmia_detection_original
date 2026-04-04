@@ -44,6 +44,7 @@ from data.ingest_json import (
     TARGET_FS,
     WINDOW_SAMPLES,
 )
+from signal_processing.cleaning import clean_signal
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1411,6 +1412,7 @@ def process_file(
 
         for idx, window in enumerate(windows):
             seg_name = f"{filename}{run_tag}"
+            window = np.ascontiguousarray(clean_signal(window, TARGET_FS), dtype=np.float32)
             r_peaks = _detect_r_peaks(window)
 
             # Morphology FIRST — needed for multi-feature sinus gate (P-wave + PR)
