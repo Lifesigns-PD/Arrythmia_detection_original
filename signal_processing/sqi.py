@@ -5,10 +5,10 @@ from scipy.signal import welch
 
 def calculate_sqi_score(signal: np.ndarray, fs: int) -> float:
     """
-    Calculate a quantitative Signal Quality Index (SQI) from 0.0 to 100.0.
+    Calculate a quantitative Signal Quality Index (SQI) from 0.0 to 1.0.
     Based on:
-      1. R-peak Consistency (RR interval variance) - implicitly handled by robust detectors usually, 
-         but here we check basic signal stats. 
+      1. R-peak Consistency (RR interval variance) - implicitly handled by robust detectors usually,
+         but here we check basic signal stats.
       2. SNR (Signal-to-Noise Ratio) estimate
       3. Baseline Stability (Zero-crossing rate approx)
       4. Physiologic range checks (Skewness/Kurtosis)
@@ -83,4 +83,4 @@ def calculate_sqi_score(signal: np.ndarray, fs: int) -> float:
     # 4. Final Score
     # ----------------------------------------
     final_score = max(0.0, score - deductions)
-    return float(final_score)
+    return float(final_score / 100.0)

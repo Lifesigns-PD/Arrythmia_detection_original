@@ -1,6 +1,6 @@
 import numpy as np
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from decision_engine.models import Event, EventCategory, DisplayState
 
 # =============================================================================
@@ -10,170 +10,32 @@ from decision_engine.models import Event, EventCategory, DisplayState
 def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
     """
     Analyzes clinical features to detect arrhythmias strictly via rules.
-    Returns a list of 'Rule-Derived Events' (AF, SVT, VT, AV Blocks, Pauses).
-    Sinus rhythms are handled as background only and NEVER produce events.
+    Only fires for Pause — all other arrhythmias (AF, BBB, AV Blocks) are
+    predicted directly by the ML rhythm model and no longer duplicated here.
+    Pattern arrhythmias (SVT/VT/NSVT/Bigeminy) are handled in apply_ectopy_patterns().
     """
     events = []
-    
-    # Extract features safely
-    hr_val = features.get("mean_hr")
-    hr = float(hr_val) if hr_val is not None else 0.0
-    
-    pr_val = features.get("pr_interval")
-    pr = float(pr_val) if pr_val is not None else 0.0
-    
+
     rr_intervals = features.get("rr_intervals_ms", [])
     rr_arr = np.array([])
     if isinstance(rr_intervals, list) and len(rr_intervals) > 2:
         rr_arr = np.array([x for x in rr_intervals if x is not None and isinstance(x, (int, float))])
-        
-    qrs_mean = 0.0
-    try:
-        raw_qrs = features.get("qrs_durations_ms")
-        if isinstance(raw_qrs, list):
-            q_list = [x for x in raw_qrs if isinstance(x, (int, float))]
-            if q_list: 
-                qrs_mean = float(sum(q_list) / len(q_list))
-    except: pass
-    
-    cv = 0.0
-    if len(rr_arr) > 3:
-        rr_std = np.std(rr_arr)
-        rr_mean = np.mean(rr_arr)
-        cv = rr_std / rr_mean if rr_mean > 0 else 0
 
     # ---------------------------------------------------------
-    # 1. Atrial Fibrillation (Irregular + No P-wave)
-    #    Requires: enough beats for reliable CV (>5),
-    #              high RR variability (CV > 0.15),
-    #              AND absent P-waves (either PR < 10 OR p_wave_present_ratio < 0.3).
-    #    The P-wave ratio guard prevents false AF on sinus strips where
-    #    P-wave detection fails (returning PR=0) due to noise.
-    # ---------------------------------------------------------
-    is_af = False
-    p_wave_ratio = features.get("p_wave_present_ratio", None)
-    if len(rr_arr) > 5:
-        p_waves_absent_pr = (pr < 10)
-        p_waves_absent_ratio = (p_wave_ratio is not None and p_wave_ratio < 0.3)
-        # Both checks must agree, OR use ratio when available (more reliable)
-        if p_wave_ratio is not None:
-            p_waves_absent = p_waves_absent_ratio
-        else:
-            p_waves_absent = p_waves_absent_pr
-        if cv > 0.15 and p_waves_absent:
-            is_af = True
-            events.append(Event(
-                event_id=str(uuid.uuid4()),
-                event_type="AF",
-                event_category=EventCategory.RHYTHM,
-                start_time=0.0, end_time=10.0,
-                rule_evidence={"rule": "AF_Strict", "cv": cv, "pr": pr,
-                               "p_wave_ratio": p_wave_ratio},
-                priority=90,
-                used_for_training=True
-            ))
-
-    # ---------------------------------------------------------
-    # 2. SVT / VT — REMOVED from rules. Now purely derived from
-    #    consecutive PAC/PVC beat counts in apply_ectopy_patterns().
+    # AF, BBB, and AV Block rules have been REMOVED.
+    # These arrhythmias are predicted directly by the ML rhythm model
+    # (classes trained in CNNTransformerClassifier). Duplicating them here
+    # caused false positives from noisy clinical measurements (PR=0 from
+    # missed P-waves, QRS width from NeuroKit delineation error, etc.)
+    # and created contradictions when the rule fired but the model did not.
+    #
+    # What remains: only Pause (model never predicts this) and the
+    # pattern arrhythmias in apply_ectopy_patterns() (SVT/VT/NSVT/
+    # Bigeminy/Trigeminy — the model also never predicts these directly).
     # ---------------------------------------------------------
 
-    # Per-beat PR intervals (needed for 2nd/3rd degree block detection)
-    per_beat_pr = []
-    raw_pbpr = features.get("per_beat_pr_ms", [])
-    if isinstance(raw_pbpr, list):
-        per_beat_pr = [x for x in raw_pbpr if isinstance(x, (int, float)) and x > 0]
-
     # ---------------------------------------------------------
-    # 3a. Bundle Branch Block (QRS > 120 ms)
-    # ---------------------------------------------------------
-    if qrs_mean > 120 and not is_af:
-        events.append(Event(
-            event_id=str(uuid.uuid4()),
-            event_type="Bundle Branch Block",
-            event_category=EventCategory.RHYTHM,
-            start_time=0.0, end_time=10.0,
-            rule_evidence={"rule": "BBB_WideQRS", "qrs_mean_ms": round(qrs_mean, 1)},
-            priority=70,
-            used_for_training=False
-        ))
-
-    # ---------------------------------------------------------
-    # 3b. AV Blocks (1st, 2nd Type 1/2, 3rd)
-    # Only fire when not AF (AF has no organised P-waves → PR is meaningless)
-    # ---------------------------------------------------------
-    block_fired = False  # track highest-grade block to avoid dual firing
-
-    # 3rd Degree (Complete AV Block) — most specific, check first
-    # Criteria: very slow escape HR, P-waves present, PR intervals highly variable (AV dissociation)
-    if (not is_af and hr > 0 and hr < 50 and pr > 0
-            and len(per_beat_pr) >= 3
-            and float(np.std(per_beat_pr)) > 40):
-        events.append(Event(
-            event_id=str(uuid.uuid4()),
-            event_type="3rd Degree AV Block",
-            event_category=EventCategory.RHYTHM,
-            start_time=0.0, end_time=10.0,
-            rule_evidence={"rule": "3rdDegBlock_AVDissociation",
-                           "hr": round(hr, 1), "pr_std": round(float(np.std(per_beat_pr)), 1)},
-            priority=80,
-            used_for_training=False
-        ))
-        block_fired = True
-
-    # 2nd Degree Type 2 (Mobitz II) — fixed PR + sudden dropped beat
-    # Criteria: PR intervals constant (CV < 10%), RR gap ≥ 1.7× median (dropped beat without warning)
-    if (not is_af and not block_fired and len(per_beat_pr) >= 2 and len(rr_arr) >= 3):
-        pr_mean = float(np.mean(per_beat_pr))
-        pr_cv = float(np.std(per_beat_pr)) / pr_mean if pr_mean > 0 else 1.0
-        median_rr = float(np.median(rr_arr))
-        if pr_cv < 0.10 and float(np.max(rr_arr)) > 1.7 * median_rr:
-            events.append(Event(
-                event_id=str(uuid.uuid4()),
-                event_type="2nd Degree AV Block Type 2",
-                event_category=EventCategory.RHYTHM,
-                start_time=0.0, end_time=10.0,
-                rule_evidence={"rule": "2ndDegBlock_MobitzII",
-                               "pr_cv": round(pr_cv, 3), "max_rr_ms": round(float(np.max(rr_arr)), 1)},
-                priority=70,
-                used_for_training=False
-            ))
-            block_fired = True
-
-    # 2nd Degree Type 1 (Wenckebach) — progressive PR lengthening + dropped beat
-    # Criteria: majority of consecutive PR diffs > +10 ms AND one RR gap > 1.5× median
-    if (not is_af and not block_fired and len(per_beat_pr) >= 3 and len(rr_arr) >= 3):
-        pr_diffs = np.diff(per_beat_pr)
-        increasing = int(np.sum(pr_diffs > 10)) >= len(pr_diffs) // 2
-        median_rr = float(np.median(rr_arr))
-        if increasing and float(np.max(rr_arr)) > 1.5 * median_rr:
-            events.append(Event(
-                event_id=str(uuid.uuid4()),
-                event_type="2nd Degree AV Block Type 1",
-                event_category=EventCategory.RHYTHM,
-                start_time=0.0, end_time=10.0,
-                rule_evidence={"rule": "2ndDegBlock_Wenckebach",
-                               "pr_increasing_beats": int(np.sum(pr_diffs > 10)),
-                               "max_rr_ms": round(float(np.max(rr_arr)), 1)},
-                priority=65,
-                used_for_training=False
-            ))
-            block_fired = True
-
-    # 1st Degree AV Block — only if no higher-grade block already fired
-    if not is_af and not block_fired and pr > 200:
-        events.append(Event(
-            event_id=str(uuid.uuid4()),
-            event_type="1st Degree AV Block",
-            event_category=EventCategory.RHYTHM,
-            start_time=0.0, end_time=10.0,
-            rule_evidence={"rule": "1stDegBlock", "pr": pr},
-            priority=50,
-            used_for_training=False
-        ))
-
-    # ---------------------------------------------------------
-    # 5. Pause
+    # Pause
     # ---------------------------------------------------------
     if any(rr > 2000 for rr in rr_arr):
         events.append(Event(
@@ -294,8 +156,8 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
 
             # ── PVC consecutive count rules ──
             elif is_consecutive and target_type == "PVC":
-                if count >= 11:
-                    # VT: 11+ consecutive PVCs
+                if count >= 11 and rate >= 100:
+                    # VT: 11+ consecutive PVCs at rate >= 100 bpm
                     new_event = Event(
                         event_id=str(uuid.uuid4()),
                         event_type="VT",
@@ -309,8 +171,8 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                     )
                     events.append(new_event)
                     for e in cluster: e.pattern_label = "Run"
-                elif count >= 4:
-                    # NSVT: 4-10 consecutive PVCs
+                elif count >= 4 and rate >= 100:
+                    # NSVT: 4-10 consecutive PVCs at rate >= 100 bpm
                     new_event = Event(
                         event_id=str(uuid.uuid4()),
                         event_type="NSVT",
@@ -324,7 +186,7 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                     )
                     events.append(new_event)
                     for e in cluster: e.pattern_label = "Run"
-                elif count == 3:
+                elif count >= 3:
                     # Ventricular Run: exactly 3 consecutive PVCs
                     new_event = Event(
                         event_id=str(uuid.uuid4()),
@@ -357,8 +219,8 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
 
             # ── PAC consecutive count rules ──
             elif is_consecutive and target_type == "PAC":
-                if count >= 11:
-                    # SVT: 11+ consecutive PACs
+                if count >= 11 and rate >= 100:
+                    # SVT: 11+ consecutive PACs at rate >= 100 bpm
                     new_event = Event(
                         event_id=str(uuid.uuid4()),
                         event_type="SVT",
@@ -372,8 +234,8 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                     )
                     events.append(new_event)
                     for e in cluster: e.pattern_label = "Run"
-                elif count >= 6:
-                    # PSVT: 6-10 consecutive PACs
+                elif count >= 6 and rate >= 100:
+                    # PSVT: 6-10 consecutive PACs at rate >= 100 bpm
                     new_event = Event(
                         event_id=str(uuid.uuid4()),
                         event_type="PSVT",
@@ -425,15 +287,6 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
 # =============================================================================
 
 def apply_display_rules(background_rhythm: str, events: List[Event]) -> List[Event]:
-    # # DEBUG MODE: Show all AI events for transition.
-    # # We temporarily disable the veto logic so the user can audit model performance.
-    # has_manual_sinus = any(
-    #     e.event_type == "Sinus Rhythm" and getattr(e, "annotation_source", "") == "cardiologist"
-    #     for e in events
-    # )
-
-    has_manual_sinus = False # FORCE DISABLE VETO
-    
     # Pass 1: Global Hierarchy & Veto
     has_af = any(e.event_type in ["AF", "Atrial Fibrillation", "Atrial Flutter"] for e in events)
     has_svt = any(e.event_type in ["SVT", "PSVT", "Atrial Run"] for e in events)
@@ -442,19 +295,6 @@ def apply_display_rules(background_rhythm: str, events: List[Event]) -> List[Eve
     for event in events:
         should_display = True
         suppression_reason = None
-        
-        # AI Visibility: Never hide AI events during this validation phase
-        is_ai_event = getattr(event, "annotation_source", "ai") != "cardiologist"
-        
-        if is_ai_event:
-            should_display = True # Force display for AI auditing
-            event.display_state = DisplayState.DISPLAYED
-            continue
-
-        # 2. APPLY VETO (Disabled)
-        # if has_manual_sinus and is_ai_event and event.event_category == EventCategory.RHYTHM:
-        #      should_display = False
-        #      suppression_reason = "Cardiologist Veto (Sinus)"
 
         # Rule A: Life-Threatening
         if event.priority >= 95:

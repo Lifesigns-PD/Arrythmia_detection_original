@@ -674,6 +674,8 @@
             <div style="border-top: 1px solid #444; margin: 5px 0;"></div>
             <div id="ctx-clear" class="ctx-item" style="color: #ff4444; display: none;" onclick="clearAnnotation()">❌
                 Clear Annotation</div>
+            <div id="ctx-remove-beat" class="ctx-item" style="color: #ff8844; display: none;" onclick="removebeat()">🗑️
+                Remove Beat</div>
             <div style="border-top: 1px solid #444; margin: 5px 0;"></div>
 
             <div class="ctx-item" style="color: #aaa;"
@@ -792,14 +794,12 @@
                 const xaiEl = document.getElementById("xaiText");
                 if (xaiEl) xaiEl.innerText = "Analyzing...";
 
-                // Update Header Verified Icon
+                // Update Header Verified Icon — driven by is_corrected from the API,
+                // not the sidebar badge (which is a Jinja2 snapshot from page load).
                 const headerIcon = document.getElementById("header-verified-icon");
                 if (headerIcon) {
-                    // Check if segment is in sidebar and has status 'confirmed'
-                    const sidebarRow = document.getElementById(`row-${id}`);
-                    const successBadge = sidebarRow ? sidebarRow.querySelector('.badge-success') : null;
-                    const isVerified = successBadge ? successBadge.style.display !== 'none' : false;
-                    headerIcon.style.display = isVerified ? 'inline' : 'none';
+                    headerIcon.style.display = data.is_corrected ? 'inline' : 'none';
+                    headerIcon.title = data.is_corrected ? "Verified by Cardiologist" : "";
                 }
 
                 // Populate currentDecision from backend response
@@ -1327,8 +1327,9 @@
                     document.getElementById('ctx-add-beat').style.display = 'none';
                     document.getElementById('ctx-sep-top').style.display = 'none';
 
-                    // Show/Hide Clear Option
+                    // Show/Hide Clear and Remove Beat options
                     document.getElementById('ctx-clear').style.display = rightClickedEventId ? 'block' : 'none';
+                    document.getElementById('ctx-remove-beat').style.display = 'block';
                 } else {
                     // No near peak - Allow "Add Beat"
                     rightClickedBeatIdx = -1;
@@ -1336,6 +1337,7 @@
                     document.getElementById('ctx-add-beat').style.display = 'block';
                     document.getElementById('ctx-sep-top').style.display = 'block';
                     document.getElementById('ctx-clear').style.display = 'none';
+                    document.getElementById('ctx-remove-beat').style.display = 'none';
                 }
             });
 
@@ -1411,13 +1413,28 @@
                 wasDragging = true; // prevent click handler from selecting a beat
                 const ev = editingEvents[draggingHandle.eventIdx];
                 draggingHandle = null;
-                await fetch(`/api/event/${currentSegment}/${ev.event_id}`, {
-                    method: "PATCH",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({start_time: ev.start_time, end_time: ev.end_time})
-                });
                 editingEvents = null;
-                await loadSegment(currentSegment);
+
+                if (ev.event_id && ev.event_id.startsWith("local_")) {
+                    // Local (unsaved) event — just update in-memory state and redraw,
+                    // do NOT reload from backend (would wipe all local_ events)
+                    if (currentDecision && currentDecision.final_display_events) {
+                        const idx = currentDecision.final_display_events.findIndex(e2 => e2.event_id === ev.event_id);
+                        if (idx !== -1) {
+                            currentDecision.final_display_events[idx].start_time = ev.start_time;
+                            currentDecision.final_display_events[idx].end_time = ev.end_time;
+                        }
+                    }
+                    redraw();
+                } else {
+                    // Saved event — persist to backend, then reload to stay in sync
+                    await fetch(`/api/event/${currentSegment}/${ev.event_id}`, {
+                        method: "PATCH",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({start_time: ev.start_time, end_time: ev.end_time})
+                    });
+                    await loadSegment(currentSegment);
+                }
             });
             // ---- END SPAN DRAG HANDLERS ----
 
@@ -1431,12 +1448,15 @@
                     // Find sequential beat index from rPeaks array
                     const seqIdx = rPeaks.indexOf(idx);
                     const beatIndices = seqIdx !== -1 ? [seqIdx] : [];
+                    // Pause: start at the beat before the gap, extend 2.5s forward
+                    // All others: ±0.3s window around the beat
+                    const isPause = label === "Pause";
                     const newEvent = {
                         event_id: "local_" + Math.random().toString(36).substr(2, 9),
                         event_type: label,
                         event_category: (label.toUpperCase().includes("PVC") || label.toUpperCase().includes("PAC")) ? "ECTOPY" : "RHYTHM",
-                        start_time: Math.max(0, timeSec - 0.3),
-                        end_time: timeSec + 0.3,
+                        start_time: isPause ? timeSec : Math.max(0, timeSec - 0.3),
+                        end_time:   isPause ? Math.min(10.0, timeSec + 2.5) : timeSec + 0.3,
                         beat_indices: beatIndices,
                         annotation_source: source
                     };
@@ -1586,32 +1606,16 @@
                 checkAutomationGuard();
             }
 
-            // NEW: AUTOMATION BIAS UI GUARD
-            // Prevents clicking "Verify" if there are any pending ML-only suggestions
+            // Verify is always available.
+            // AI output is informational — cardiologist agrees (just verify) or
+            // overrides (change dropdown label, then verify). No gatekeeping.
             function checkAutomationGuard() {
                 const verifyBtn = document.getElementById("verify-btn");
                 const acceptAiBtn = document.getElementById("accept-ai-btn");
-
-                if (!currentDecision || !currentDecision.final_display_events) {
-                    verifyBtn.disabled = false;
-                    verifyBtn.style.opacity = "1";
-                    acceptAiBtn.style.display = "none";
-                    return;
-                }
-
-                const hasMLEvents = currentDecision.final_display_events.some(e => e.annotation_source === "ml");
-
-                if (hasMLEvents) {
-                    verifyBtn.disabled = true;
-                    verifyBtn.style.opacity = "0.3";
-                    verifyBtn.innerText = "VERIFY LOCKED";
-                    acceptAiBtn.style.display = "block";
-                } else {
-                    verifyBtn.disabled = false;
-                    verifyBtn.style.opacity = "1";
-                    verifyBtn.innerText = "✅ VERIFY SEGMENT";
-                    acceptAiBtn.style.display = "none";
-                }
+                verifyBtn.disabled = false;
+                verifyBtn.style.opacity = "1";
+                verifyBtn.innerText = "✅ VERIFY SEGMENT";
+                acceptAiBtn.style.display = "none";
             }
 
             // Convert ML labels to human upon exact UI click
@@ -1668,6 +1672,28 @@
                 redraw();
             }
 
+            async function removebeat() {
+                if (rightClickedBeatIdx === -1) return;
+                const peakToRemove = rightClickedBeatIdx;
+
+                // Remove from local array
+                rPeaks = rPeaks.filter(p => p !== peakToRemove);
+                // Also deselect if selected
+                selectedBeats = selectedBeats.filter(p => p !== peakToRemove);
+                updateSelectionCount();
+
+                // Persist to backend
+                await fetch("/api/update_rpeaks", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ segment_id: currentSegment, r_peaks: rPeaks })
+                });
+
+                document.getElementById('beat-context-menu').style.display = 'none';
+                rightClickedBeatIdx = -1;
+                redraw();
+            }
+
             async function clearAnnotation() {
                 if (!rightClickedEventId) return;
 
@@ -1693,6 +1719,8 @@
             // Batch Apply Logic
             // Labels that only make sense on a specific beat — require beat selection
             const BEAT_LEVEL_LABELS = new Set(["PVC", "PAC", "Artifact", "Sinus Rhythm"]);
+            // Labels that require right-clicking on a specific ECG location
+            const LOCATION_REQUIRED_LABELS = new Set(["Pause"]);
 
             document.getElementById("apply-batch-btn").onclick = function () {
                 const label = document.getElementById('diagnosis-select').value;
@@ -1706,6 +1734,11 @@
                     // Beat-level labels (PVC, PAC, etc.) still require a beat to be meaningful.
                     if (BEAT_LEVEL_LABELS.has(label)) {
                         alert("Please left-click individual beats first for single-beat labels (PVC, PAC, etc.).\nFor pattern labels like Bigeminy or AF, you can apply without selecting beats.");
+                        return;
+                    }
+                    // Pause requires right-clicking at the exact location on the ECG trace
+                    if (LOCATION_REQUIRED_LABELS.has(label)) {
+                        alert("To mark a Pause:\n1. Right-click directly on the beat that comes just BEFORE the long gap\n2. Select 'Pause' from the context menu\n\nThis marks the start of the pause and auto-extends 2.5 seconds forward.");
                         return;
                     }
                     // Segment-level: one event spanning the full 10s
@@ -1773,7 +1806,7 @@
             async function verifySegment() {
                 const label = document.getElementById('diagnosis-select').value;
                 const verifyBtn = document.getElementById("verify-btn");
-                if (verifyBtn.disabled) return; // Hard fail if locked
+                // Verify is always allowed — no lock.
 
                 // ONLY Save events that are marked cardiologist! ML events are wiped if not accepted.
                 const eventsToSave = currentDecision && currentDecision.final_display_events ?

@@ -66,7 +66,7 @@ def _lowpass_40hz(signal: np.ndarray, fs: int) -> np.ndarray:
 
 def _flag(value: float, key: str) -> str:
     """Return 'normal', 'low', 'high', or 'unavailable'."""
-    if value == 0.0:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
         return "unavailable"
     lo, hi = NORMAL_RANGES.get(key, (None, None))
     if lo is None:
@@ -185,6 +185,62 @@ def _extract_single_beat(
     t_peak   = _get_wave_idx(waves, "ECG_T_Peaks", beat_idx)
     t_offset = _get_wave_idx(waves, "ECG_T_Offsets", beat_idx)
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # HEURISTIC FALLBACK: When NeuroKit2 DWT fails (returns None)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # Fallback for R-onset/R-offset (QRS boundaries): tight window ±40ms around R-peak
+    if r_onset is None or r_offset is None:
+        half_qrs_window = int(0.040 * fs)  # ±40ms window
+        r_onset_fallback = max(0, r_sample - half_qrs_window)
+        r_offset_fallback = min(len(raw) - 1, r_sample + half_qrs_window)
+
+        # QRS within normal range [40, 200ms]?
+        qrs_ms_test = (r_offset_fallback - r_onset_fallback) * 1000.0 / fs
+        if 40 <= qrs_ms_test <= 200:
+            if r_onset is None:
+                r_onset = r_onset_fallback
+            if r_offset is None:
+                r_offset = r_offset_fallback
+
+    # Fallback for P-onset: search in window [R-250ms, R-60ms] for local max
+    if p_onset is None and r_onset is not None:
+        search_lo_sample = max(0, r_onset - int(0.250 * fs))
+        search_hi_sample = max(0, r_onset - int(0.060 * fs))
+        if search_hi_sample > search_lo_sample:
+            # Find peak in P-wave expected region
+            window_data = smooth[search_lo_sample:search_hi_sample]
+            local_max_idx = int(np.argmax(window_data)) + search_lo_sample
+            # P-onset is roughly 20ms before the peak
+            p_onset_fallback = max(0, local_max_idx - int(0.020 * fs))
+            # Validate P-onset is before R-onset
+            if p_onset_fallback < r_onset:
+                p_onset = p_onset_fallback
+
+    # Fallback for P-offset: estimate as 60ms after P-onset
+    if p_offset is None and p_onset is not None:
+        p_offset_fallback = min(len(raw) - 1, p_onset + int(0.060 * fs))
+        if p_offset_fallback < r_onset:
+            p_offset = p_offset_fallback
+
+    # Fallback for T-onset: search in window [R+100ms, R+400ms] for local max
+    if t_onset is None and r_offset is not None:
+        search_lo_sample = max(0, r_offset + int(0.100 * fs))
+        search_hi_sample = min(len(raw), r_offset + int(0.400 * fs))
+        if search_hi_sample > search_lo_sample:
+            window_data = smooth[search_lo_sample:search_hi_sample]
+            local_max_idx = int(np.argmax(window_data)) + search_lo_sample
+            # T-onset is roughly 30ms before the peak
+            t_onset_fallback = max(0, local_max_idx - int(0.030 * fs))
+            if t_onset_fallback > r_offset:
+                t_onset = t_onset_fallback
+
+    # Fallback for T-offset: estimate as 120ms after T-onset
+    if t_offset is None and t_onset is not None:
+        t_offset_fallback = min(len(raw) - 1, t_onset + int(0.120 * fs))
+        if t_offset_fallback > t_onset:
+            t_offset = t_offset_fallback
+
     beat = {"beat_index": beat_idx, "r_peak_sample": r_sample}
 
     # --- P wave ---
@@ -203,6 +259,9 @@ def _extract_single_beat(
     # --- PR interval (P-onset to R-onset) ---
     if p_onset is not None and r_onset is not None and r_onset > p_onset:
         beat["pr_interval_ms"] = (r_onset - p_onset) * 1000.0 / fs
+        # Validate: PR interval physiologically impossible?
+        if beat["pr_interval_ms"] < 60 or beat["pr_interval_ms"] > 400:
+            beat["pr_interval_ms"] = None
     else:
         beat["pr_interval_ms"] = None
 
@@ -215,6 +274,9 @@ def _extract_single_beat(
     # --- QRS complex ---
     if r_onset is not None and r_offset is not None and r_offset > r_onset:
         beat["qrs_duration_ms"] = (r_offset - r_onset) * 1000.0 / fs
+        # Validate: QRS duration physiologically impossible?
+        if beat["qrs_duration_ms"] < 40 or beat["qrs_duration_ms"] > 200:
+            beat["qrs_duration_ms"] = None
     else:
         beat["qrs_duration_ms"] = None
 

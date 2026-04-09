@@ -145,7 +145,7 @@ CLASS_NAMES = [
     "Other Arrhythmia",              # 22
     
     # NEW COMBINATIONS
-    "Sinus Bradycardia + PVC",       # 22
+    "Sinus Bradycardia + PVC",       # 23
     "Sinus Tachycardia + PVC",       # 23
     "Sinus Bradycardia + PAC",       # 24
     "Sinus Tachycardia + PAC",       # 25
@@ -275,8 +275,14 @@ def get_ectopy_label_idx(original_label_name):
     if any(t in label for t in ["ATRIAL RUN", "PSVT", "ATRIAL TRIPLET", "SVT"]):
         return ECTOPY_INDEX["PAC"]
 
-    # Priority 2: PACs (including Atrial Couplet/Bigeminy/Trigeminy/Quadrigeminy)
-    if any(t in label for t in ["PAC", "ATRIAL"]):
+    # Priority 2: PACs (specific ectopy terms only)
+    # "ATRIAL" alone is too broad — it catches "ATRIAL FLUTTER" and "ATRIAL FIBRILLATION"
+    # which are RHYTHMS, not ectopy. Explicitly exclude them.
+    if "PAC" in label or (
+        "ATRIAL" in label and
+        "FIBRILLATION" not in label and
+        "FLUTTER" not in label
+    ):
         return ECTOPY_INDEX["PAC"]
 
     # Priority 3: PVCs (including bigeminy/trigeminy/quadrigeminy/couplets)
@@ -342,7 +348,7 @@ LABEL_MAP = {
     "N": "Sinus Rhythm",      # Normal beat
     "V": "PVC",               # Premature ventricular contraction
     "A": "PAC",               # Atrial premature contraction
-    "F": "Fusion",            # Fusion of ventricular and normal beat (map to PVC for simplicity or None)
+    "F": "PVC",               # Fusion of ventricular and normal beat — treated as PVC (clinically closest)
     "E": "Junctional Rhythm", # Escape beat
     "J": "Junctional Rhythm", # Nodal (junctional) premature beat
     "L": "Bundle Branch Block", # Left bundle branch block beat
@@ -413,17 +419,22 @@ class ECGDataset:
     """
     SQL-based dataset that loads ECG segments from ecg_features_annotatable.
     Replaces the old file-strolling JSON loader.
+
+    use_features=True  →  also extracts auxiliary feature vectors for models_v2.
+    use_features=False →  original behavior (signal + label only).
     """
 
-    def __init__(self, mode='all', limit=None, task='all', **kwargs):
+    def __init__(self, mode='all', limit=None, task='all', use_features=False, **kwargs):
         """
         mode: 'all' to load everything, 'retrain' to load only clinician-corrected segments.
         limit: Max segments to load (int or None).
         task: Filter for task-specific labels (e.g. 'rhythm', 'ectopy').
+        use_features: If True, extract auxiliary feature vectors per sample.
         """
         self.samples = []
         self.task = task
-        
+        self.use_features = use_features
+
         # Connection params (Match db_service.py/retrain.py)
         DB_PARAMS = {
             "host":     "127.0.0.1",
@@ -433,38 +444,44 @@ class ECGDataset:
             "port":     "5432",
         }
 
-        print(f"[Dataset] Initializing SQL dataset (mode={mode}, limit={limit}, task={task})...")
+        # Lazy import — only needed when use_features=True
+        if self.use_features:
+            from signal_processing.feature_extraction import extract_feature_vector, NUM_FEATURES
+            self._extract_features = extract_feature_vector
+            self._num_features = NUM_FEATURES
+
+        print(f"[Dataset] Initializing SQL dataset (mode={mode}, limit={limit}, task={task}, use_features={use_features})...")
         try:
             conn = psycopg2.connect(**DB_PARAMS)
             cur = conn.cursor()
-            
-            # Fetch signal_data (REAL[]), label, and fs
+
+            # Fetch signal_data (REAL[]), label, features_json, and fs
             base_query = """
-                SELECT segment_id, signal_data, arrhythmia_label, segment_fs, filename
-                FROM ecg_features_annotatable 
+                SELECT segment_id, signal_data, arrhythmia_label, segment_fs, filename, features_json
+                FROM ecg_features_annotatable
             """
-            
+
             where_clauses = ["signal_data IS NOT NULL"]
             if mode == 'retrain':
                 where_clauses.append("is_corrected = TRUE")
-            
+
             query = base_query + " WHERE " + " AND ".join(where_clauses)
             query += " ORDER BY segment_id DESC" # Get recent ones first if limited
-            
+
             if limit:
                 query += f" LIMIT {limit}"
-            
+
             cur.execute(query)
             rows = cur.fetchall()
-            
-            for seg_id, signal_raw, label_txt, fs, filename in rows:
+
+            for seg_id, signal_raw, label_txt, fs, filename, features_json_raw in rows:
                 # 1. Parse signal (Postgres REAL[] comes back as list)
                 sig = np.array(signal_raw, dtype=np.float32)
-                
+
                 # 2. Resample & Fix Length (10s @ 125Hz = 1250 samples)
                 fs = int(fs or 125)
                 sig = self._resample_and_fixlen(sig, fs)
-                
+
                 # 3. Resolve label index based on actual task
                 if self.task == 'rhythm':
                     y = get_rhythm_label_idx(label_txt)
@@ -473,25 +490,76 @@ class ECGDataset:
                 else:
                     label_norm = normalize_label(label_txt or "Sinus Rhythm")
                     y = CLASS_INDEX.get(label_norm, 0)
-                
+
                 # Skip if label is invalid for the specified task
-                if y is None: 
+                if y is None:
                     continue
 
-                self.samples.append({
+                sample = {
                     "signal": sig,
                     "label": int(y),
                     "id": seg_id,
                     "filename": filename
-                })
-                
+                }
+
+                # 4. Extract or load feature vector (only when use_features=True)
+                if self.use_features:
+                    feat_vec = self._load_or_extract_features(
+                        sig, fs, features_json_raw
+                    )
+                    sample["features"] = feat_vec
+
+                self.samples.append(sample)
+
             cur.close()
             conn.close()
             print(f"[Dataset] Loaded {len(self.samples)} samples from SQL.")
-            
+
         except Exception as e:
             print(f"[ERROR] Failed to load SQL dataset: {e}")
             raise
+
+    def _load_or_extract_features(self, sig, fs, features_json_raw):
+        """
+        Try to load pre-computed features from features_json (fast).
+        If not available, extract from signal on-the-fly (slower but works).
+        """
+        import json as _json
+        from signal_processing.feature_extraction import FEATURE_NAMES, NUM_FEATURES
+
+        # Try pre-computed features first
+        if features_json_raw:
+            try:
+                if isinstance(features_json_raw, str):
+                    feat_dict = _json.loads(features_json_raw)
+                else:
+                    feat_dict = features_json_raw
+
+                # Check if the features were backfilled (has our keys)
+                if "mean_hr_bpm" in feat_dict:
+                    vec = np.array(
+                        [float(feat_dict.get(name, 0.0)) for name in FEATURE_NAMES],
+                        dtype=np.float32,
+                    )
+                    return vec
+            except Exception:
+                pass
+
+        # Fallback: extract from signal (slower)
+        r_peaks = None
+        if features_json_raw:
+            try:
+                if isinstance(features_json_raw, str):
+                    feat_dict = _json.loads(features_json_raw)
+                else:
+                    feat_dict = features_json_raw
+                rp = feat_dict.get("r_peaks", [])
+                if rp:
+                    r_peaks = np.array(rp, dtype=int)
+            except Exception:
+                pass
+
+        return self._extract_features(sig, fs=TARGET_FS, r_peaks=r_peaks)
 
     def _resample_and_fixlen(self, sig, orig_fs):
         """Standardizes signal to 125 Hz and 1250 samples."""
@@ -519,18 +587,31 @@ class ECGDataset:
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        return {
-            "signal": s["signal"], 
-            "label": s["label"], 
+        item = {
+            "signal": s["signal"],
+            "label": s["label"],
             "meta": {"id": s["id"], "filename": s["filename"]}
         }
+        if self.use_features and "features" in s:
+            item["features"] = s["features"]
+        return item
 
 
 def collate_fn(batch):
-    """Batches signals and labels for training."""
+    """Batches signals and labels for training (original, backward compatible)."""
     signals = np.stack([b["signal"] for b in batch])
     labels = np.array([b["label"] for b in batch])
     return signals, labels
+
+
+def collate_fn_v2(batch):
+    """Batches signals, features, and labels for v2 model training."""
+    signals = np.stack([b["signal"] for b in batch])
+    labels = np.array([b["label"] for b in batch])
+    if "features" in batch[0]:
+        features = np.stack([b["features"] for b in batch])
+        return signals, features, labels
+    return signals, None, labels
 
 # Backward Compatibility Alias
 ECGRawDatasetSQL = ECGDataset

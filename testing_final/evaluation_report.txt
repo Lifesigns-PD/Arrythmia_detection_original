@@ -1,0 +1,53 @@
+================================================================================
+PIPELINE EVALUATION RESULTS
+================================================================================
+Overall Pipeline Accuracy: 0.0680 (171/2516)
+
+                              precision    recall  f1-score   support
+
+         1st Degree AV Block       0.95      0.05      0.09       366
+   1st Degree AV Block + PVC       0.00      0.00      0.00         1
+                    Artifact       0.00      0.00      0.00        92
+         Atrial Fibrillation       1.00      0.40      0.57         5
+              Atrial Flutter       0.00      0.00      0.00         0
+         Bundle Branch Block       0.04      0.24      0.07       108
+                        NSVT       0.00      0.00      0.00         0
+                         PAC       0.00      0.00      0.00         9
+                        PSVT       0.00      0.00      0.00         0
+                         PVC       0.00      0.00      0.00        17
+                PVC Bigeminy       0.00      0.00      0.00        28
+                 PVC Couplet       0.00      0.00      0.00        20
+           Sinus Bradycardia       0.31      0.09      0.13       361
+                Sinus Rhythm       0.34      0.06      0.11      1508
+           Sinus Tachycardia       0.00      0.00      0.00         1
+Supraventricular Tachycardia       0.00      0.00      0.00         0
+             Ventricular Run       0.00      0.00      0.00         0
+     Ventricular Tachycardia       0.00      0.00      0.00         0
+
+                    accuracy                           0.07      2516
+                   macro avg       0.15      0.05      0.05      2516
+                weighted avg       0.39      0.07      0.10      2516
+
+
+CONFUSION MATRIX:
+                          1st Degr 1st Degr Artifact Atrial F Atrial F Bundle B     NSVT      PAC     PSVT      PVC PVC Bige PVC Coup Sinus Br Sinus Rh Sinus Ta Supraven Ventricu Ventricu
+1st Degree AV Block             18        0        0        0        0       14       17        0       41        0        0        0       23      135        0       12        7       99
+1st Degree AV Block + PV         0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        1
+Artifact                         0        0        0        0        0       35        9        0       12        0        0        0        1       27        2        2        2        2
+Atrial Fibrillation              0        0        0        2        1        2        0        0        0        0        0        0        0        0        0        0        0        0
+Atrial Flutter                   0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0
+Bundle Branch Block              0        0        0        0        0       26        0        0        5        0        0        0        2       11        0        4        0       60
+NSVT                             0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0
+PAC                              0        0        0        0        0        4        1        0        1        0        0        0        0        0        0        0        0        3
+PSVT                             0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0
+PVC                              0        0        0        0        0        1        9        0        3        0        0        0        0        1        0        0        1        2
+PVC Bigeminy                     0        0        0        0        0        4       11        0        0        0        0        0        0        1        0        0        0       12
+PVC Couplet                      0        0        0        0        0        5       11        0        0        0        0        0        0        2        0        0        1        1
+Sinus Bradycardia                0        0        0        0        0      224       27        0       77        0        0        0       31        2        0        0        0        0
+Sinus Rhythm                     1        0        0        0        0      327       28        0      389        0        0        0       43       94        0      615        1       10
+Sinus Tachycardia                0        0        0        0        0        0        0        0        1        0        0        0        0        0        0        0        0        0
+Supraventricular Tachyca         0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0
+Ventricular Run                  0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0
+Ventricular Tachycardia          0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0        0
+
+================================================================================

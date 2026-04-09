@@ -26,7 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
 sys.path.append(str(BASE_DIR / "models_training"))
 
-from data_loader import CLASS_NAMES, ECGRawDatasetSQL
+from data_loader import RHYTHM_CLASS_NAMES, ECGRawDatasetSQL
 from models import CNNTransformerClassifier
 
 
@@ -185,7 +185,7 @@ def evaluate():
 
     # 2. Load Dataset
     print("\nLoading dataset from SQL database...")
-    dataset = ECGRawDatasetSQL()
+    dataset = ECGRawDatasetSQL(task='rhythm')
     print(f"Dataset size: {len(dataset)} segments")
     
     if len(dataset) == 0:
@@ -201,7 +201,7 @@ def evaluate():
         return
 
     print(f"\nLoading model from {ckpt_path}...")
-    model = CNNTransformerClassifier(num_classes=len(CLASS_NAMES))
+    model = CNNTransformerClassifier(num_classes=len(RHYTHM_CLASS_NAMES))
     state = torch.load(ckpt_path, map_location=device)
     
     if "model_state" in state:
@@ -231,7 +231,7 @@ def evaluate():
             y_true.extend(y.numpy())
 
     # 5. Print comprehensive report
-    print_evaluation_report(y_true, y_pred, CLASS_NAMES)
+    print_evaluation_report(y_true, y_pred, RHYTHM_CLASS_NAMES)
     
     # 6. Save report to file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -241,7 +241,7 @@ def evaluate():
     original_stdout = sys.stdout
     with open(report_file, 'w', encoding='utf-8') as f:
         sys.stdout = f
-        print_evaluation_report(y_true, y_pred, CLASS_NAMES)
+        print_evaluation_report(y_true, y_pred, RHYTHM_CLASS_NAMES)
     sys.stdout = original_stdout
     
     print(f"\n✅ Evaluation report saved to: {report_file}")

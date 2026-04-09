@@ -28,7 +28,6 @@ import subprocess
 from xai import explain_decision, generate_detailed_ledger
 from decision_engine.rhythm_orchestrator import RhythmOrchestrator
 from decision_engine.models import SegmentDecision
-from models_training.data_loader import RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES
 
 # Suppress harmless scipy warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -810,12 +809,17 @@ def get_segment_api(segment_id: int):
             qrs_mean_ms = float(np.nanmedian(qrs_durations))
         else:
              # Fallback to stored features if NeuroKit returns nothing (rare)
-             qrs_mean_ms = 0.0 
-             qrs_list = features.get("qrs_durations_ms")
-             if isinstance(qrs_list, list):
-                q_clean = [float(v) for v in qrs_list if v is not None and not np.isnan(float(v))]
-                if q_clean:
-                    qrs_mean_ms = float(sum(q_clean)/len(q_clean))
+             # Try scalar qrs_duration_ms first (always in features_json), then list fallback
+             scalar_qrs = features.get("qrs_duration_ms")
+             if scalar_qrs is not None and not np.isnan(float(scalar_qrs)) and float(scalar_qrs) > 0:
+                 qrs_mean_ms = float(scalar_qrs)
+             else:
+                 qrs_mean_ms = 0.0
+                 qrs_list = features.get("qrs_durations_ms")
+                 if isinstance(qrs_list, list):
+                     q_clean = [float(v) for v in qrs_list if v is not None and not np.isnan(float(v))]
+                     if q_clean:
+                         qrs_mean_ms = float(sum(q_clean)/len(q_clean))
     except Exception as e:
         qrs_mean_ms = float(features.get("mean_qrs", 0.0))
 
@@ -848,66 +852,31 @@ def get_segment_api(segment_id: int):
     # Skipped if cardiologist cleared annotations (they want a blank slate)
     # ---------------------------------------------------------
     ml_decision = None
+    is_corrected = meta.get("is_corrected", False)
     has_cardiologist_events = any(
         isinstance(e, dict) and e.get("annotation_source") == "cardiologist"
         for e in raw_events
     )
-    if not has_cardiologist_events and not was_cleared:
+    # Skip ML inference if the cardiologist has verified this segment (is_corrected=True).
+    # This covers the case where the cardiologist verified with no beat events (empty events_json)
+    # but set the background rhythm — we must show their label, not re-run the model.
+    if not is_corrected and not has_cardiologist_events and not was_cleared:
         print(f"[API] No manual events for segment {segment_id}. Running ML inference...")
         try:
-            from xai import _load_model, _init_device, extract_fixed_window
-            import torch
-            import torch.nn.functional as F
-
-            device = _init_device()
-            model_rhythm = _load_model(task="rhythm")
-            model_ectopy = _load_model(task="ectopy")
+            from xai.xai import explain_segment
 
             arr = np.array(raw_signal, dtype=np.float32)
-            signal_2s = extract_fixed_window(arr, TARGET_FS, 0.0, 10.0)
-            x = torch.from_numpy(signal_2s[None, None, :]).to(device)
 
-            with torch.no_grad():
-                r_logits = model_rhythm(x)
-                r_probs = F.softmax(r_logits, dim=1)[0].cpu().numpy()
+            # Build features dict for explain_segment: stored features + r_peaks
+            xai_features = dict(features)  # copy of features_json values
+            xai_features["r_peaks"] = r_peaks_arr.tolist() if len(r_peaks_arr) > 0 else []
 
-            r_idx = int(np.argmax(r_probs))
-            r_label = RHYTHM_CLASS_NAMES[r_idx]
+            # Full V2 inference: signal + features tensor, per-beat ectopy
+            ml_prediction = explain_segment(arr, xai_features)
+            if "error" in ml_prediction:
+                raise RuntimeError(ml_prediction["error"])
 
-            # Per-beat ectopy inference — build beat_events for the orchestrator
-            beat_records = []
-            if len(r_peaks_arr) > 0:
-                for beat_idx, peak_idx in enumerate(r_peaks_arr):
-                    start_s = (peak_idx / seg_fs) - 1.0
-                    end_s = (peak_idx / seg_fs) + 1.0
-                    beat_window = extract_fixed_window(arr, TARGET_FS, start_s, end_s)
-                    bx = torch.from_numpy(beat_window[None, None, :]).to(device)
-
-                    with torch.no_grad():
-                        be_logits = model_ectopy(bx)
-                        be_probs = F.softmax(be_logits, dim=1)[0].cpu().numpy()
-
-                    e_idx = int(np.argmax(be_probs))
-                    beat_records.append({
-                        "beat_idx": beat_idx,
-                        "peak_sample": int(peak_idx),
-                        "label": ECTOPY_CLASS_NAMES[e_idx],
-                        "conf": float(be_probs[e_idx]),
-                    })
-
-            # Build ml_prediction dict matching explain_segment() output format
-            ml_prediction = {
-                "rhythm": {
-                    "label": r_label,
-                    "confidence": float(r_probs[r_idx]),
-                    "probs": r_probs.tolist(),
-                },
-                "ectopy": {
-                    "label": "None",
-                    "confidence": 0.0,
-                    "beat_events": beat_records,
-                },
-            }
+            r_label = ml_prediction.get("rhythm", {}).get("label", "Unknown")
 
             # Build clinical features for the rules engine
             rr_intervals_ms = []
@@ -981,7 +950,8 @@ def get_segment_api(segment_id: int):
             "notes": meta.get("cardiologist_notes") or "",
             "corrected_by": meta.get("corrected_by"),
             "corrected_at": meta.get("corrected_at"),
-            "xai_explanation": ledger_text
+            "xai_explanation": ledger_text,
+            "is_corrected": is_corrected,
         }
     )
 

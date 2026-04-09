@@ -9,8 +9,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models_training.models import CNNTransformerClassifier
+from models_training.models_v2 import CNNTransformerWithFeatures
+from models_training.models import CNNTransformerClassifier  # V1 fallback only
 from models_training.data_loader import CLASS_NAMES, RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES, extract_fixed_window, WINDOW_SEC
+from signal_processing.feature_extraction import FEATURE_NAMES, NUM_FEATURES
 from decision_engine.models import SegmentDecision, SegmentState, DisplayState
 
 
@@ -23,8 +25,10 @@ from decision_engine.models import SegmentDecision, SegmentState, DisplayState
 # BASE_DIR is defined above as project root
 # CKPT is in models_training/outputs/checkpoints
 # Checkpoints for split models
-RHYTHM_CKPT = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm.pth"
-ECTOPY_CKPT = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_ectopy.pth"
+RHYTHM_CKPT    = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm_v2.pth"
+ECTOPY_CKPT    = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_ectopy_v2.pth"
+RHYTHM_CKPT_V1 = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm.pth"
+ECTOPY_CKPT_V1 = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_ectopy.pth"
 
 _device = None
 _model_rhythm = None
@@ -81,20 +85,13 @@ def _load_model(task="rhythm"):
     """
     global _model_rhythm, _model_ectopy, _rhythm_mtime, _ectopy_mtime, _is_model_untrained
 
-    ckpt = RHYTHM_CKPT if task == "rhythm" else ECTOPY_CKPT
+    ckpt    = RHYTHM_CKPT    if task == "rhythm" else ECTOPY_CKPT
+    ckpt_v1 = RHYTHM_CKPT_V1 if task == "rhythm" else ECTOPY_CKPT_V1
     classes = RHYTHM_CLASS_NAMES if task == "rhythm" else ECTOPY_CLASS_NAMES
-    
-    if not ckpt.exists():
-        # Fallback to legacy path if split model not found (during transition)
-        legacy = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model.pth"
-        if legacy.exists():
-            ckpt = legacy
-        else:
-            print(f"⚠️  Checkpoint {ckpt} not found. Using untrained specialist.")
 
     # Check modification time
     current_mtime = ckpt.stat().st_mtime if ckpt.exists() else 0
-    
+
     # Selection
     current_model = _model_rhythm if task == "rhythm" else _model_ectopy
     stored_mtime = _rhythm_mtime if task == "rhythm" else _ectopy_mtime
@@ -104,17 +101,33 @@ def _load_model(task="rhythm"):
         return current_model
 
     device = _init_device()
-    model = CNNTransformerClassifier(num_classes=len(classes))
-    
+
+    # Try V2 checkpoint first, fall back to V1 if not available
     if ckpt.exists():
+        model = CNNTransformerWithFeatures(num_classes=len(classes), num_features=NUM_FEATURES)
         try:
             state = torch.load(ckpt, map_location=device, weights_only=False)
             sd = state["model_state"] if "model_state" in state else state
             model.load_state_dict(sd)
-            print(f"[OK] {task.upper()} model loaded from {ckpt}")
+            print(f"[OK] {task.upper()} V2 model loaded from {ckpt}")
         except Exception as e:
-            print(f"[WARN] {task.upper()} checkpoint mismatch: {e}. Using untrained.")
+            print(f"[WARN] {task.upper()} V2 checkpoint mismatch: {e}. Using untrained V2.")
             _is_model_untrained = True
+    elif ckpt_v1.exists():
+        print(f"[INFO] {task.upper()} V2 checkpoint not found, falling back to V1: {ckpt_v1}")
+        model = CNNTransformerClassifier(num_classes=len(classes))
+        try:
+            state = torch.load(ckpt_v1, map_location=device, weights_only=False)
+            sd = state["model_state"] if "model_state" in state else state
+            model.load_state_dict(sd)
+            print(f"[OK] {task.upper()} V1 model loaded (fallback)")
+        except Exception as e:
+            print(f"[WARN] {task.upper()} V1 fallback mismatch: {e}. Using untrained.")
+            _is_model_untrained = True
+    else:
+        print(f"[WARN] No checkpoint found for {task.upper()}. Using untrained V2.")
+        model = CNNTransformerWithFeatures(num_classes=len(classes), num_features=NUM_FEATURES)
+        _is_model_untrained = True
     
     model.to(device)
     model.eval()
@@ -381,15 +394,28 @@ def _clinical_explanation(label: str, features: dict, attention_context: str = "
 # SALIENCY (vanilla gradient)
 # ---------------------------------------------------------------------
 
-def _compute_saliency(model, x, target_idx: int):
+def _build_features_tensor(features: dict, device) -> torch.Tensor:
+    """Build the canonical 13-dim features tensor from the segment's features dict."""
+    vec = np.array(
+        [float(features.get(name) or 0.0) for name in FEATURE_NAMES],
+        dtype=np.float32,
+    )
+    return torch.from_numpy(vec[None, :]).to(device)  # shape (1, 13)
+
+
+def _compute_saliency(model, x, target_idx: int, features_t=None):
     """
     Vanilla gradient saliency on the 1-D ECG trace.
     x: torch tensor of shape (1, 1, T) with requires_grad=True
+    features_t: optional features tensor (1, F) for V2 model — no gradient needed
     """
     model.zero_grad()
     x = x.clone().detach().requires_grad_(True)
 
-    logits = model(x)
+    if features_t is not None and isinstance(model, CNNTransformerWithFeatures):
+        logits = model(x, features_t.detach())
+    else:
+        logits = model(x)
     score = logits[0, target_idx]
     score.backward()
 
@@ -488,6 +514,9 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
         # Target FS is 125Hz as per system standards
         fs = 125
 
+        # Build features tensor once — reused for every inference call (V2 models)
+        features_t = _build_features_tensor(features, device)
+
         # ── 1. Inference: Ectopy (Beat-by-Beat) — runs FIRST so we can
         #    identify non-ectopic beats for clean rhythm-model windowing.
         BEAT_ECTOPY_THRESHOLD = 0.7  # per-beat confidence floor — model over-predicts ectopy
@@ -498,7 +527,10 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
             default_window = extract_fixed_window(arr, fs, 0.0, 10.0)
             x_default = torch.from_numpy(default_window[None, None, :]).to(device)
             with torch.no_grad():
-                e_logits = model_ectopy(x_default)
+                if isinstance(model_ectopy, CNNTransformerWithFeatures):
+                    e_logits = model_ectopy(x_default, features_t)
+                else:
+                    e_logits = model_ectopy(x_default)
                 e_probs = F.softmax(e_logits, dim=1)[0].cpu().numpy()
             e_idx = int(np.argmax(e_probs))
             if e_idx != 0 and e_probs[e_idx] < BEAT_ECTOPY_THRESHOLD:
@@ -517,7 +549,10 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
                 bx = torch.from_numpy(beat_window[None, None, :]).to(device)
 
                 with torch.no_grad():
-                    be_logits = model_ectopy(bx)
+                    if isinstance(model_ectopy, CNNTransformerWithFeatures):
+                        be_logits = model_ectopy(bx, features_t)
+                    else:
+                        be_logits = model_ectopy(bx)
                     be_probs = F.softmax(be_logits, dim=1)[0].cpu().numpy()
                 all_e_probs.append(be_probs)
 
@@ -568,14 +603,17 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
 
         x = torch.from_numpy(rhythm_window[None, None, :]).to(device)
         with torch.no_grad():
-            r_logits = model_rhythm(x)
+            if isinstance(model_rhythm, CNNTransformerWithFeatures):
+                r_logits = model_rhythm(x, features_t)
+            else:
+                r_logits = model_rhythm(x)
             r_probs = F.softmax(r_logits, dim=1)[0].cpu().numpy()
 
         r_idx = int(np.argmax(r_probs))
         r_label = RHYTHM_CLASS_NAMES[r_idx]
 
         # 3. Evidence Gathering
-        saliency = _compute_saliency(model_rhythm, x, r_idx)
+        saliency = _compute_saliency(model_rhythm, x, r_idx, features_t=features_t)
         attention_desc = _analyze_attention(model_rhythm)
         
         return {

@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS ecg_features_annotatable (
     model_pred_probs JSONB, -- Model prediction probabilities (JSONB for universal compatibility)
     raw_signal JSONB, -- The actual 10-second ECG voltage values (JSON for dashboard)
     features_json JSONB,
+    sqi_score FLOAT DEFAULT NULL, -- Signal Quality Index (0-1, higher is better)
     events_json JSONB DEFAULT '[]'::jsonb, -- Unified beat-level event storage (PVC/PAC)
     r_peaks_in_segment TEXT,
     pr_interval FLOAT,

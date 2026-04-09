@@ -151,7 +151,7 @@ def get_segment_new(segment_id: int) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             # We now query ecg_features_annotatable and use raw_signal, features_json, and arrhythmia_label
             cur.execute("""
-                SELECT raw_signal, features_json, arrhythmia_label, events_json, segment_fs, filename, segment_index, r_peaks_in_segment, cardiologist_notes, dataset_source
+                SELECT raw_signal, features_json, arrhythmia_label, events_json, segment_fs, filename, segment_index, r_peaks_in_segment, cardiologist_notes, dataset_source, is_corrected
                 FROM ecg_features_annotatable
                 WHERE segment_id = %s
             """, (segment_id,))
@@ -173,7 +173,8 @@ def get_segment_new(segment_id: int) -> Optional[Dict[str, Any]]:
                     "segment_index": row[6],
                     "r_peaks_in_segment": row[7],
                     "cardiologist_notes": row[8] or "",
-                    "dataset_source": row[9] or "Unknown"
+                    "dataset_source": row[9] or "Unknown",
+                    "is_corrected": bool(row[10]) if row[10] is not None else False,
                 }
     except Exception as e:
         print(f"CRITICAL DB ERROR in get_segment_new: {e}")
@@ -473,8 +474,15 @@ def get_all_segments() -> List[Dict[str, Any]]:
 # ---------------------------------------
 def update_segment_status(segment_id: int, background_rhythm: str = 'Unlabeled', events: list = None, notes: str = '') -> bool:
     """
-    Updates the unified table.
-    Saves the rhythm, the specific beat events (PVCs/PACs), and marks it ready for ML Retraining.
+    Updates the unified table with cardiologist verification.
+    Saves the rhythm, the specific beat events (PVCs/PACs), and marks for ML Retraining.
+
+    ARCHITECTURAL FIX (is_corrected ↔ used_for_training):
+    - Sets is_corrected=TRUE: cardiologist has verified this segment
+    - Sets used_for_training=TRUE: eligible for inclusion in next training run
+    - training_round will be incremented by retrain_v2.py AFTER training completes
+    - If cardiologist later clears this annotation, clear_all_annotations() will
+      set both flags to FALSE, allowing the segment to be re-annotated
     """
     conn = _connect()
     try:
@@ -514,11 +522,17 @@ def update_segment_status(segment_id: int, background_rhythm: str = 'Unlabeled',
 
 
 def clear_all_annotations(segment_id: int) -> bool:
-    """Wipes all annotation events and resets it so the ML model ignores it."""
+    """
+    Wipes all annotation events and resets it so the ML model ignores it.
+
+    ARCHITECTURAL: Sets is_corrected=FALSE and used_for_training=FALSE to prevent
+    reuse of stale annotations in future training runs. The segment can be re-annotated
+    and used in the next training cycle.
+    """
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            # We ONLY reset the manual markers and training flags. 
+            # We ONLY reset the manual markers and training flags.
             # We DO NOT overwrite the arrhythmia_label with "Unlabeled"!
             cur.execute("""
                 UPDATE ecg_features_annotatable
@@ -530,7 +544,7 @@ def clear_all_annotations(segment_id: int) -> bool:
                     corrected_by = NULL
                 WHERE segment_id = %s
             """, (segment_id,))
-            
+
         conn.commit()
         return True
     except Exception as e:
@@ -541,7 +555,13 @@ def clear_all_annotations(segment_id: int) -> bool:
 
 
 def mark_segment_corrected(segment_id: int) -> bool:
-    """Set is_corrected=TRUE and used_for_training=TRUE after event edits."""
+    """
+    Set is_corrected=TRUE and used_for_training=TRUE after event edits.
+
+    NOTE: training_round is NOT incremented here; it is incremented by retrain_v2.py
+    after a training run completes, per segment that was included in training.
+    This ensures accurate tracking of which model version trained on which segments.
+    """
     conn = _connect()
     try:
         with conn.cursor() as cur:
