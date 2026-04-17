@@ -1,38 +1,83 @@
-# ECG Arrhythmia Detection Pipeline
+# ECG Arrhythmia Detection System
 
-Real-time ECG arrhythmia detection system for continuous patient monitoring.
-Consumes raw ECG data from Kafka, runs AI analysis, writes results to MongoDB.
+Real-time ECG arrhythmia detection for continuous patient monitoring.
+Processes raw ECG signals through a multi-stage AI pipeline and produces
+structured clinical event output per 10-second segment.
 
 ---
 
 ## What This System Does
 
 ```
-ECG Device → Kafka Topic → [This Container] → MongoDB
+ECG Device → Kafka Topic → ECG Processor → MongoDB
 ```
 
-For every 1-minute ECG recording received:
+For every 1-minute ECG recording:
 1. Splits into 6 × 10-second segments
-2. Cleans signal (baseline wander + powerline noise removal)
-3. Detects R-peaks (Pan-Tompkins algorithm)
-4. Extracts 13 clinical features (HR, HRV, PR interval, QRS duration, etc.)
-5. Runs two AI models:
-   - **Rhythm model** — classifies background rhythm (Sinus, AF, AV Block, BBB, etc.)
-   - **Ectopy model** — detects PVC/PAC beats per-beat
-6. Applies clinical rules engine — derives patterns (Bigeminy, NSVT, VT, PSVT, etc.)
-7. Writes structured result to MongoDB
+2. Runs full V3 signal processing pipeline (preprocessing → R-peak detection → delineation → feature extraction)
+3. Feeds signal + 60 clinical features into two AI models
+4. Applies clinical rules engine for pattern detection
+5. Writes structured arrhythmia events to MongoDB
 
 ---
 
 ## AI Models
 
-| Model | Architecture | Classes | Accuracy |
-|-------|-------------|---------|----------|
-| Rhythm V2 | CNN + Transformer + Features | 13 rhythm classes | Balanced acc (see training logs) |
-| Ectopy V2 | CNN + Transformer + Features | None / PVC / PAC | 0.77 balanced acc |
+| Model | Architecture | Classes | Input |
+|-------|-------------|---------|-------|
+| Rhythm V2 | CNN + Transformer + Feature Fusion | 9 rhythm classes | Signal (1250 samples) + 60 features |
+| Ectopy V2 | CNN + Transformer + Feature Fusion | None / PVC / PAC | Signal (1250 samples) + 60 features |
 
-Both models use signal + 13 clinical features as input (V2 architecture).
-Checkpoints are included in `models_training/outputs/checkpoints/`.
+**Rhythm classes:** Sinus Rhythm, Atrial Fibrillation, Atrial Flutter, 1st Degree AV Block,
+3rd Degree AV Block, 2nd Degree AV Block Type 2, Bundle Branch Block, Artifact, Sinus Bradycardia
+
+Checkpoints: `models_training/outputs/checkpoints/`
+
+---
+
+## Signal Processing Pipeline (V3)
+
+```
+Raw ECG (125 Hz, 10s = 1250 samples)
+    │
+    ├─ 1. Preprocessing
+    │      Adaptive baseline removal + Butterworth bandpass (0.5–40 Hz)
+    │      Adaptive notch filter (50/60 Hz auto-detect)
+    │      Artifact suppression + signal quality index (SQI)
+    │
+    ├─ 2. R-Peak Detection (Ensemble)
+    │      3 independent detectors voted by ≥2/3 agreement
+    │      Polarity-corrected (handles inverted leads)
+    │      Sub-sample parabolic interpolation for HRV accuracy
+    │
+    ├─ 3. Waveform Delineation
+    │      CWT-based P/Q/R/S/T boundaries per beat
+    │      Inverted-lead aware (aVR, LBBB patterns)
+    │      P-wave morphology classification (normal/inverted/biphasic/absent)
+    │
+    └─ 4. Feature Extraction (60 features)
+           HRV time domain (11) + HRV frequency domain (8)
+           Nonlinear HRV (8) + Morphology (13) + Beat discriminators (20)
+```
+
+Full technical reference: `docs/ECG_Signal_Processing_Pipeline.md`
+Signal processing module reference: `signal_processing_v3/README.md`
+
+---
+
+## Rules Engine
+
+Pattern detection runs after the ML models and derives higher-level events:
+
+| Pattern | Method |
+|---------|--------|
+| PVC Bigeminy / Trigeminy | Beat alternation counting |
+| PVC Couplet / Run / NSVT | Consecutive PVC detection |
+| Ventricular Tachycardia | ≥3 consecutive PVCs + rate > 100 bpm |
+| SVT / PSVT | HR > 150 + narrow QRS + sudden onset |
+| AV Block patterns | PR + dropped beat analysis |
+
+Rules reference: `decision_engine/rules.py`, `docs/arrhythmia_rules_documentation.md`
 
 ---
 
@@ -40,13 +85,9 @@ Checkpoints are included in `models_training/outputs/checkpoints/`.
 
 ### 1. Environment Variables
 
-Copy `.env.template` to `.env` and fill in your values:
-
 ```bash
 cp .env.template .env
 ```
-
-Required variables:
 
 ```
 KAFKA_BOOTSTRAP_SERVERS=your-kafka-broker:9092
@@ -57,25 +98,16 @@ MONGO_DB=ecg_db
 MONGO_COLLECTION=ecg_results
 ```
 
-### 2. Build Docker Image
+### 2. Docker
 
 ```bash
 docker build -t ecg-processor .
-```
-
-Build takes 3–5 minutes (installs scipy, torch, neurokit2).
-
-### 3. Run
-
-```bash
 docker run --env-file .env ecg-processor
 ```
 
-Or with Docker Compose / Kubernetes — use environment variables from ConfigMap/Secret.
-
 ---
 
-## Kafka Message Format (Input)
+## Input Format (Kafka)
 
 ```json
 {
@@ -88,17 +120,15 @@ Or with Docker Compose / Kubernetes — use environment variables from ConfigMap
 }
 ```
 
-- `ecgData`: 7500 float values (1 minute at 125 Hz, mV scale)
-- `timestamp`: Unix timestamp (seconds)
+`ecgData`: 7500 float values (1 minute at 125 Hz, mV scale)
 
 ---
 
-## MongoDB Document Format (Output)
+## Output Format (MongoDB)
 
 ```json
 {
   "admissionId": "ADM123456",
-  "deviceId": "ECG-DEVICE-01",
   "patientId": "PAT789",
   "timestamp": 1712600000,
   "analysis": {
@@ -111,7 +141,6 @@ Or with Docker Compose / Kubernetes — use environment variables from ConfigMap
         "end_time_s": 10.0,
         "primary_conclusion": "PVC Bigeminy",
         "background_rhythm": "Sinus Rhythm",
-        "rhythm_label": "Sinus Rhythm",
         "rhythm_confidence": 0.923,
         "ectopy_label": "PVC",
         "ectopy_confidence": 0.981,
@@ -126,7 +155,6 @@ Or with Docker Compose / Kubernetes — use environment variables from ConfigMap
       }
     ],
     "summary": {
-      "total_segments": 6,
       "dominant_rhythm": "Sinus Rhythm",
       "arrhythmia_detected": true,
       "events_found": ["PVC Bigeminy"],
@@ -138,79 +166,76 @@ Or with Docker Compose / Kubernetes — use environment variables from ConfigMap
 
 ---
 
-## Possible Output Values
+## Detectable Events
 
-### `primary_conclusion` / `events_found`
+**Normal:** Sinus Rhythm, Sinus Bradycardia, Sinus Tachycardia
 
-**Normal:**
-- `Sinus Rhythm`, `Sinus Bradycardia`, `Sinus Tachycardia`
+**Atrial:** Atrial Fibrillation, Atrial Flutter, PAC, Atrial Couplet, Atrial Run, SVT, PSVT,
+PAC Bigeminy, PAC Trigeminy
 
-**Atrial:**
-- `Atrial Fibrillation`, `Atrial Flutter`
-- `PAC`, `Atrial Couplet`, `Atrial Run`, `PSVT`, `SVT`
-- `PAC Bigeminy`, `PAC Trigeminy`, `PAC Quadrigeminy`
+**Ventricular:** PVC, PVC Couplet, PVC Bigeminy, PVC Trigeminy, Ventricular Run, NSVT, VT
 
-**Ventricular:**
-- `PVC`, `PVC Couplet`, `Ventricular Run`, `NSVT`, `VT`
-- `PVC Bigeminy`, `PVC Trigeminy`, `PVC Quadrigeminy`
+**Conduction:** 1st Degree AV Block, 2nd Degree AV Block Type 1/2, 3rd Degree AV Block,
+Bundle Branch Block
 
-**Conduction:**
-- `1st Degree AV Block`, `2nd Degree AV Block Type 1/2`, `3rd Degree AV Block`
-- `Bundle Branch Block`
-
-**Other:**
-- `Junctional Rhythm`, `Idioventricular Rhythm`, `Pause`, `Artifact`
+**Other:** Junctional Rhythm, Idioventricular Rhythm, Pause, Artifact
 
 ---
 
 ## File Structure
 
 ```
-├── kafka_consumer.py          Entry point — Kafka consumer loop
-├── ecg_processor.py           Full pipeline: clean → detect → infer → rules
-├── mongo_writer.py            MongoDB write logic
-├── config.py                  All config (reads from env vars)
-├── Dockerfile
-├── requirements.txt
+├── ecg_processor.py               Entry point — full pipeline per segment
+├── kafka_consumer.py              Kafka consumer loop
+├── mongo_writer.py                MongoDB write logic
 │
-├── signal_processing/
-│   ├── cleaning.py            Bandpass + notch filters
-│   ├── pan_tompkins.py        R-peak detection
-│   ├── morphology.py          PR/QRS/QT interval extraction
-│   ├── feature_extraction.py  13-feature vector builder
-│   └── sqi.py                 Signal Quality Index (0–1)
+├── signal_processing_v3/          V3 signal processing pipeline
+│   ├── preprocessing/             Baseline, denoising, artifact removal
+│   ├── detection/                 Ensemble R-peak detection (3 detectors)
+│   ├── delineation/               CWT P/Q/R/S/T waveform delineation
+│   ├── features/                  60-feature extraction
+│   └── quality/                   Signal quality index
 │
 ├── models_training/
-│   ├── models.py              V1 CNN+Transformer (signal only)
-│   ├── models_v2.py           V2 CNN+Transformer+Features
-│   ├── data_loader.py         Class name definitions
-│   └── outputs/checkpoints/
-│       ├── best_model_rhythm_v2.pth    Active rhythm model
-│       ├── best_model_ectopy_v2.pth    Active ectopy model
-│       ├── best_model_rhythm.pth       V1 fallback
-│       └── best_model_ectopy.pth       V1 fallback
+│   ├── models_v2.py               CNN+Transformer+Features architecture
+│   ├── data_loader.py             Class definitions (9 rhythm, 3 ectopy)
+│   ├── retrain_v2.py              Training script
+│   └── outputs/checkpoints/       Saved model weights
 │
 ├── xai/
-│   └── xai.py                 Model inference + per-beat ectopy detection
+│   └── xai.py                     Model inference + per-beat ectopy detection
 │
-└── decision_engine/
-    ├── rhythm_orchestrator.py  Combines ML + rules into final decision
-    ├── rules.py                Pattern detection (Bigeminy, NSVT, VT, etc.)
-    └── models.py               Data classes (Event, SegmentDecision, etc.)
+├── decision_engine/
+│   ├── rhythm_orchestrator.py     ML + rules → final decision
+│   └── rules.py                   Pattern detection
+│
+├── scripts/
+│   ├── backfill_features.py       Populate features_json for all DB segments
+│   ├── visualise_pipeline.py      Visual pipeline debugger (per segment)
+│   └── compare_models.py          Evaluate model checkpoints
+│
+└── docs/
+    ├── ECG_Signal_Processing_Pipeline.md   Full signal processing technical reference
+    ├── MODEL_ARCHITECTURE.md               Model design and rationale
+    └── arrhythmia_rules_documentation.md   Rules engine documentation
 ```
 
 ---
 
-## Requirements
+## Training
 
-- Docker (no other local dependencies needed)
-- Kafka broker accessible from container
-- MongoDB instance accessible from container
-- Python 3.13 (handled by Docker)
+```bash
+# 1. Backfill V3 features for all annotated segments
+python scripts/backfill_features.py --force --corrected
 
-Key Python packages (see `requirements.txt`):
-- `torch` — AI model inference
-- `neurokit2` — ECG waveform delineation
-- `scipy`, `numpy` — signal processing
-- `confluent-kafka` — Kafka consumer
-- `pymongo` — MongoDB writes
+# 2. Train
+python models_training/retrain_v2.py --task rhythm --mode initial
+python models_training/retrain_v2.py --task ectopy --mode initial
+
+# 3. Evaluate
+python scripts/compare_models.py --task rhythm
+python scripts/compare_models.py --task ectopy
+```
+
+Training uses only `is_corrected = TRUE` segments (cardiologist-verified).
+Class imbalance handled by `WeightedRandomSampler` + Focal Loss.

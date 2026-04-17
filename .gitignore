@@ -42,6 +42,11 @@ data/converted_ecg/
 data/input_segments/
 raw_data/
 models_training/outputs/logs/
+NO_USE/
+testing_final/
+tmp/
+utils/
+*.zip
 *.log
 *.json
 *.png
@@ -50,3 +55,24 @@ models_training/outputs/logs/
 # Database
 *.sql.gz
 *.backup
+SIGNAL_PROCESSING_ISSUES_AND_FIX_PLAN.md
+README.md
+ecg_processor.py
+V2_TRAINING_READINESS.md
+HOW_V3_WORKS.md
+MAJOR_CHANGES.md
+pong.py
+quesions.md
+ecg_processor.py
+check_qrs.py
+SCRIPTS_GUIDE.md
+V2_PIPELINE_VERIFICATION.md
+V2_FIXES_VERIFICATION.md
+SYSTEM_ARCHITECTURE.md
+tmp/check_ectopy.py
+utils/ecgprocessor.py
+utils/utils.py
+README.md
+SIGNAL_PROCESSING_ISSUES_AND_FIX_PLAN.md
+TEST_CURRENT_V2_MODELS.md
+V1_VS_V2_COMPARISON.md
