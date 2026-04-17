@@ -41,6 +41,8 @@ FEATURE_NAMES = [
     "hr_std_bpm",
     "sdnn_ms",
     "rmssd_ms",
+    "pnn50",        # % successive RR diffs >50ms — strong AF indicator
+    "rr_cv",        # RR coefficient of variation — separates AFib from Sinus Arrhythmia
     "qrs_duration_ms",
     "pr_interval_ms",
     "qtc_ms",
@@ -109,6 +111,11 @@ def extract_feature_vector(
         vec[_idx("hr_std_bpm")]   = float(np.std(hr_bpm))
         vec[_idx("sdnn_ms")]      = float(np.std(rr_ms))
         vec[_idx("rmssd_ms")]     = float(np.sqrt(np.mean(np.diff(rr_ms) ** 2)))
+        # pNN50: fraction of successive RR differences >50ms (strong AF indicator)
+        rr_diffs = np.abs(np.diff(rr_ms))
+        vec[_idx("pnn50")]  = float(np.mean(rr_diffs > 50)) if len(rr_diffs) > 0 else 0.0
+        # RR coefficient of variation: std/mean — separates AFib from Sinus Arrhythmia
+        vec[_idx("rr_cv")]  = float(np.std(rr_ms) / np.mean(rr_ms)) if np.mean(rr_ms) > 0 else 0.0
     elif len(rr_ms) == 1:
         vec[_idx("mean_hr_bpm")] = float(60000.0 / rr_ms[0])
 
@@ -122,7 +129,7 @@ def extract_feature_vector(
 
         vec[_idx("qrs_duration_ms")]     = float(summary.get("qrs_duration_ms", 0.0))
         vec[_idx("pr_interval_ms")]      = float(summary.get("pr_interval_ms", 0.0))
-        vec[_idx("qtc_ms")]              = float(summary.get("qtc_bazett_ms", 0.0))
+        vec[_idx("qtc_ms")]              = float(summary.get("qtc_ms") or summary.get("qtc_bazett_ms", 0.0))
         vec[_idx("p_wave_amplitude_mv")] = float(summary.get("p_wave_amplitude_mv", 0.0))
         vec[_idx("t_wave_amplitude_mv")] = float(summary.get("t_wave_amplitude_mv", 0.0))
         vec[_idx("st_deviation_mv")]     = float(summary.get("st_deviation_mv", 0.0))

@@ -22,7 +22,6 @@ from werkzeug.utils import secure_filename
 from typing import List, Dict, Any, Tuple
 import warnings
 import psycopg2
-import subprocess
 
 # XAI – Option A (clinical text + model prediction)
 from xai import explain_decision, generate_detailed_ledger
@@ -788,44 +787,33 @@ def get_segment_api(segment_id: int):
         except:
             r_peaks_arr = np.array([], dtype=int)
 
-    # Calculate LIVE Heart Rate
+    # Vitals: computed live via NeuroKit2 — independent of stored features_json
+    # HR from RR intervals (R-peaks already detected above)
+    mean_hr = 0.0
     if len(r_peaks_arr) >= 2:
         rr_intervals = np.diff(r_peaks_arr)
-        mean_rr = np.mean(rr_intervals)
-        if mean_rr > 0:
-            mean_hr = 60.0 * seg_fs / mean_rr
+        rr_valid = rr_intervals[(rr_intervals > seg_fs * 0.2) & (rr_intervals < seg_fs * 3.0)]
+        if len(rr_valid) > 0:
+            mean_hr = float(60.0 * seg_fs / np.mean(rr_valid))
+
+    # QRS duration: live NeuroKit2 DWT delineation
+    _sig_arr = np.array(raw_signal, dtype=np.float32)
+    qrs_mean_ms = 0.0
     try:
-        pr_interval_ms = _calculate_pr_interval(np.array(raw_signal), r_peaks_arr, seg_fs)
+        qrs_durations = _compute_qrs_durations(_sig_arr, r_peaks_arr, seg_fs)
+        if qrs_durations is not None and len(qrs_durations) > 0:
+            qrs_mean_ms = float(np.median(qrs_durations))
     except Exception:
-        pr_interval_ms = 0.0
+        pass
 
-    # QRS width from features (robust to None/NaN)
-    # QRS width from features (robust to None/NaN) -- RECALCULATED ON THE FLY with NeuroKit
-    # Note: We prioritize recomputing it to fix old data issues in dashboard
+    # PR interval: live NeuroKit2 DWT delineation
+    pr_interval_ms = 0.0
     try:
-        qrs_durations = _compute_qrs_durations(np.array(raw_signal), r_peaks_arr, seg_fs)
-        if len(qrs_durations) > 0:
-            # Use MEDIAN for robustness against delineation errors
-            qrs_mean_ms = float(np.nanmedian(qrs_durations))
-        else:
-             # Fallback to stored features if NeuroKit returns nothing (rare)
-             # Try scalar qrs_duration_ms first (always in features_json), then list fallback
-             scalar_qrs = features.get("qrs_duration_ms")
-             if scalar_qrs is not None and not np.isnan(float(scalar_qrs)) and float(scalar_qrs) > 0:
-                 qrs_mean_ms = float(scalar_qrs)
-             else:
-                 qrs_mean_ms = 0.0
-                 qrs_list = features.get("qrs_durations_ms")
-                 if isinstance(qrs_list, list):
-                     q_clean = [float(v) for v in qrs_list if v is not None and not np.isnan(float(v))]
-                     if q_clean:
-                         qrs_mean_ms = float(sum(q_clean)/len(q_clean))
-    except Exception as e:
-        qrs_mean_ms = float(features.get("mean_qrs", 0.0))
-
-    # NaN Guards for JSON compliance
-    if np.isnan(qrs_mean_ms): qrs_mean_ms = 0.0
-    if np.isnan(pr_interval_ms): pr_interval_ms = 0.0
+        pr_val = _calculate_pr_interval(_sig_arr, r_peaks_arr, seg_fs)
+        if pr_val is not None and pr_val > 0:
+            pr_interval_ms = float(pr_val)
+    except Exception:
+        pass
 
     # constructing structured response for frontend
     vitals = {
@@ -879,27 +867,25 @@ def get_segment_api(segment_id: int):
             r_label = ml_prediction.get("rhythm", {}).get("label", "Unknown")
 
             # Build clinical features for the rules engine
+            # Use V3 features already stored in features_json — avoids re-running
+            # NeuroKit2 delineation separately (which would be inconsistent with the
+            # V3 pipeline used for model training).
             rr_intervals_ms = []
             if len(r_peaks_arr) >= 2:
                 rr_intervals_ms = (np.diff(r_peaks_arr) * 1000.0 / seg_fs).tolist()
 
-            try:
-                qrs_dur_list = _compute_qrs_durations(np.array(raw_signal), r_peaks_arr, seg_fs).tolist()
-            except Exception:
-                qrs_dur_list = []
-
-            try:
-                per_beat_pr_ms = _get_per_beat_pr_ms(np.array(raw_signal), r_peaks_arr, seg_fs)
-            except Exception:
-                per_beat_pr_ms = []
-
             clinical_features = {
-                "mean_hr": mean_hr,
-                "pr_interval": pr_interval_ms,
-                "per_beat_pr_ms": per_beat_pr_ms,
-                "rr_intervals_ms": rr_intervals_ms,
-                "qrs_durations_ms": qrs_dur_list,
-                "fs": seg_fs,
+                "mean_hr":            features.get("mean_hr_bpm") or mean_hr,
+                "pr_interval":        features.get("pr_interval_ms") or pr_interval_ms,
+                "per_beat_pr_ms":     [],
+                "rr_intervals_ms":    rr_intervals_ms,
+                "qrs_durations_ms":   [features.get("mean_qrs_duration_ms")] if features.get("mean_qrs_duration_ms") else [],
+                "qrs_duration_ms":    features.get("mean_qrs_duration_ms") or features.get("qrs_duration_ms"),
+                "p_wave_present_ratio": features.get("p_absent_fraction", 1.0),
+                "r_peaks":            r_peaks_arr.tolist() if len(r_peaks_arr) > 0 else [],
+                "pvc_score_mean":     features.get("pvc_score_mean"),
+                "pac_score_mean":     features.get("pac_score_mean"),
+                "fs":                 seg_fs,
             }
 
             sqi_result = {"is_acceptable": True, "overall_sqi": 1.0}
@@ -1246,38 +1232,10 @@ def api_prev_segment(segment_id: int):
 # Retrain Model Endpoint (Button in UI)
 # =========================================================
 
-@app.route("/api/retrain_model", methods=["GET", "POST"])
-def api_retrain_model():
-    """
-    Called by dashboard "Retrain Model Using Corrected Segments" button.
-
-    Pipeline:
-      1) export_corrected_segments()  -> retraining_data/
-      2) run retrain_model.py         -> models_training/outputs/checkpoints/best_model_{rhythm|ectopy}.pth
-      3) xai.reset_model()            -> reload new weights on next XAI call
-    """
-    try:
-        # 🔒 ISSUE 4: Retraining Gate enforcement
-        count = db_service.count_confirmed_cardiologist_events()
-        if count < 10: 
-            return jsonify({
-                "error": f"Insufficient data. Need at least 10 cardiologist-confirmed events (Current: {count})."
-            }), 400
-
-        script_path = BASE_DIR / "models_training" / "retrain.py"
-
-        with open("training_log.txt", "w") as log_file:
-            for task in ["rhythm", "ectopy"]:
-                subprocess.Popen(
-                    [sys.executable, str(script_path), "--task", task],
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(BASE_DIR / "models_training")
-                )
-
-        return jsonify({"status": "ok", "message": "Training started for both rhythm and ectopy! Check training_log.txt for progress."})
-    except Exception as e:
-        return jsonify({"error": str(e)})
+# Retrain endpoint removed — training is done via command line:
+#   python models_training/retrain_v2.py --task rhythm --mode initial
+#   python models_training/retrain_v2.py --task ectopy --mode initial
+#   python models_training/retrain_v2.py --task rhythm --mode finetune  (after collecting more data)
 
 
 @app.route("/api/update_rpeaks", methods=["POST"])

@@ -1,18 +1,72 @@
 import numpy as np
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from decision_engine.models import Event, EventCategory, DisplayState
 
 # =============================================================================
 # 1. RULE-BASED EVENT DERIVATION
 # =============================================================================
 
-def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
+def _detect_flutter_waves(signal: np.ndarray, r_peaks: np.ndarray, fs: int) -> bool:
+    """
+    Detects atrial flutter waves via spectral analysis of QRS-blanked signal.
+    AFL = organized atrial rate 250-350 bpm → dominant FFT peak at 4-6 Hz.
+    """
+    if len(signal) < fs or len(r_peaks) == 0:
+        return False
+    try:
+        blanked = signal.copy().astype(np.float64)
+        for peak in r_peaks:
+            s = max(0, int(peak) - int(0.10 * fs))
+            e = min(len(blanked), int(peak) + int(0.15 * fs))
+            blanked[s:e] = 0.0
+        freqs = np.fft.rfftfreq(len(blanked), 1.0 / fs)
+        psd   = np.abs(np.fft.rfft(blanked)) ** 2
+        band  = (freqs >= 4.0) & (freqs <= 6.5)   # 240–390 atrial bpm
+        if not band.any():
+            return False
+        nonzero = psd[psd > 0]
+        if len(nonzero) == 0:
+            return False
+        return float(psd[band].max()) > 2.5 * float(np.median(nonzero))
+    except Exception:
+        return False
+
+
+def _classify_compensatory_pause(
+    beat_seq_idx: int,
+    r_peaks: np.ndarray,
+    normal_rr: float,
+) -> Optional[str]:
+    """
+    Returns 'PVC', 'PAC', or None based on compensatory pause analysis.
+    PVC → full compensatory pause (SA node NOT reset): RR_before + RR_after ≈ 2×normal_RR
+    PAC → incomplete pause (SA node IS reset): sum < 1.8×normal_RR
+    """
+    if beat_seq_idx <= 0 or beat_seq_idx >= len(r_peaks) - 1 or normal_rr <= 0:
+        return None
+    rr_before = float(r_peaks[beat_seq_idx] - r_peaks[beat_seq_idx - 1])
+    rr_after  = float(r_peaks[beat_seq_idx + 1] - r_peaks[beat_seq_idx])
+    total = rr_before + rr_after
+    if total >= 1.85 * normal_rr:   # full compensatory → ventricular origin
+        return "PVC"
+    if total <= 1.60 * normal_rr:   # incomplete → atrial origin
+        return "PAC"
+    return None  # ambiguous — trust ML
+
+
+def derive_rule_events(
+    features: Dict[str, Any],
+    signal: Optional[np.ndarray] = None,
+    r_peaks: Optional[np.ndarray] = None,
+    fs: int = 125,
+) -> List[Event]:
     """
     Analyzes clinical features to detect arrhythmias strictly via rules.
-    Only fires for Pause — all other arrhythmias (AF, BBB, AV Blocks) are
-    predicted directly by the ML rhythm model and no longer duplicated here.
-    Pattern arrhythmias (SVT/VT/NSVT/Bigeminy) are handled in apply_ectopy_patterns().
+    - Pause: detected via RR >2000ms
+    - AF safety net: RR irregularity + absent P-waves (fallback when ML misses AF)
+    - Atrial Flutter: spectral detection of flutter waves in QRS-blanked signal
+    Pattern arrhythmias (VT/NSVT/Bigeminy etc.) are handled in apply_ectopy_patterns().
     """
     events = []
 
@@ -20,19 +74,6 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
     rr_arr = np.array([])
     if isinstance(rr_intervals, list) and len(rr_intervals) > 2:
         rr_arr = np.array([x for x in rr_intervals if x is not None and isinstance(x, (int, float))])
-
-    # ---------------------------------------------------------
-    # AF, BBB, and AV Block rules have been REMOVED.
-    # These arrhythmias are predicted directly by the ML rhythm model
-    # (classes trained in CNNTransformerClassifier). Duplicating them here
-    # caused false positives from noisy clinical measurements (PR=0 from
-    # missed P-waves, QRS width from NeuroKit delineation error, etc.)
-    # and created contradictions when the rule fired but the model did not.
-    #
-    # What remains: only Pause (model never predicts this) and the
-    # pattern arrhythmias in apply_ectopy_patterns() (SVT/VT/NSVT/
-    # Bigeminy/Trigeminy — the model also never predicts these directly).
-    # ---------------------------------------------------------
 
     # ---------------------------------------------------------
     # Pause
@@ -45,8 +86,45 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
             start_time=0.0, end_time=10.0,
             rule_evidence={"rule": "Pause_Detected"},
             priority=85,
-            used_for_training=False # Never train on Pause
+            used_for_training=False
         ))
+
+    # ---------------------------------------------------------
+    # AF Safety Net: irregularly irregular RR + absent P-waves
+    # Fires when ML misses AF (only 5 corrected AF segments in training data).
+    # Masterclass criterion: RR std >160ms + p_wave_present_ratio <0.4 = AF.
+    # ---------------------------------------------------------
+    if len(rr_arr) >= 4:
+        rr_std = float(np.std(rr_arr))
+        p_ratio = float(features.get("p_wave_present_ratio") or 1.0)
+        if rr_std > 160 and p_ratio < 0.4:
+            events.append(Event(
+                event_id=str(uuid.uuid4()),
+                event_type="Atrial Fibrillation",
+                event_category=EventCategory.RHYTHM,
+                start_time=0.0, end_time=10.0,
+                rule_evidence={"rule": "AF_RR_Irregularity", "rr_std_ms": round(rr_std, 1), "p_wave_ratio": round(p_ratio, 2)},
+                priority=88,
+                used_for_training=False
+            ))
+
+    # ---------------------------------------------------------
+    # Atrial Flutter: spectral detection (FFT on QRS-blanked signal)
+    # AFL = ventricular rate 130-175 bpm (2:1 block) + flutter waves at 4-6 Hz.
+    # ---------------------------------------------------------
+    mean_hr = float(features.get("mean_hr_bpm") or 0)
+    if 130 <= mean_hr <= 175 and signal is not None and r_peaks is not None and len(r_peaks) > 0:
+        r_peaks_arr = np.asarray(r_peaks, dtype=int)
+        if _detect_flutter_waves(np.asarray(signal, dtype=np.float32), r_peaks_arr, fs):
+            events.append(Event(
+                event_id=str(uuid.uuid4()),
+                event_type="Atrial Flutter",
+                event_category=EventCategory.RHYTHM,
+                start_time=0.0, end_time=10.0,
+                rule_evidence={"rule": "AFL_Spectral_Detected", "mean_hr_bpm": round(mean_hr, 1)},
+                priority=87,
+                used_for_training=False
+            ))
 
     return events
 
@@ -55,7 +133,7 @@ def derive_rule_events(features: Dict[str, Any]) -> List[Event]:
 # 2. ECTOPY PATTERN RECOGNITION
 # =============================================================================
 
-def apply_ectopy_patterns(events: List[Event]) -> None:
+def apply_ectopy_patterns(events: List[Event], clinical_features: Optional[Dict[str, Any]] = None) -> None:
     """
     Scans ECTOPY events and applies pattern labels.
 
@@ -63,7 +141,59 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
     PVC: 2=Couplet, 3=Ventricular Run, 4-10=NSVT, 11+=VT
     PAC: 2=Atrial Couplet, 3-5=Atrial Run, 6-10=PSVT, 11+=SVT
     Bigeminy/Trigeminy/Quadrigeminy: interspersed patterns via beat_indices diffs
+
+    Clinical validation (when clinical_features provided):
+    - QRS width check: PVC must have QRS >80ms; PAC must have QRS ≤150ms
+    - Compensatory pause: full=PVC, incomplete=PAC (overrides ML when ambiguous)
+    - VT/NSVT require wide complex (QRS >110ms); narrow-complex → downgrade to SVT/PSVT
     """
+    if clinical_features is None:
+        clinical_features = {}
+
+    # ── Clinical feature extraction for PVC/PAC validation ──
+    qrs_ms      = float(clinical_features.get("qrs_duration_ms") or
+                        clinical_features.get("mean_qrs_duration_ms") or 0)
+    r_peaks_raw = clinical_features.get("r_peaks", [])
+    r_peaks_arr = np.array(r_peaks_raw, dtype=int) if r_peaks_raw else np.array([], dtype=int)
+    normal_rr   = float(np.median(np.diff(r_peaks_arr))) if len(r_peaks_arr) > 2 else 0.0
+
+    # V3 beat discriminator scores (from feature vector — pre-computed)
+    # These already aggregate p_absent, compensatory_pause, t_discordance etc.
+    pvc_score = float(clinical_features.get("pvc_score_mean") or 0)
+    pac_score = float(clinical_features.get("pac_score_mean") or 0)
+
+    # ── Per-beat PVC/PAC correction via QRS width + V3 discriminators ────────
+    for ev in events:
+        if ev.event_category != EventCategory.ECTOPY:
+            continue
+        label = ev.event_type
+        if label not in ("PVC", "PAC"):
+            continue
+
+        # Stage 1: Hard QRS-width rule (electrophysiology: PVC >120ms, PAC <120ms)
+        if label == "PVC" and 0 < qrs_ms < 80:
+            ev.event_type = "PAC"   # Too narrow for ventricular origin
+            continue
+        if label == "PAC" and qrs_ms > 150:
+            ev.event_type = "PVC"   # Too wide for atrial origin
+            continue
+
+        # Stage 2: Ambiguous width (80–150 ms) — use V3 discriminator scores
+        if 80 <= qrs_ms <= 150:
+            if pvc_score > 0 or pac_score > 0:
+                # V3 scores available: trust them
+                if pvc_score > pac_score + 0.15:
+                    ev.event_type = "PVC"
+                elif pac_score > pvc_score + 0.15:
+                    ev.event_type = "PAC"
+                # else: keep ML label (scores too close to override)
+            elif normal_rr > 0 and ev.beat_indices:
+                # Fallback: compensatory pause tiebreaker
+                pause_result = _classify_compensatory_pause(
+                    ev.beat_indices[0], r_peaks_arr, normal_rr)
+                if pause_result:
+                    ev.event_type = pause_result
+
     ectopy = sorted(
         [e for e in events if e.event_category == EventCategory.ECTOPY],
         key=lambda e: e.start_time
@@ -158,14 +288,18 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
             elif is_consecutive and target_type == "PVC":
                 if count >= 11 and rate >= 100:
                     # VT: 11+ consecutive PVCs at rate >= 100 bpm
+                    # Masterclass: any wide-complex tachycardia is VT. Narrow-complex → SVT.
+                    run_label = "VT"
+                    if 0 < qrs_ms < 110:
+                        run_label = "SVT"   # Narrow complex — cannot be VT
                     new_event = Event(
                         event_id=str(uuid.uuid4()),
-                        event_type="VT",
+                        event_type=run_label,
                         event_category=EventCategory.RHYTHM,
                         start_time=cluster[0].start_time,
                         end_time=cluster[-1].end_time,
                         pattern_label="Run",
-                        rule_evidence={"rule": "VT_Detected", "count": count, "rate": round(rate, 1)},
+                        rule_evidence={"rule": f"{run_label}_Detected", "count": count, "rate": round(rate, 1), "qrs_ms": round(qrs_ms, 1)},
                         priority=100,
                         used_for_training=False,
                     )
@@ -173,14 +307,17 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
                     for e in cluster: e.pattern_label = "Run"
                 elif count >= 4 and rate >= 100:
                     # NSVT: 4-10 consecutive PVCs at rate >= 100 bpm
+                    run_label = "NSVT"
+                    if 0 < qrs_ms < 110:
+                        run_label = "PSVT"  # Narrow complex — cannot be NSVT
                     new_event = Event(
                         event_id=str(uuid.uuid4()),
-                        event_type="NSVT",
+                        event_type=run_label,
                         event_category=EventCategory.RHYTHM,
                         start_time=cluster[0].start_time,
                         end_time=cluster[-1].end_time,
                         pattern_label="Run",
-                        rule_evidence={"rule": "NSVT_Detected", "count": count, "rate": round(rate, 1)},
+                        rule_evidence={"rule": f"{run_label}_Detected", "count": count, "rate": round(rate, 1), "qrs_ms": round(qrs_ms, 1)},
                         priority=90,
                         used_for_training=False,
                     )
@@ -286,7 +423,7 @@ def apply_ectopy_patterns(events: List[Event]) -> None:
 # 3. DISPLAY ARBITRATION RULES
 # =============================================================================
 
-def apply_display_rules(background_rhythm: str, events: List[Event]) -> List[Event]:
+def apply_display_rules(_background_rhythm: str, events: List[Event]) -> List[Event]:
     # Pass 1: Global Hierarchy & Veto
     has_af = any(e.event_type in ["AF", "Atrial Fibrillation", "Atrial Flutter"] for e in events)
     has_svt = any(e.event_type in ["SVT", "PSVT", "Atrial Run"] for e in events)
@@ -358,23 +495,27 @@ def apply_training_flags(events: List[Event]) -> None:
     and the Rhythm specialist on Runs/Rhythms.
     """
     training_set = {
-        # Atrial (beat-level ectopy — trains ectopy model)
-        "PAC", "Atrial Couplet",           # "PAC Couplet" renamed to "Atrial Couplet" in rules
+        # Atrial ectopy — trains ectopy model (PAC class)
+        "PAC", "Atrial Couplet",
         "PAC Bigeminy", "PAC Trigeminy", "PAC Quadrigeminy",
-        "AF", "Atrial Fibrillation", "Atrial Flutter",
 
-        # Ventricular (beat-level ectopy — trains ectopy model)
+        # Ventricular ectopy — trains ectopy model (PVC class)
         "PVC", "PVC Couplet",
         "PVC Bigeminy", "PVC Trigeminy", "PVC Quadrigeminy",
-        "Ventricular Fibrillation",
 
-        # Blocks — train the rhythm model (indices 6-10 in RHYTHM_CLASS_NAMES)
+        # Rhythm labels — train the rhythm model
+        "AF", "Atrial Fibrillation", "Atrial Flutter",
+        "Ventricular Fibrillation",
+        # VT and NSVT annotated by cardiologist → train rhythm model (VT class)
+        "VT", "Ventricular Tachycardia", "NSVT",
+
+        # Blocks — train the rhythm model (indices 7-11 in RHYTHM_CLASS_NAMES)
         "1st Degree AV Block", "2nd Degree AV Block Type 1",
         "2nd Degree AV Block Type 2", "3rd Degree AV Block",
         "Bundle Branch Block",
 
-        # NOTE: SVT, VT, NSVT, PSVT, Ventricular Run, Atrial Run are
-        # RULES-ONLY and should NOT train the ML models.
+        # NOTE: SVT, PSVT, Ventricular Run, Atrial Run are RULES-ONLY pattern
+        # labels derived from clustering; they are NOT trained directly.
     }
     for event in events:
         # Never train on Sinus or Artifact as primary labels to avoid baseline bias

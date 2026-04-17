@@ -217,6 +217,23 @@ def _extract_single_beat(
             if p_onset_fallback < r_onset:
                 p_onset = p_onset_fallback
 
+    # Secondary P-wave search: look for hidden P in preceding T-wave (aberrant PAC detection)
+    # Masterclass: PAC can hide its P-wave in the T-wave of the preceding beat (R_prev+200ms to R_prev+350ms)
+    if p_onset is None and beat_idx > 0 and r_onset is not None:
+        prev_r = r_peaks[beat_idx - 1]
+        tw_start = prev_r + int(0.20 * fs)
+        tw_end   = min(prev_r + int(0.35 * fs), r_onset - int(0.04 * fs))
+        if tw_start < tw_end and tw_end <= len(smooth):
+            region = smooth[tw_start:tw_end]
+            if len(region) > 0 and (region.max() - region.min()) > 0.05:  # >50µV deformation
+                pk = int(np.argmax(region)) + tw_start
+                p_onset_fallback  = max(0, pk - int(0.02 * fs))
+                p_offset_fallback = min(len(raw) - 1, pk + int(0.02 * fs))
+                if p_onset_fallback < r_onset:
+                    p_onset  = p_onset_fallback
+                    if p_offset is None:
+                        p_offset = p_offset_fallback
+
     # Fallback for P-offset: estimate as 60ms after P-onset
     if p_offset is None and p_onset is not None:
         p_offset_fallback = min(len(raw) - 1, p_onset + int(0.060 * fs))
@@ -275,7 +292,7 @@ def _extract_single_beat(
     if r_onset is not None and r_offset is not None and r_offset > r_onset:
         beat["qrs_duration_ms"] = (r_offset - r_onset) * 1000.0 / fs
         # Validate: QRS duration physiologically impossible?
-        if beat["qrs_duration_ms"] < 40 or beat["qrs_duration_ms"] > 200:
+        if beat["qrs_duration_ms"] < 40 or beat["qrs_duration_ms"] > 300:
             beat["qrs_duration_ms"] = None
     else:
         beat["qrs_duration_ms"] = None
@@ -316,7 +333,7 @@ def _extract_single_beat(
         qt_ms = (t_offset - r_onset) * 1000.0 / fs
         beat["qt_interval_ms"] = qt_ms
 
-        # QTc (Bazett): QTc = QT / sqrt(RR in seconds)
+        # QTc (Fridericia): QTc = QT / RR^(1/3) — more accurate than Bazett at high/low HR
         if beat_idx < n_beats - 1:
             rr_s = (r_peaks[beat_idx + 1] - r_peaks[beat_idx]) / fs
         elif beat_idx > 0:
@@ -325,12 +342,12 @@ def _extract_single_beat(
             rr_s = 0.0
 
         if rr_s > 0:
-            beat["qtc_bazett_ms"] = qt_ms / np.sqrt(rr_s)
+            beat["qtc_ms"] = qt_ms / (rr_s ** (1.0 / 3.0))
         else:
-            beat["qtc_bazett_ms"] = None
+            beat["qtc_ms"] = None
     else:
         beat["qt_interval_ms"] = None
-        beat["qtc_bazett_ms"] = None
+        beat["qtc_ms"] = None
 
     # --- RR interval ---
     if beat_idx < n_beats - 1:
@@ -384,9 +401,10 @@ def _summarize(per_beat: List[dict], r_peaks: np.ndarray, fs: int) -> Dict[str, 
     summary["t_wave_amplitude_mv"] = med("t_wave_amplitude_mv")
     summary["t_wave_flag"] = _flag(summary["t_wave_duration_ms"], "t_wave_duration_ms")
 
-    # QTc
-    summary["qtc_bazett_ms"] = med("qtc_bazett_ms")
-    summary["qtc_flag"] = _flag(summary["qtc_bazett_ms"], "qtc_ms")
+    # QTc (Fridericia) — primary key is qtc_ms; qtc_bazett_ms kept as alias for backward compat
+    summary["qtc_ms"] = med("qtc_ms")
+    summary["qtc_bazett_ms"] = summary["qtc_ms"]   # alias — existing code reading qtc_bazett_ms still works
+    summary["qtc_flag"] = _flag(summary["qtc_ms"], "qtc_ms")
 
     # RR / HR
     rr_vals = [b.get("rr_interval_ms") for b in per_beat if b.get("rr_interval_ms") is not None]
@@ -431,7 +449,8 @@ def _empty_summary() -> Dict[str, Any]:
         "t_wave_duration_ms": 0.0,
         "t_wave_amplitude_mv": 0.0,
         "t_wave_flag": "unavailable",
-        "qtc_bazett_ms": 0.0,
+        "qtc_ms": 0.0,
+        "qtc_bazett_ms": 0.0,  # alias
         "qtc_flag": "unavailable",
         "rr_interval_ms": 0.0,
         "rr_flag": "unavailable",
