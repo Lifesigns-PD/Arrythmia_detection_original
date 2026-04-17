@@ -571,8 +571,15 @@
                         </optgroup>
 
                         <optgroup label="--- Ventricular Rhythms ---">
+                            <option value="Ventricular Tachycardia">Ventricular Tachycardia (VT)</option>
                             <option value="Ventricular Fibrillation">Ventricular Fibrillation (VF)</option>
                             <option value="Idioventricular Rhythm">Idioventricular Rhythm (IVR)</option>
+                            <option value="NSVT">NSVT (Non-Sustained VT)</option>
+                        </optgroup>
+
+                        <optgroup label="--- Supraventricular Tachycardias ---">
+                            <option value="Supraventricular Tachycardia">SVT (Supraventricular Tachy)</option>
+                            <option value="PSVT">PSVT (Paroxysmal SVT)</option>
                         </optgroup>
 
                         <optgroup label="--- Conduction Blocks ---">
@@ -600,7 +607,7 @@
                         </optgroup>
 
                         <optgroup label="--- Common Combinations ---">
-                            <option value="Sinus Bradycardia + PVC">Bradicardia + PVC</option>
+                            <option value="Sinus Bradycardia + PVC">Bradycardia + PVC</option>
                             <option value="Sinus Tachycardia + PVC">Tachycardia + PVC</option>
                             <option value="Atrial Fibrillation + PVC">AFib + PVC</option>
                             <option value="1st Degree AV Block + PVC">1st Degree Block + PVC</option>
@@ -804,7 +811,8 @@
 
                 // Populate currentDecision from backend response
                 // The backend now runs the full orchestrator pipeline (ML + rules)
-                // so events already include pattern labels (PVC Bigeminy, NSVT, etc.)
+                // so events already include pattern labels (PVC Bigeminy, SVT, etc.)
+                // Note: VT/NSVT are rhythm classifications, not pattern events
                 if (!currentDecision) currentDecision = {};
                 currentDecision.final_display_events = data.events || [];
                 currentDecision.background_rhythm = data.background_rhythm || "Sinus Rhythm";
@@ -1472,8 +1480,8 @@
 
                 // Always use the DROPDOWN value as the rhythm background sent to the
                 // rules engine. The dropdown is the cardiologist's explicit rhythm choice
-                // (Sinus Rhythm, AF, etc.) and must NOT be overridden by ectopy patterns
-                // (PVC Bigeminy, NSVT, etc.) that pattern detection returns.
+                // (Sinus Rhythm, AF, VT, etc.) and must NOT be overridden by ectopy patterns
+                // (PVC Bigeminy, SVT, etc.) that pattern detection returns.
                 const sel = document.getElementById("diagnosis-select");
                 const rhythmBg = (sel && sel.value) ? sel.value : (currentDecision.background_rhythm || "Sinus Rhythm");
 
@@ -1511,9 +1519,11 @@
                 if (!currentDecision || !currentDecision.final_display_events) return;
 
                 // ---------------------------------------------------------
-                // BACKEND-FIRST: Pattern detection (PVC Bigeminy, NSVT, etc.)
+                // BACKEND-FIRST: Pattern detection (PVC Bigeminy, SVT, etc.)
                 // is now done by the backend rules engine. The dashboard only
                 // displays the result. No V/N/A sequence matching here.
+                // Note: VT/NSVT are rhythm classifications handled by rhythm model,
+                // not pattern detection.
                 // ---------------------------------------------------------
 
                 const events = currentDecision.final_display_events;
@@ -1839,12 +1849,16 @@
                     // Ectopy labels (PVC, PAC, PVC Bigeminy) go via events_json → ectopy model.
                     // The dropdown may contain ectopy labels for display, but we send
                     // the actual background rhythm for training.
+                    // ECTOPY_LABELS: beat-pattern events (bigeminy, couplet, run, SVT/PSVT as PAC patterns)
+                    // VT/NSVT are RHYTHM classifications, not ectopy events — excluded from this set
                     const ECTOPY_LABELS = new Set([
                         "PVC", "PAC", "PVC Bigeminy", "PVC Trigeminy", "PVC Couplet",
                         "PVC Quadrigeminy", "PAC Bigeminy", "PAC Trigeminy", "PAC Quadrigeminy",
                         "PAC Couplet", "Atrial Couplet", "Ventricular Run", "Atrial Run", "None",
-                        "NSVT", "PSVT", "SVT", "Supraventricular Tachycardia",
-                        "VT", "Ventricular Tachycardia"
+                        "PSVT", "SVT", "Supraventricular Tachycardia"
+                        // NOTE: "VT", "Ventricular Tachycardia", "NSVT" are REMOVED
+                        // These are rhythm classifications, not ectopy patterns.
+                        // They go to arrhythmia_label, not events_json.
                     ]);
                     const dropdownLabel = label || "Sinus Rhythm";
                     const rhythmForTraining = ECTOPY_LABELS.has(dropdownLabel)

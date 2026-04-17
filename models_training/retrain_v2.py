@@ -38,6 +38,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
+import joblib
+from sklearn.preprocessing import StandardScaler
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
@@ -49,10 +51,24 @@ from data_loader import (
     ECTOPY_CLASS_NAMES, get_ectopy_label_idx, ECTOPY_INDEX,
 )
 from models_v2 import CNNTransformerWithFeatures, load_v2_from_v1_checkpoint
-from signal_processing.cleaning import clean_signal
-from signal_processing.feature_extraction import (
-    extract_feature_vector, NUM_FEATURES, FEATURE_NAMES,
+from signal_processing_v3 import process_ecg_v3
+from signal_processing_v3.features.extraction import (
+    feature_dict_to_vector,
+    FEATURE_NAMES_V3 as FEATURE_NAMES,
 )
+NUM_FEATURES = len(FEATURE_NAMES)
+
+
+def clean_signal(sig, fs):
+    """V3 preprocessing replaces V2 clean_signal."""
+    from signal_processing_v3.preprocessing.pipeline import preprocess_v3
+    return preprocess_v3(sig, fs=fs)["cleaned"].astype(np.float32)
+
+
+def extract_feature_vector(sig, fs=125, r_peaks=None):
+    """V3 feature extractor — drop-in replacement for V2 extract_feature_vector."""
+    result = process_ecg_v3(sig, fs=fs, min_quality=0.0)
+    return feature_dict_to_vector(result["features"])
 
 # ---------------------------------------------------------------------------
 # Paths & DB
@@ -145,6 +161,7 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
         self.augment = augment
         self.task    = task
         self.samples = []  # (signal, features, label, source, seg_id, filename)
+        self.scaler  = None  # Set by run_initial/run_finetune after fitting
         self.training_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         print(f"\n[DatasetV2] task={task}  filter={source_filter}")
@@ -257,9 +274,22 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                     if label_idx is not None:
                         try:
                             windows = self._slide_windows(signal, 0.0, 10.0, fs)
+                            # Use stored V3 features from features_json when available.
+                            # The full segment window is identical to what was backfilled,
+                            # so re-running process_ecg_v3 is redundant and slow.
+                            stored_feat = None
+                            if features_json_raw:
+                                try:
+                                    fj = features_json_raw if isinstance(features_json_raw, dict) else json.loads(features_json_raw)
+                                    stored_feat = feature_dict_to_vector(fj)
+                                except Exception:
+                                    stored_feat = None
                             for win in windows:
                                 if win is not None:
-                                    feat = extract_feature_vector(win, fs=self.TARGET_FS, r_peaks=None)
+                                    if stored_feat is not None:
+                                        feat = stored_feat
+                                    else:
+                                        feat = extract_feature_vector(win, fs=self.TARGET_FS, r_peaks=None)
                                     self.samples.append((
                                         win, feat, label_idx, "cardiologist",
                                         seg_id, filename or ""
@@ -334,20 +364,45 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                     log_load_error("feature_extract_errors", seg_id, f"{event_type}: {str(e)}")
                     continue
 
-        # ── ECTOPY ONLY: Add None-class beats from cardiologist-verified sinus segments ──
-        # The ectopy model previously had 0 None-class training samples — it had never
-        # seen a normal beat, forcing it to always choose PVC or PAC (hallucination source).
+        # ── ECTOPY ONLY: Add None-class beats from unannotated sinus segments ──
+        # Use unannotated sinus-labeled segments (15K+ available) instead of the
+        # verified set — no data leakage with rhythm model, no manual annotation needed.
+        # These segments are safe ground truth for "normal beat" since they are labeled
+        # Sinus Rhythm by the importer. SQI filter drops garbage signal.
         if self.task == "ectopy":
             none_candidates = []
-            sinus_labels = {"Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia", "Normal"}
             from scipy.signal import find_peaks as _find_peaks
 
-            for row_data in rows:
-                seg_id, signal_raw, events_json_raw, arrhythmia_label, fs, filename, is_corrected, features_json_raw, sqi_score = row_data
+            # Compute cap up front so we can break early
+            pvc_count = sum(1 for s in self.samples if s[2] == ECTOPY_INDEX["PVC"])
+            cap = max(pvc_count * 2, 5000)
 
-                # Only cardiologist-verified sinus segments
-                if not is_corrected or arrhythmia_label not in sinus_labels:
-                    continue
+            import random as _random
+
+            # Fetch unannotated sinus segments — separate from the verified training set
+            with psycopg2.connect(**DB_PARAMS) as _conn:
+                with _conn.cursor() as _cur:
+                    _cur.execute("""
+                        SELECT segment_id, signal_data, events_json, arrhythmia_label,
+                               segment_fs, filename, is_corrected, features_json, sqi_score
+                        FROM   ecg_features_annotatable
+                        WHERE  signal_data IS NOT NULL
+                          AND  (is_corrected = FALSE OR is_corrected IS NULL)
+                          AND  arrhythmia_label IN ('Sinus Rhythm','Sinus Bradycardia','Sinus Tachycardia','Normal')
+                          AND  (sqi_score IS NULL OR sqi_score >= 0.5)
+                        ORDER BY RANDOM()
+                        LIMIT  %s
+                    """, (cap * 3,))  # fetch 3× cap so early-break has enough variety
+                    sinus_rows = _cur.fetchall()
+
+            print(f"[DatasetV2] None-class pool: {len(sinus_rows)} unannotated sinus segments (cap={cap})")
+            _random.shuffle(sinus_rows)
+
+            for row_data in sinus_rows:
+                if len(none_candidates) >= cap:
+                    break
+
+                seg_id, signal_raw, events_json_raw, arrhythmia_label, fs, filename, is_corrected, features_json_raw, sqi_score = row_data
 
                 try:
                     sig = np.array(json.loads(signal_raw) if isinstance(signal_raw, str) else signal_raw, dtype=np.float32)
@@ -394,7 +449,6 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                             r_peaks = np.array(rp, dtype=int)
                 except Exception as e:
                     log_load_error("rpeak_detect_errors", seg_id, f"none-class r_peaks: {str(e)}")
-                    pass
 
                 if r_peaks is None or len(r_peaks) == 0:
                     try:
@@ -404,12 +458,14 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                         log_load_error("rpeak_detect_errors", seg_id, f"find_peaks: {str(e)}")
                         continue
 
-                # ── PREVENT SEGMENT DUPLICATION: Track which segments we use ──
+                # ── PREVENT SEGMENT DUPLICATION ──
                 if seg_id in used_segment_ids:
                     continue
                 used_segment_ids.add(seg_id)
 
                 for r in r_peaks:
+                    if len(none_candidates) >= cap:
+                        break
                     try:
                         win = self._center_window(sig, r / self.TARGET_FS, self.TARGET_FS)
                         if win is not None:
@@ -418,13 +474,6 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                     except Exception as e:
                         log_load_error("feature_extract_errors", seg_id, f"none-class beat: {str(e)}")
                         continue
-
-            # Cap at 2× PVC count to keep training fast; minimum 5,000
-            pvc_count = sum(1 for s in self.samples if s[2] == ECTOPY_INDEX["PVC"])
-            cap = max(pvc_count * 2, 5000)
-            if len(none_candidates) > cap:
-                import random as _random
-                none_candidates = _random.sample(none_candidates, cap)
 
             self.samples.extend(none_candidates)
             total_windows += len(none_candidates)
@@ -513,6 +562,10 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
             sig = self._augment_signal(sig.copy())
             # Re-extract features from augmented signal for consistency
             feat = extract_feature_vector(sig, fs=self.TARGET_FS, r_peaks=None)
+        # Apply feature scaler if fitted (prevents high-magnitude features from
+        # dominating gradient descent; scaler is fit on training split only)
+        if self.scaler is not None:
+            feat = self.scaler.transform(feat.reshape(1, -1))[0].astype(np.float32)
         return {
             "signal":   sig,
             "features": feat,
@@ -712,10 +765,10 @@ def _build_criterion(labels, num_classes, device):
     ca     = np.array([counts.get(i, 0) for i in range(num_classes)], dtype=np.float32)
     ca[ca == 0] = 1.0
     alpha  = torch.tensor(
-        np.clip(np.sqrt(ca.sum() / (num_classes * ca)), 0.5, 5.0),
+        np.clip(np.sqrt(ca.sum() / (num_classes * ca)), 0.5, 15.0),  # raised cap 10→15 for very rare classes
         dtype=torch.float32,
     ).to(device)
-    return FocalLoss(alpha=alpha, gamma=2.0)
+    return FocalLoss(alpha=alpha, gamma=3.0)  # gamma 2.5→3.0: harder penalty on confident wrong predictions
 
 
 # ---------------------------------------------------------------------------
@@ -822,9 +875,22 @@ def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
     for i, name in enumerate(class_names):
         print(f"  {i:02d}  {name:<40}  {counts.get(i, 0):>6}")
 
+    # ── Fit StandardScaler on training features ──────────────────────────────
+    # Feature vector mixes wildly different scales (SDNN ~20–200 ms vs ST
+    # elevation ~±0.5 mV).  Without normalization gradient descent ignores
+    # low-magnitude clinical features.  Scaler is fit on train split only
+    # (never val) and saved for inference.
+    X_train_feats = np.stack([ds.samples[i][1] for i in train_idx])
+    scaler = StandardScaler()
+    scaler.fit(X_train_feats)
+    scaler_path = CHECKPOINTS / f"feature_scaler_{task}.joblib"
+    joblib.dump(scaler, scaler_path)
+    ds.scaler = scaler   # applied in __getitem__ for both train and val
+    print(f"[Scaler] Fit on {len(train_idx)} train windows → {scaler_path.name}")
+
     eff_batch = min(batch_size, max(2, len(train_idx) // 4))
 
-    sampler   = build_sampler(ds.samples, train_idx, num_classes, oversample_factor=2)
+    sampler   = build_sampler(ds.samples, train_idx, num_classes, oversample_factor=6)  # 2→6
     train_ds  = torch.utils.data.Subset(ds, train_idx)
     val_ds    = torch.utils.data.Subset(ds, val_idx)
     train_ldr = DataLoader(train_ds, batch_size=eff_batch, sampler=sampler,   collate_fn=collate_fn_v2)
@@ -843,17 +909,20 @@ def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
         model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=NUM_FEATURES).to(device)
 
     criterion = _build_criterion(train_labels, num_classes, device)
-    opt       = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=4)
+    opt       = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-3)  # 5e-4→5e-3: stronger regularisation
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=5)  # track bal_acc, not loss
 
-    best_bal_acc = 0.0
+    best_bal_acc  = 0.0
+    no_improve    = 0
+    early_stop_patience = 15  # stop if no improvement for 15 epochs
+
     print(f"\nDevice={device}  Batch={eff_batch}  "
           f"Train_windows={len(train_idx)}  Val_windows={len(val_idx)}\n")
 
     for ep in range(1, num_epochs + 1):
         tr = train_epoch(model, opt, criterion, train_ldr, device)
         va = eval_epoch(model, criterion, val_ldr, device, num_classes, class_names)
-        scheduler.step(va["loss"])
+        scheduler.step(va["balanced_acc"])
 
         print(f"Ep {ep:02d}/{num_epochs}  "
               f"train loss={tr['loss']:.4f} acc={tr['acc']:.3f}  "
@@ -861,6 +930,7 @@ def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
 
         if va["balanced_acc"] > best_bal_acc:
             best_bal_acc = va["balanced_acc"]
+            no_improve   = 0
             torch.save({
                 "epoch":        ep,
                 "model_state":  model.state_dict(),
@@ -872,6 +942,11 @@ def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
                 "version":      "v2",
             }, ckpt_path)
             print(f"  → Saved  bal_acc={best_bal_acc:.4f}")
+        else:
+            no_improve += 1
+            if no_improve >= early_stop_patience:
+                print(f"\n[Early Stop] No improvement for {early_stop_patience} epochs. Stopping at ep {ep}.")
+                break
 
     print(f"\n[DONE] Best balanced acc: {best_bal_acc:.4f}  |  Checkpoint: {ckpt_path}")
 
@@ -925,6 +1000,20 @@ def run_finetune(task, num_epochs, batch_size, lr):
     for i, name in enumerate(class_names):
         if counts.get(i, 0) > 0:
             print(f"  {i:02d}  {name:<40}  {counts[i]:>6}")
+
+    # ── Load or refit feature scaler ─────────────────────────────────────────
+    scaler_path = CHECKPOINTS / f"feature_scaler_{task}.joblib"
+    if scaler_path.exists():
+        scaler = joblib.load(scaler_path)
+        print(f"[Scaler] Loaded existing scaler from {scaler_path.name}")
+    else:
+        # Fallback: fit from fine-tune training data (e.g. if initial never ran)
+        X_train_feats = np.stack([ds.samples[i][1] for i in train_idx])
+        scaler = StandardScaler()
+        scaler.fit(X_train_feats)
+        joblib.dump(scaler, scaler_path)
+        print(f"[Scaler] Fit from fine-tune data (no initial scaler found) → {scaler_path.name}")
+    ds.scaler = scaler
 
     eff_batch = min(batch_size, max(2, len(train_idx)))
 
@@ -1014,13 +1103,13 @@ if __name__ == "__main__":
     parser.add_argument("--mode",   choices=["initial", "finetune"], default="finetune")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch",  type=int, default=32)
-    parser.add_argument("--lr",     type=float, default=5e-4)
+    parser.add_argument("--lr",     type=float, default=1e-4)  # 5e-4→1e-4: slower learning prevents overfitting
     parser.add_argument("--bootstrap-v1", action="store_true",
                         help="Bootstrap signal pathway weights from v1 checkpoint (initial mode only)")
     args = parser.parse_args()
 
     if args.epochs is None:
-        args.epochs = 30 if args.mode == "initial" else 10
+        args.epochs = 60 if args.mode == "initial" else 20  # 30→60: more epochs + early stopping handles overfitting
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOGS / f"retrain_v2_{args.task}_{args.mode}_{ts}.log"

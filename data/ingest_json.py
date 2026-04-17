@@ -64,8 +64,8 @@ INSERT_SQL = """
     INSERT INTO ecg_features_annotatable (
         dataset_source, patient_id, filename, segment_index,
         signal_data, raw_signal, features_json,
-        arrhythmia_label, segment_fs, events_json
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        arrhythmia_label, segment_fs, events_json, is_corrected
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
     ON CONFLICT (filename, segment_index) DO NOTHING
     RETURNING segment_id;
 """

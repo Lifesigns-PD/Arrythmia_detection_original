@@ -1,4 +1,5 @@
 import uuid
+import numpy as np
 from typing import Dict, Any
 
 from decision_engine.models import (
@@ -69,8 +70,16 @@ class RhythmOrchestrator:
         decision.background_rhythm = self._detect_background_rhythm(clinical_features)
 
         # 4. Gather Events
-        # A) Rule-Derived Events
-        rule_events = derive_rule_events(clinical_features)
+        # A) Rule-Derived Events — pass signal + r_peaks for AFL spectral detection
+        _signal  = clinical_features.get("_signal")
+        _r_peaks = clinical_features.get("r_peaks")
+        _fs      = int(clinical_features.get("fs", 125))
+        rule_events = derive_rule_events(
+            clinical_features,
+            signal=np.asarray(_signal, dtype=np.float32) if _signal else None,
+            r_peaks=np.asarray(_r_peaks, dtype=int) if _r_peaks else None,
+            fs=_fs,
+        )
         
         # B) ML-Derived Events
         ml_events = []
@@ -83,14 +92,18 @@ class RhythmOrchestrator:
         # higher confidence to fire, reducing costly false positives.
         _RHYTHM_CONF_THRESHOLDS = {
             "Ventricular Fibrillation":      0.90,
-            "VT": 0.90, "Ventricular Tachycardia": 0.90,
+            "VT":                            0.88,
+            "Ventricular Tachycardia":       0.88,
+            "NSVT":                          0.85,
             "Atrial Fibrillation":           0.85,
-            "AF": 0.85, "Atrial Flutter":    0.85,
+            "AF":                            0.85,
+            "Atrial Flutter":                0.85,
             "3rd Degree AV Block":           0.85,
             "2nd Degree AV Block Type 2":    0.85,
             "2nd Degree AV Block Type 1":    0.82,
             "1st Degree AV Block":           0.80,
             "Bundle Branch Block":           0.80,
+            "Sinus Bradycardia":             0.75,  # own class now — lower bar
         }
         required_conf = _RHYTHM_CONF_THRESHOLDS.get(ml_label, 0.80)
         if ml_label not in ["Sinus Rhythm", "Unknown"] and ml_conf > required_conf:
@@ -158,19 +171,26 @@ class RhythmOrchestrator:
         decision.events = rule_events + ml_events
         
         # 5. Apply Complex Logic (Phase 2)
-        apply_ectopy_patterns(decision.events)
+        apply_ectopy_patterns(decision.events, clinical_features)
         
-        # Promote high-priority rule events to background_rhythm
-        # AF, VT, NSVT replace the HR-derived sinus background entirely
-        af_event = next((e for e in decision.events if e.event_type in ["AF", "Atrial Fibrillation", "Atrial Flutter"]), None)
-        if af_event:
+        # Promote high-priority events to background_rhythm
+        # Priority: VF > VT > AF/AFL > NSVT > everything else
+        def _has(event_types):
+            return next((e for e in decision.events if e.event_type in event_types), None)
+
+        vf_event = _has(["Ventricular Fibrillation"])
+        vt_event = _has(["VT", "Ventricular Tachycardia"])
+        af_event = _has(["AF", "Atrial Fibrillation", "Atrial Flutter"])
+        nsvt_event = _has(["NSVT", "Ventricular Run"])
+
+        if vf_event:
+            decision.background_rhythm = "Ventricular Fibrillation"
+        elif vt_event:
+            decision.background_rhythm = "Ventricular Tachycardia"
+        elif af_event:
             decision.background_rhythm = af_event.event_type
-        else:
-            # VT/NSVT: ventricular rhythm replaces sinus background
-            for vt_type in ["VT", "NSVT", "Ventricular Run"]:
-                if any(e.event_type == vt_type for e in decision.events):
-                    decision.background_rhythm = vt_type
-                    break
+        elif nsvt_event:
+            decision.background_rhythm = nsvt_event.event_type
         
         decision.final_display_events = apply_display_rules(
             decision.background_rhythm,
@@ -189,21 +209,31 @@ class RhythmOrchestrator:
         return decision
 
     def _detect_background_rhythm(self, features: Dict[str, Any]) -> str:
-        """Determines background rhythm (Sinus variants) from HR."""
-        hr_val = features.get("mean_hr")
-        hr = float(hr_val) if hr_val is not None else 0.0
-        
+        """
+        Determines background rhythm from HR + P-wave + QRS width.
+        Uses clinical features beyond just rate for Junctional / Idioventricular detection.
+        """
+        hr_val  = features.get("mean_hr") or features.get("mean_hr_bpm")
+        hr      = float(hr_val) if hr_val is not None else 0.0
+        p_ratio = float(features.get("p_wave_present_ratio") or 1.0)
+        qrs_ms  = float(features.get("qrs_duration_ms") or 0)
+
         if hr == 0:
             return "Unknown"
-        
+
         if hr < 60:
-             return "Sinus Bradycardia"
-        elif hr > 150:
-             return "Sinus Tachycardia" # Or SVT, but "Sinus Tachycardia" for background usually
+            # Slow rhythm — check for escape pacemakers
+            if p_ratio < 0.2 and qrs_ms > 120:
+                return "Idioventricular Rhythm"   # Wide-complex ventricular escape
+            if p_ratio < 0.3:
+                return "Junctional Rhythm"        # Narrow, no P-waves, slow
+            return "Sinus Bradycardia"
         elif hr > 100:
-             return "Sinus Tachycardia"
+            return "Sinus Tachycardia"
         else:
-             return "Sinus Rhythm"
+            if p_ratio < 0.2:
+                return "Junctional Rhythm"        # Normal rate but no P-waves
+            return "Sinus Rhythm"
 
     def _create_event_from_ml(self, label: str, ml_prediction: Dict[str, Any]) -> Event:
         """Creates an Event object from ML prediction."""
@@ -215,14 +245,19 @@ class RhythmOrchestrator:
              category = EventCategory.ECTOPY
 
         # Determine Priority
-        # NOTE: SVT/VT/PSVT/NSVT/Run are rules-only, never from ML
         priority = 50
         if label in ["VF", "Ventricular Fibrillation"]:
             priority = 100
-        elif label in ["Atrial Fibrillation", "AFib", "AF", "Atrial Flutter"]:
+        elif label in ["VT", "Ventricular Tachycardia"]:
+            priority = 95
+        elif label == "NSVT":
             priority = 90
+        elif label in ["Atrial Fibrillation", "AFib", "AF", "Atrial Flutter"]:
+            priority = 88
         elif "Block" in label:
             priority = 70
+        elif label in ["Sinus Bradycardia"]:
+            priority = 20
         elif label in ["PVC", "PAC"]:
             priority = 10
             

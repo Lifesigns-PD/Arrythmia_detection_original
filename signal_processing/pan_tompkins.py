@@ -249,7 +249,7 @@ def _adaptive_thresholding(integrated: np.ndarray,
                     # MUCH stricter: if peak is within 150-360 ms of last QRS AND
                     # current peak is > 30% of previous QRS → very likely a T-wave
                     # Only accept if it's significantly larger than previous (rare arrhythmia)
-                    if peak_val_i > 0.30 * integrated[qrs_peaks[-1]]:
+                    if peak_val_i > 0.50 * integrated[qrs_peaks[-1]]:
                         # This is likely a tall T-wave or artifact, not a real QRS
                         is_qrs = False
                     else:

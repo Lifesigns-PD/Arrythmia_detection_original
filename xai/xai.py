@@ -8,11 +8,12 @@ sys.path.append(str(BASE_DIR / "models_training"))
 import numpy as np
 import torch
 import torch.nn.functional as F
+import joblib
 
 from models_training.models_v2 import CNNTransformerWithFeatures
-from models_training.models import CNNTransformerClassifier  # V1 fallback only
 from models_training.data_loader import CLASS_NAMES, RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES, extract_fixed_window, WINDOW_SEC
-from signal_processing.feature_extraction import FEATURE_NAMES, NUM_FEATURES
+from signal_processing_v3.features.extraction import FEATURE_NAMES_V3 as FEATURE_NAMES
+NUM_FEATURES = len(FEATURE_NAMES)
 from decision_engine.models import SegmentDecision, SegmentState, DisplayState
 
 
@@ -25,14 +26,18 @@ from decision_engine.models import SegmentDecision, SegmentState, DisplayState
 # BASE_DIR is defined above as project root
 # CKPT is in models_training/outputs/checkpoints
 # Checkpoints for split models
-RHYTHM_CKPT    = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm_v2.pth"
-ECTOPY_CKPT    = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_ectopy_v2.pth"
-RHYTHM_CKPT_V1 = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm.pth"
-ECTOPY_CKPT_V1 = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_ectopy.pth"
+RHYTHM_CKPT = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_rhythm_v2.pth"
+ECTOPY_CKPT = BASE_DIR / "models_training" / "outputs" / "checkpoints" / "best_model_ectopy_v2.pth"
+
+_CKPT_DIR = BASE_DIR / "models_training" / "outputs" / "checkpoints"
+_RHYTHM_SCALER_PATH = _CKPT_DIR / "feature_scaler_rhythm.joblib"
+_ECTOPY_SCALER_PATH = _CKPT_DIR / "feature_scaler_ectopy.joblib"
 
 _device = None
 _model_rhythm = None
 _model_ectopy = None
+_scaler_rhythm = None   # loaded lazily on first inference call
+_scaler_ectopy = None
 
 _last_cnn_featuremap = None
 _last_attention = None
@@ -81,52 +86,36 @@ _ectopy_mtime = 0
 
 def _load_model(task="rhythm"):
     """
-    Lazily load either the Rhythm or Ectopy specialist model.
+    Lazily load either the Rhythm or Ectopy V3 model.
+    Loads from best_model_rhythm_v2.pth / best_model_ectopy_v2.pth.
+    If checkpoint missing or stale, uses untrained V3 model (no V1 fallback).
     """
     global _model_rhythm, _model_ectopy, _rhythm_mtime, _ectopy_mtime, _is_model_untrained
 
-    ckpt    = RHYTHM_CKPT    if task == "rhythm" else ECTOPY_CKPT
-    ckpt_v1 = RHYTHM_CKPT_V1 if task == "rhythm" else ECTOPY_CKPT_V1
+    ckpt    = RHYTHM_CKPT if task == "rhythm" else ECTOPY_CKPT
     classes = RHYTHM_CLASS_NAMES if task == "rhythm" else ECTOPY_CLASS_NAMES
 
-    # Check modification time
     current_mtime = ckpt.stat().st_mtime if ckpt.exists() else 0
-
-    # Selection
     current_model = _model_rhythm if task == "rhythm" else _model_ectopy
-    stored_mtime = _rhythm_mtime if task == "rhythm" else _ectopy_mtime
+    stored_mtime  = _rhythm_mtime if task == "rhythm" else _ectopy_mtime
 
-    # Reload if model is None OR file has changed
     if current_model is not None and current_mtime == stored_mtime:
         return current_model
 
     device = _init_device()
+    model  = CNNTransformerWithFeatures(num_classes=len(classes), num_features=NUM_FEATURES)
 
-    # Try V2 checkpoint first, fall back to V1 if not available
     if ckpt.exists():
-        model = CNNTransformerWithFeatures(num_classes=len(classes), num_features=NUM_FEATURES)
         try:
             state = torch.load(ckpt, map_location=device, weights_only=False)
             sd = state["model_state"] if "model_state" in state else state
             model.load_state_dict(sd)
-            print(f"[OK] {task.upper()} V2 model loaded from {ckpt}")
+            print(f"[OK] {task.upper()} V3 model loaded from {ckpt.name}")
         except Exception as e:
-            print(f"[WARN] {task.upper()} V2 checkpoint mismatch: {e}. Using untrained V2.")
-            _is_model_untrained = True
-    elif ckpt_v1.exists():
-        print(f"[INFO] {task.upper()} V2 checkpoint not found, falling back to V1: {ckpt_v1}")
-        model = CNNTransformerClassifier(num_classes=len(classes))
-        try:
-            state = torch.load(ckpt_v1, map_location=device, weights_only=False)
-            sd = state["model_state"] if "model_state" in state else state
-            model.load_state_dict(sd)
-            print(f"[OK] {task.upper()} V1 model loaded (fallback)")
-        except Exception as e:
-            print(f"[WARN] {task.upper()} V1 fallback mismatch: {e}. Using untrained.")
+            print(f"[WARN] {task.upper()} checkpoint failed to load ({e}). Using untrained model.")
             _is_model_untrained = True
     else:
-        print(f"[WARN] No checkpoint found for {task.upper()}. Using untrained V2.")
-        model = CNNTransformerWithFeatures(num_classes=len(classes), num_features=NUM_FEATURES)
+        print(f"[WARN] No checkpoint found for {task.upper()} at {ckpt}. Using untrained model.")
         _is_model_untrained = True
     
     model.to(device)
@@ -394,13 +383,34 @@ def _clinical_explanation(label: str, features: dict, attention_context: str = "
 # SALIENCY (vanilla gradient)
 # ---------------------------------------------------------------------
 
-def _build_features_tensor(features: dict, device) -> torch.Tensor:
-    """Build the canonical 13-dim features tensor from the segment's features dict."""
+def _load_scaler(task: str):
+    """Load feature scaler from disk (lazy, cached in module globals)."""
+    global _scaler_rhythm, _scaler_ectopy
+    if task == "rhythm":
+        if _scaler_rhythm is None and _RHYTHM_SCALER_PATH.exists():
+            _scaler_rhythm = joblib.load(_RHYTHM_SCALER_PATH)
+        return _scaler_rhythm
+    else:
+        if _scaler_ectopy is None and _ECTOPY_SCALER_PATH.exists():
+            _scaler_ectopy = joblib.load(_ECTOPY_SCALER_PATH)
+        return _scaler_ectopy
+
+
+def _build_features_tensor(features: dict, device, task: str = "rhythm") -> torch.Tensor:
+    """
+    Build the normalised feature tensor from the segment's features dict.
+    Applies the StandardScaler trained during retrain_v2.py if available.
+    Without the scaler, high-magnitude features (SDNN ~200 ms) dominate
+    over low-magnitude clinical features (ST ~0.1 mV).
+    """
     vec = np.array(
         [float(features.get(name) or 0.0) for name in FEATURE_NAMES],
         dtype=np.float32,
     )
-    return torch.from_numpy(vec[None, :]).to(device)  # shape (1, 13)
+    scaler = _load_scaler(task)
+    if scaler is not None:
+        vec = scaler.transform(vec.reshape(1, -1))[0].astype(np.float32)
+    return torch.from_numpy(vec[None, :]).to(device)  # shape (1, NUM_FEATURES)
 
 
 def _compute_saliency(model, x, target_idx: int, features_t=None):
@@ -514,8 +524,12 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
         # Target FS is 125Hz as per system standards
         fs = 125
 
-        # Build features tensor once — reused for every inference call (V2 models)
-        features_t = _build_features_tensor(features, device)
+        # Build normalised feature tensors for each model task.
+        # Separate scalers are fit during training (feature_scaler_rhythm.joblib /
+        # feature_scaler_ectopy.joblib) — each task has its own z-score transform.
+        features_t_rhythm = _build_features_tensor(features, device, task="rhythm")
+        features_t_ectopy = _build_features_tensor(features, device, task="ectopy")
+        features_t = features_t_rhythm  # default alias for rhythm-only paths below
 
         # ── 1. Inference: Ectopy (Beat-by-Beat) — runs FIRST so we can
         #    identify non-ectopic beats for clean rhythm-model windowing.
@@ -528,7 +542,7 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
             x_default = torch.from_numpy(default_window[None, None, :]).to(device)
             with torch.no_grad():
                 if isinstance(model_ectopy, CNNTransformerWithFeatures):
-                    e_logits = model_ectopy(x_default, features_t)
+                    e_logits = model_ectopy(x_default, features_t_ectopy)
                 else:
                     e_logits = model_ectopy(x_default)
                 e_probs = F.softmax(e_logits, dim=1)[0].cpu().numpy()
@@ -550,7 +564,7 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
 
                 with torch.no_grad():
                     if isinstance(model_ectopy, CNNTransformerWithFeatures):
-                        be_logits = model_ectopy(bx, features_t)
+                        be_logits = model_ectopy(bx, features_t_ectopy)
                     else:
                         be_logits = model_ectopy(bx)
                     be_probs = F.softmax(be_logits, dim=1)[0].cpu().numpy()
@@ -610,7 +624,8 @@ def explain_segment(signal_1d: np.ndarray, features: dict) -> dict:
             r_probs = F.softmax(r_logits, dim=1)[0].cpu().numpy()
 
         r_idx = int(np.argmax(r_probs))
-        r_label = RHYTHM_CLASS_NAMES[r_idx]
+        # Guard: V1 fallback may have fewer classes than current RHYTHM_CLASS_NAMES
+        r_label = RHYTHM_CLASS_NAMES[r_idx] if r_idx < len(RHYTHM_CLASS_NAMES) else "Sinus Rhythm"
 
         # 3. Evidence Gathering
         saliency = _compute_saliency(model_rhythm, x, r_idx, features_t=features_t)

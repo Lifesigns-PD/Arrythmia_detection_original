@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-compare_models.py — Compare v1 (signal-only) vs v2 (signal+features) models
-=============================================================================
-
-Loads both checkpoints and evaluates them on the SAME validation set,
-printing side-by-side metrics so you can decide which model to deploy.
+compare_models.py — V1 vs V2 vs V3 Model Accuracy Comparison (CLI)
+====================================================================
+Loads available checkpoints and evaluates them against the same DB
+validation set, printing a side-by-side accuracy table.
 
 Usage:
     python scripts/compare_models.py --task rhythm
     python scripts/compare_models.py --task ectopy
+    python scripts/compare_models.py --task rhythm --limit 300
 """
 
 import sys
@@ -16,186 +16,254 @@ import json
 import numpy as np
 import torch
 from pathlib import Path
-from collections import Counter
+from collections import defaultdict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
 sys.path.append(str(BASE_DIR / "models_training"))
 
-from data_loader import RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES
-from models import CNNTransformerClassifier
-from models_v2 import CNNTransformerWithFeatures
-from signal_processing.feature_extraction import extract_feature_vector, NUM_FEATURES
+from models_training.data_loader import RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES
+from models_training.models import CNNTransformerClassifier
+from models_training.models_v2 import CNNTransformerWithFeatures
 
 CHECKPOINTS = BASE_DIR / "models_training" / "outputs" / "checkpoints"
 
 
-def evaluate_model(model, loader, device, num_classes, use_features=False):
-    """Run inference and return metrics."""
-    model.eval()
-    y_true, y_pred = [], []
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    with torch.no_grad():
-        for batch in loader:
-            if use_features:
-                x, f, y = batch
-                x, f, y = x.to(device), f.to(device), y.to(device)
-                logits = model(x, f)
-            else:
-                x, y = batch
-                x, y = x.to(device), y.to(device)
-                logits = model(x)
+def _v2_num_features():
+    from signal_processing.feature_extraction import NUM_FEATURES
+    return NUM_FEATURES
 
-            y_true += y.cpu().tolist()
-            y_pred += logits.argmax(1).cpu().tolist()
 
-    y_arr  = np.array(y_true)
-    yp_arr = np.array(y_pred)
+def _v3_num_features():
+    from signal_processing_v3.features.extraction import FEATURE_NAMES_V3
+    return len(FEATURE_NAMES_V3)
 
-    overall_acc = float((y_arr == yp_arr).mean())
-    per_cls = {}
-    for i in range(num_classes):
-        mask = y_arr == i
-        if mask.sum() > 0:
-            per_cls[i] = float((yp_arr[mask] == i).mean())
-        else:
-            per_cls[i] = 0.0
 
-    balanced_acc = float(np.mean(list(per_cls.values())))
+def _extract_v2_features(sig, fs=125):
+    from signal_processing.feature_extraction import extract_feature_vector
+    return extract_feature_vector(sig, fs=fs)
+
+
+def _extract_v3_features(sig, fs=125):
+    from signal_processing_v3 import process_ecg_v3
+    from signal_processing_v3.features.extraction import feature_dict_to_vector
+    res = process_ecg_v3(sig, fs=fs, min_quality=0.0)
+    return feature_dict_to_vector(res["features"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_samples(task: str, limit: int, feature_version: str):
+    import psycopg2
+    from scipy.signal import resample
+    from models_training.data_loader import get_rhythm_label_idx, get_ectopy_label_idx
+
+    conn = psycopg2.connect(
+        host="127.0.0.1", dbname="ecg_analysis",
+        user="ecg_user", password="sais", port="5432",
+    )
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT segment_id, signal_data, arrhythmia_label, segment_fs, features_json
+        FROM ecg_features_annotatable
+        WHERE signal_data IS NOT NULL AND is_corrected = TRUE
+        ORDER BY segment_id DESC LIMIT %s
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+
+    extractor = _extract_v3_features if feature_version == "v3" else _extract_v2_features
+    n_feat = _v3_num_features() if feature_version == "v3" else _v2_num_features()
+    label_fn = get_rhythm_label_idx if task == "rhythm" else get_ectopy_label_idx
+
+    samples, skipped = [], 0
+    for _, sig_raw, label_txt, fs, feat_json in rows:
+        sig = np.array(sig_raw, dtype=np.float32)
+        fs  = int(fs or 125)
+        if fs != 125 and len(sig) > 1:
+            sig = resample(sig, int(len(sig) * 125 / fs)).astype(np.float32)
+        sig = sig[:1250] if len(sig) > 1250 else np.pad(sig, (0, max(0, 1250 - len(sig))))
+
+        y = label_fn(label_txt)
+        if y is None:
+            skipped += 1
+            continue
+
+        try:
+            feats = extractor(sig, fs=125)
+        except Exception:
+            feats = np.zeros(n_feat, dtype=np.float32)
+
+        samples.append({"signal": sig, "label": int(y), "features": feats})
+
+    print(f"    Loaded {len(samples)} samples  (skipped {skipped} wrong-task labels)")
+    return samples
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluate one model on a sample list
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _evaluate(model, samples, device, use_features=True, batch_size=32):
+    all_preds, all_labels = [], []
+    for i in range(0, len(samples), batch_size):
+        batch  = samples[i:i + batch_size]
+        sigs   = torch.tensor(np.stack([s["signal"]   for s in batch]), dtype=torch.float32).unsqueeze(1).to(device)
+        feats  = torch.tensor(np.stack([s["features"] for s in batch]), dtype=torch.float32).to(device)
+        labels = [s["label"] for s in batch]
+
+        with torch.no_grad():
+            try:
+                logits = model(sigs, feats) if use_features else model(sigs)
+            except Exception:
+                logits = model(sigs)
+            preds = torch.argmax(logits, dim=1).cpu().tolist()
+
+        all_preds.extend(preds)
+        all_labels.extend(labels)
+
+    cls_correct = defaultdict(int)
+    cls_total   = defaultdict(int)
+    for p, l in zip(all_preds, all_labels):
+        cls_total[l] += 1
+        if p == l:
+            cls_correct[l] += 1
+
+    overall  = sum(p == l for p, l in zip(all_preds, all_labels)) / max(len(all_labels), 1)
+    cls_acc  = {c: cls_correct[c] / cls_total[c] for c in cls_total}
+    balanced = float(np.mean(list(cls_acc.values()))) if cls_acc else 0.0
 
     return {
-        "overall_acc": overall_acc,
-        "balanced_acc": balanced_acc,
-        "per_class": per_cls,
-        "total_samples": len(y_arr),
+        "overall":  overall,
+        "balanced": balanced,
+        "per_class": cls_acc,
+        "n":        len(all_labels),
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=["rhythm", "ectopy"], default="rhythm")
+    parser = argparse.ArgumentParser(description="V1 / V2 / V3 model comparison")
+    parser.add_argument("--task",  default="rhythm", choices=["rhythm", "ectopy"])
+    parser.add_argument("--limit", type=int, default=500)
     args = parser.parse_args()
 
+    device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     class_names = RHYTHM_CLASS_NAMES if args.task == "rhythm" else ECTOPY_CLASS_NAMES
     num_classes = len(class_names)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    v1_path = CHECKPOINTS / f"best_model_{args.task}.pth"
-    v2_path = CHECKPOINTS / f"best_model_{args.task}_v2.pth"
+    print(f"\n{'='*72}")
+    print(f"  MODEL COMPARISON  —  {args.task.upper()} task  |  device={device}")
+    print(f"{'='*72}")
 
-    print(f"\n{'='*70}")
-    print(f"  MODEL COMPARISON  |  task={args.task.upper()}")
-    print(f"{'='*70}")
+    # ── Checkpoints to evaluate ──────────────────────────────────────────────
+    candidates = {
+        "v1": {
+            "path":         CHECKPOINTS / f"best_model_{args.task}.pth",
+            "model_class":  "v1",
+            "feat_version": "v2",   # V1 model doesn't use features at inference
+            "use_features": False,
+        },
+        "v2": {
+            "path":         CHECKPOINTS / f"best_model_{args.task}_v2.pth",
+            "model_class":  "v2",
+            "feat_version": "v2",
+            "use_features": True,
+        },
+    }
 
-    # Check which checkpoints exist
-    has_v1 = v1_path.exists()
-    has_v2 = v2_path.exists()
+    results = {}
 
-    if not has_v1 and not has_v2:
-        print("[ERROR] No checkpoints found. Train at least one model first.")
-        sys.exit(1)
+    for ver, cfg in candidates.items():
+        if not cfg["path"].exists():
+            print(f"\n  [{ver.upper()}] checkpoint not found: {cfg['path'].name} — skip")
+            continue
 
-    # Print checkpoint info
-    if has_v1:
-        v1_state = torch.load(v1_path, map_location=device, weights_only=False)
-        print(f"\n  V1 (signal-only):  {v1_path.name}")
-        print(f"    Epoch:        {v1_state.get('epoch', '?')}")
-        print(f"    Balanced Acc: {v1_state.get('balanced_acc', 0):.4f}")
-        print(f"    Mode:         {v1_state.get('mode', '?')}")
-    else:
-        print(f"\n  V1: NOT FOUND at {v1_path}")
+        state = torch.load(cfg["path"], map_location=device, weights_only=False)
+        saved_epoch = state.get("epoch", "?")
+        saved_acc   = state.get("balanced_acc", state.get("val_balanced_acc", 0.0))
+        saved_feats = state.get("num_features", "?")
 
-    if has_v2:
-        v2_state = torch.load(v2_path, map_location=device, weights_only=False)
-        print(f"\n  V2 (signal+features):  {v2_path.name}")
-        print(f"    Epoch:        {v2_state.get('epoch', '?')}")
-        print(f"    Balanced Acc: {v2_state.get('balanced_acc', 0):.4f}")
-        print(f"    Mode:         {v2_state.get('mode', '?')}")
-        print(f"    Features:     {v2_state.get('num_features', '?')} dimensions")
-    else:
-        print(f"\n  V2: NOT FOUND at {v2_path}")
+        print(f"\n  [{ver.upper()}] {cfg['path'].name}")
+        print(f"    Epoch: {saved_epoch}  |  Saved balanced acc: {saved_acc:.4f}  |  Feat dims: {saved_feats}")
 
-    # Build evaluation dataset (use retrain.py's ECGEventDataset for v1, v2 for v2)
-    print(f"\n  Loading evaluation data...")
+        n_feat = _v3_num_features() if cfg["feat_version"] == "v3" else _v2_num_features()
 
-    if has_v2:
-        from retrain_v2 import ECGEventDatasetV2, collate_fn_v2, filename_split as fs_v2
-        ds_v2 = ECGEventDatasetV2(task=args.task, source_filter="all", augment=False)
-        _, val_idx_v2 = fs_v2(ds_v2.samples)
-        val_ds_v2 = torch.utils.data.Subset(ds_v2, val_idx_v2)
-        val_ldr_v2 = torch.utils.data.DataLoader(val_ds_v2, batch_size=32, shuffle=False, collate_fn=collate_fn_v2)
-
-    if has_v1:
-        from retrain import ECGEventDataset, collate_fn, filename_split as fs_v1
-        ds_v1 = ECGEventDataset(task=args.task, source_filter="all", augment=False)
-        _, val_idx_v1 = fs_v1(ds_v1.samples)
-        val_ds_v1 = torch.utils.data.Subset(ds_v1, val_idx_v1)
-        val_ldr_v1 = torch.utils.data.DataLoader(val_ds_v1, batch_size=32, shuffle=False, collate_fn=collate_fn)
-
-    # Evaluate V1
-    if has_v1:
-        print(f"\n  Evaluating V1 (signal-only)...")
-        model_v1 = CNNTransformerClassifier(num_classes=num_classes).to(device)
-        model_v1.load_state_dict(v1_state["model_state"])
-        metrics_v1 = evaluate_model(model_v1, val_ldr_v1, device, num_classes, use_features=False)
-    else:
-        metrics_v1 = None
-
-    # Evaluate V2
-    if has_v2:
-        print(f"  Evaluating V2 (signal+features)...")
-        model_v2 = CNNTransformerWithFeatures(
-            num_classes=num_classes, num_features=v2_state.get("num_features", NUM_FEATURES)
-        ).to(device)
-        model_v2.load_state_dict(v2_state["model_state"])
-        metrics_v2 = evaluate_model(model_v2, val_ldr_v2, device, num_classes, use_features=True)
-    else:
-        metrics_v2 = None
-
-    # Print comparison
-    print(f"\n{'='*70}")
-    print(f"  RESULTS COMPARISON")
-    print(f"{'='*70}")
-    print(f"\n  {'Metric':<30} {'V1 (signal)':>15} {'V2 (sig+feat)':>15} {'Delta':>10}")
-    print(f"  {'-'*70}")
-
-    if metrics_v1 and metrics_v2:
-        v1_oa = metrics_v1["overall_acc"]
-        v2_oa = metrics_v2["overall_acc"]
-        v1_ba = metrics_v1["balanced_acc"]
-        v2_ba = metrics_v2["balanced_acc"]
-
-        print(f"  {'Overall Accuracy':<30} {v1_oa:>14.4f} {v2_oa:>14.4f} {v2_oa-v1_oa:>+10.4f}")
-        print(f"  {'Balanced Accuracy':<30} {v1_ba:>14.4f} {v2_ba:>14.4f} {v2_ba-v1_ba:>+10.4f}")
-        print(f"  {'Val Samples':<30} {metrics_v1['total_samples']:>15} {metrics_v2['total_samples']:>15}")
-
-        print(f"\n  Per-class accuracy:")
-        for i, name in enumerate(class_names):
-            v1_c = metrics_v1["per_class"].get(i, 0)
-            v2_c = metrics_v2["per_class"].get(i, 0)
-            delta = v2_c - v1_c
-            marker = " ✓" if delta > 0.01 else " ✗" if delta < -0.01 else ""
-            print(f"    {i:02d} {name:<35} {v1_c:>8.3f} {v2_c:>8.3f} {delta:>+8.3f}{marker}")
-
-        print(f"\n  VERDICT: ", end="")
-        if v2_ba > v1_ba + 0.01:
-            print(f"V2 is BETTER by {v2_ba-v1_ba:+.4f} balanced accuracy. Use v2!")
-        elif v1_ba > v2_ba + 0.01:
-            print(f"V1 is still better by {v1_ba-v2_ba:+.4f}. Keep v1, tune v2 more.")
+        if cfg["model_class"] == "v1":
+            model = CNNTransformerClassifier(num_classes=num_classes).to(device)
+            key = "model_state" if "model_state" in state else "model_state_dict"
         else:
-            print(f"Models are comparable (delta={v2_ba-v1_ba:+.4f}). V2 may improve with more training.")
+            model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=n_feat).to(device)
+            key = "model_state_dict" if "model_state_dict" in state else "model_state"
 
-    elif metrics_v1:
-        print(f"  {'Overall Accuracy':<30} {metrics_v1['overall_acc']:>14.4f} {'N/A':>15}")
-        print(f"  {'Balanced Accuracy':<30} {metrics_v1['balanced_acc']:>14.4f} {'N/A':>15}")
-        print(f"\n  Train v2 first: python models_training/retrain_v2.py --task {args.task} --mode initial")
+        try:
+            model.load_state_dict(state[key], strict=False)
+        except Exception as e:
+            print(f"    [warn] load_state_dict: {e}")
 
-    elif metrics_v2:
-        print(f"  {'Overall Accuracy':<30} {'N/A':>15} {metrics_v2['overall_acc']:>14.4f}")
-        print(f"  {'Balanced Accuracy':<30} {'N/A':>15} {metrics_v2['balanced_acc']:>14.4f}")
+        model.eval()
 
-    print()
+        print(f"    Loading evaluation data (V{cfg['feat_version'][-1]} features, limit={args.limit})...")
+        samples = _load_samples(args.task, args.limit, cfg["feat_version"])
+        if not samples:
+            print("    No samples — skip.")
+            continue
+
+        m = _evaluate(model, samples, device, use_features=cfg["use_features"])
+        m["saved_acc"] = saved_acc
+        results[ver] = m
+        print(f"    → Overall acc:   {m['overall']*100:.2f}%")
+        print(f"    → Balanced acc:  {m['balanced']*100:.2f}%")
+        print(f"    → N evaluated:   {m['n']}")
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    if not results:
+        print("\nNo models evaluated. Train a model first.")
+        return
+
+    print(f"\n{'='*72}")
+    print(f"  SUMMARY  —  {args.task.upper()}")
+    print(f"  {'Version':<8} {'Overall':>10} {'Balanced':>10} {'N':>6}")
+    print(f"  {'-'*36}")
+    for ver, r in results.items():
+        print(f"  {ver:<8} {r['overall']*100:>9.2f}% {r['balanced']*100:>9.2f}% {r['n']:>6}")
+
+    # Delta vs first available
+    vers = list(results.keys())
+    if len(vers) >= 2:
+        base, comp = vers[0], vers[1]
+        delta = results[comp]["balanced"] - results[base]["balanced"]
+        better = comp if delta > 0 else base
+        print(f"\n  Balanced acc delta ({comp} vs {base}): {delta:+.4f}")
+        print(f"  Best: {better.upper()}")
+
+    # ── Per-class breakdown ───────────────────────────────────────────────────
+    print(f"\n  Per-class accuracy:")
+    header = f"  {'Class':<32}"
+    for ver in results:
+        header += f"  {ver.upper():>8}"
+    print(header)
+
+    all_cls = sorted(set(c for r in results.values() for c in r["per_class"]))
+    for cls in all_cls:
+        name = class_names[cls] if cls < len(class_names) else str(cls)
+        row  = f"  {name:<32}"
+        for ver in results:
+            val = results[ver]["per_class"].get(cls)
+            row += f"  {val*100:>7.1f}%" if val is not None else f"  {'N/A':>7}"
+        print(row)
+
+    print(f"\n{'='*72}\n")
 
 
 if __name__ == "__main__":

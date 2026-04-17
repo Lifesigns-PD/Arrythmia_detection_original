@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-backfill_features.py — Populate features_json with extracted ECG features
-==========================================================================
+backfill_features.py — Populate features_json with V3 ECG features (60 dimensions)
+====================================================================================
+SAFE: Only updates features_json. Does NOT touch signal_data, labels, or events.
 
-SAFE: Only UPDATES the existing features_json column. Does NOT modify
-      signal_data, arrhythmia_label, events_json, or any other column.
-
-This script:
-  1. Reads all segments from ecg_features_annotatable that have signal_data
-  2. Extracts 13 numeric features from each signal (HR, QRS, QTc, ST, etc.)
-  3. Merges the new features into the existing features_json (preserves r_peaks)
-  4. Updates the database
-
-Run ONCE before training with retrain_v2.py. Safe to re-run (idempotent).
+Detects V3 features by the presence of 'sdnn_ms' key.
+Segments already having V3 features are skipped (idempotent).
 
 Usage:
     python scripts/backfill_features.py
-    python scripts/backfill_features.py --limit 100    # test on 100 segments first
-    python scripts/backfill_features.py --force         # re-extract even if already done
+    python scripts/backfill_features.py --limit 100   # test on 100 first
+    python scripts/backfill_features.py --force        # re-extract everything
+    python scripts/backfill_features.py --corrected    # only is_corrected=TRUE
 """
 
 import sys
@@ -30,9 +24,6 @@ from tqdm import tqdm
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
 
-from signal_processing.feature_extraction import extract_feature_dict, FEATURE_NAMES
-from signal_processing.cleaning import clean_signal
-
 DB_PARAMS = {
     "host":     "127.0.0.1",
     "dbname":   "ecg_analysis",
@@ -41,91 +32,95 @@ DB_PARAMS = {
     "port":     "5432",
 }
 
-TARGET_FS = 125
+TARGET_FS  = 125
 TARGET_LEN = 1250
+
+
+def _resample_and_fix(sig, orig_fs):
+    if orig_fs != TARGET_FS and len(sig) > 1:
+        from scipy.signal import resample as sp_resample
+        sig = sp_resample(sig, int(len(sig) * TARGET_FS / orig_fs)).astype(np.float32)
+    if len(sig) < TARGET_LEN:
+        sig = np.pad(sig, (0, TARGET_LEN - len(sig)))
+    elif len(sig) > TARGET_LEN:
+        sig = sig[:TARGET_LEN]
+    return sig.astype(np.float32)
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Backfill features_json with extracted ECG features")
-    parser.add_argument("--limit", type=int, default=None, help="Process only N segments (for testing)")
-    parser.add_argument("--force", action="store_true", help="Re-extract even if features already exist")
+    parser = argparse.ArgumentParser(description="Backfill features_json with V3 features")
+    parser.add_argument("--limit",     type=int,  default=None)
+    parser.add_argument("--force",     action="store_true", help="Re-extract even if V3 features exist")
+    parser.add_argument("--corrected", action="store_true", help="Only process is_corrected=TRUE segments")
+    parser.add_argument("--source",    type=str,  default=None, help="Filter by dataset_source (e.g. mitdb, ptbxl)")
     args = parser.parse_args()
+
+    # Import V3 pipeline
+    from signal_processing_v3 import process_ecg_v3
+    from signal_processing_v3.features.extraction import FEATURE_NAMES_V3
 
     conn = psycopg2.connect(**DB_PARAMS)
     conn.autocommit = True
-    cur = conn.cursor()
+    cur  = conn.cursor()
 
-    # Fetch segments
-    query = """
-        SELECT segment_id, signal_data, segment_fs, features_json
-        FROM ecg_features_annotatable
-        WHERE signal_data IS NOT NULL
-    """
+    # Build query
+    where = ["signal_data IS NOT NULL"]
     if not args.force:
-        # Skip segments that already have our features
-        query += " AND (features_json IS NULL OR NOT (features_json ? 'mean_hr_bpm'))"
+        # Skip segments that already have V3 features (sdnn_ms is a V3-only key)
+        where.append("(features_json IS NULL OR NOT (features_json ? 'sdnn_ms'))")
+    if args.corrected:
+        where.append("is_corrected = TRUE")
+    if args.source:
+        where.append(f"dataset_source = '{args.source}'")
 
-    query += " ORDER BY segment_id"
+    query = ("SELECT segment_id, signal_data, segment_fs, features_json "
+             "FROM ecg_features_annotatable "
+             f"WHERE {' AND '.join(where)} "
+             "ORDER BY segment_id")
     if args.limit:
         query += f" LIMIT {args.limit}"
 
     cur.execute(query)
     rows = cur.fetchall()
 
-    print(f"[Backfill] Found {len(rows)} segments to process")
-    if len(rows) == 0:
-        print("[Backfill] Nothing to do. Use --force to re-extract.")
-        cur.close()
-        conn.close()
+    print(f"[Backfill V3] {len(rows)} segments to process  "
+          f"({'force' if args.force else 'skip existing'})")
+    if not rows:
+        print("Nothing to do. Use --force to re-extract.")
         return
 
-    updated = 0
-    errors = 0
+    updated = errors = skipped = 0
 
-    for seg_id, signal_raw, fs, existing_features_raw in tqdm(rows, desc="Extracting features"):
+    for seg_id, signal_raw, fs, feat_json_raw in tqdm(rows, desc="V3 features"):
         try:
-            # Parse signal
             sig = np.array(signal_raw, dtype=np.float32)
-            fs = int(fs or TARGET_FS)
+            fs  = int(fs or TARGET_FS)
+            sig = _resample_and_fix(sig, fs)
 
-            # Resample if needed
-            if fs != TARGET_FS and len(sig) > 1:
-                from scipy.signal import resample
-                new_len = int(len(sig) * TARGET_FS / fs)
-                sig = resample(sig, new_len).astype(np.float32)
-
-            # Pad/truncate
-            if len(sig) < TARGET_LEN:
-                sig = np.pad(sig, (0, TARGET_LEN - len(sig)))
-            elif len(sig) > TARGET_LEN:
-                sig = sig[:TARGET_LEN]
-
-            # Clean signal
-            sig = clean_signal(sig, TARGET_FS).astype(np.float32)
-
-            # Get existing r_peaks if available
-            r_peaks = None
-            existing_dict = {}
-            if existing_features_raw:
+            # Preserve existing metadata (r_peaks, etc.)
+            existing = {}
+            if feat_json_raw:
                 try:
-                    if isinstance(existing_features_raw, str):
-                        existing_dict = json.loads(existing_features_raw)
-                    else:
-                        existing_dict = existing_features_raw or {}
-                    rp = existing_dict.get("r_peaks", [])
-                    if rp:
-                        r_peaks = np.array(rp, dtype=int)
+                    existing = json.loads(feat_json_raw) if isinstance(feat_json_raw, str) else (feat_json_raw or {})
                 except Exception:
-                    existing_dict = {}
+                    existing = {}
 
-            # Extract features
-            new_features = extract_feature_dict(sig, fs=TARGET_FS, r_peaks=r_peaks)
+            # Run V3 pipeline (min_quality=0 so we always get features)
+            result = process_ecg_v3(sig, fs=TARGET_FS, min_quality=0.0)
 
-            # Merge: keep existing keys (like r_peaks), add new features
-            merged = {**existing_dict, **new_features}
+            # Build feature dict to store
+            feat_dict = {k: (float(v) if v is not None else None)
+                         for k, v in result["features"].items()}
+            feat_dict["sqi_v3"]   = result["sqi"]
+            feat_dict["method_v3"] = result["method"]
+            # Store r_peaks for future use
+            if len(result["r_peaks"]) > 0:
+                feat_dict["r_peaks"] = result["r_peaks"].tolist()
 
-            # Update database
+            # Merge: V3 features overwrite V2, but keep any extra existing keys
+            merged = {**existing, **feat_dict}
+
             cur.execute(
                 "UPDATE ecg_features_annotatable SET features_json = %s WHERE segment_id = %s",
                 (json.dumps(merged), seg_id)
@@ -134,17 +129,19 @@ def main():
 
         except Exception as e:
             errors += 1
-            if errors <= 5:
-                print(f"\n[Error] segment_id={seg_id}: {e}")
+            if errors <= 10:
+                print(f"\n[Error] seg {seg_id}: {e}")
 
     cur.close()
     conn.close()
 
-    print(f"\n[Backfill] Done!")
-    print(f"  Updated:  {updated}")
-    print(f"  Errors:   {errors}")
-    print(f"  Features: {', '.join(FEATURE_NAMES)}")
-    print(f"\nYou can now train with: python models_training/retrain_v2.py --task rhythm --mode initial")
+    print(f"\n[Backfill V3] Done!")
+    print(f"  Updated : {updated}")
+    print(f"  Errors  : {errors}")
+    print(f"  Features: {len(FEATURE_NAMES_V3)} dimensions")
+    print(f"\nNext step:")
+    print(f"  python models_training/retrain_v2.py --task rhythm --mode initial")
+    print(f"  python models_training/retrain_v2.py --task ectopy --mode initial")
 
 
 if __name__ == "__main__":

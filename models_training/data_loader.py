@@ -185,21 +185,18 @@ ECTOPY_TERMS = [
 ]
 
 RHYTHM_CLASS_NAMES = [
-    "Sinus Rhythm",                  # 0
-    "Atrial Fibrillation",           # 1
-    "Atrial Flutter",                # 2
-    "Junctional Rhythm",             # 3
-    "Idioventricular Rhythm",        # 4
-    "Ventricular Fibrillation",      # 5
-    "1st Degree AV Block",           # 6
-    "2nd Degree AV Block Type 1",    # 7
-    "2nd Degree AV Block Type 2",    # 8
-    "3rd Degree AV Block",           # 9
-    "Bundle Branch Block",           # 10
-    "Artifact",                      # 11
-    "Pause",                         # 12
-    # "Other Arrhythmia" removed — catch-all label with no clinical definition,
-    # its DB segments are excluded from training (get_rhythm_label_idx returns None).
+    "Sinus Rhythm",                  # 0  — 3,244 segs (includes Sinus Tachycardia alias)
+    "Atrial Fibrillation",           # 1  — 203 segs
+    "Atrial Flutter",                # 2  — 272 segs
+    "1st Degree AV Block",           # 3  — 369 segs
+    "3rd Degree AV Block",           # 4  — 180 segs
+    "Bundle Branch Block",           # 5  — 500 segs
+    "Artifact",                      # 6  — 240 segs
+    "Sinus Bradycardia",             # 7  — 821 segs
+    "2nd Degree AV Block Type 2",    # 8  — 68 segs  (Mobitz II — cardiologist verified)
+    # Excluded (zero data):   Idioventricular Rhythm, VF, 2nd Degree AV Block Type 1, Pause
+    # Excluded (too few):     Junctional Rhythm (1), VT (3) — VT detected via rules
+    # Excluded (no def):      Other Arrhythmia — get_rhythm_label_idx returns None
 ]
 
 # Hard Safety Assertion
@@ -223,33 +220,65 @@ RHYTHM_INDEX = {name: i for i, name in enumerate(RHYTHM_CLASS_NAMES)}
 ECTOPY_INDEX = {name: i for i, name in enumerate(ECTOPY_CLASS_NAMES)}
 
 RHYTHM_LABEL_ALIASES = {
-    "Sinus Bradycardia": "Sinus Rhythm",
+    # Sinus Tachycardia → fold to Sinus Rhythm (HR handled by orchestrator thresholds)
     "Sinus Tachycardia": "Sinus Rhythm",
-    "Sinus": "Sinus Rhythm",  # bare "Sinus" from DB entries like "Sinus + PVC"
+    "Sinus": "Sinus Rhythm",
+    # VT/NSVT → None: only 3 VT samples, detected via rules (consecutive PVC count)
+    "Ventricular Tachycardia": None,
+    "NSVT": None,
+    # No data classes → None (skip from training)
+    "Junctional Rhythm": None,
+    "Idioventricular Rhythm": None,
+    "Ventricular Fibrillation": None,
+    "2nd Degree AV Block Type 1": None,
+    "Pause": None,
+    # Rules-only outputs → None
+    "Supraventricular Tachycardia": None,
+    "PSVT": None,
+    "SVT": None,
 }
 
 def get_rhythm_label_idx(original_label_name):
     """
-    RHYTHM TASK: Focuses on the base pathology.
-    - AF + PVC -> AF (KEEP)
-    - Sinus + PVC -> Sinus -> Sinus Rhythm (KEEP — ectopy handled by ectopy model)
-    - PVCs -> None (DROPPED - Ectopy is not a rhythm)
-    - Sinus Bradycardia/Tachycardia -> Sinus Rhythm (class 0)
-    - Other Arrhythmia -> None (DROPPED - catch-all, not a real class)
-    """
-    if original_label_name is None: return None
-    label = normalize_label(original_label_name)
-    # Explicitly exclude the catch-all — it has no clinical meaning
-    if label == "Other Arrhythmia": return None
+    RHYTHM TASK: maps segment label → rhythm model class index.
 
-    # 1. Strip everything after ' + ' to find the base rhythm
+    9 trained classes (indices 0-8):
+      0: Sinus Rhythm (incl. Sinus Tachycardia alias)
+      1: Atrial Fibrillation
+      2: Atrial Flutter
+      3: 1st Degree AV Block
+      4: 3rd Degree AV Block
+      5: Bundle Branch Block
+      6: Artifact
+      7: Sinus Bradycardia
+      8: 2nd Degree AV Block Type 2 (Mobitz II — 68 cardiologist-verified segments)
+
+    Returns None for:
+    - VT/NSVT              → rules-only detection (too few samples)
+    - Junctional, VF       → no/too-few samples
+    - 2nd Degree AVB Type 1 → no corrected samples
+    - Pause                → no samples
+    - SVT/PSVT             → rules-only
+    - Other Arrhythmia     → catch-all, no clinical meaning
+    - PVC/PAC alone        → ectopy model, not rhythm model
+    """
+    if original_label_name is None:
+        return None
+    label = normalize_label(original_label_name)
+    if label == "Other Arrhythmia":
+        return None
+
+    # 1. Strip ectopy suffix (e.g. "AF + PVC" → "AF")
     if " + " in label:
         label = label.split(" + ")[0]
 
-    # 2. Map rate variants to base rhythm class
-    label = RHYTHM_LABEL_ALIASES.get(label, label)
+    # 2. Apply aliases (NSVT→VT, SVT→None, etc.)
+    if label in RHYTHM_LABEL_ALIASES:
+        label = RHYTHM_LABEL_ALIASES[label]
+        if label is None:
+            return None  # explicitly excluded
 
-    # 3. Return index only if base rhythm is in our targeted list
+    # 3. Return index only if in rhythm class list
     return RHYTHM_INDEX.get(label, None)
 
 def get_ectopy_label_idx(original_label_name):
@@ -444,11 +473,11 @@ class ECGDataset:
             "port":     "5432",
         }
 
-        # Lazy import — only needed when use_features=True
+        # Lazy import — only needed when use_features=True (V3 features)
         if self.use_features:
-            from signal_processing.feature_extraction import extract_feature_vector, NUM_FEATURES
-            self._extract_features = extract_feature_vector
-            self._num_features = NUM_FEATURES
+            from signal_processing_v3.features.extraction import FEATURE_NAMES_V3
+            self._feature_names = FEATURE_NAMES_V3
+            self._num_features = len(FEATURE_NAMES_V3)
 
         print(f"[Dataset] Initializing SQL dataset (mode={mode}, limit={limit}, task={task}, use_features={use_features})...")
         try:
@@ -519,47 +548,36 @@ class ECGDataset:
             print(f"[ERROR] Failed to load SQL dataset: {e}")
             raise
 
-    def _load_or_extract_features(self, sig, fs, features_json_raw):
+    def _load_or_extract_features(self, sig, _fs, features_json_raw):
         """
-        Try to load pre-computed features from features_json (fast).
-        If not available, extract from signal on-the-fly (slower but works).
+        Try to load pre-computed V3 features from features_json (fast path).
+        If not available or keys don't match V3, extract on-the-fly with V3 pipeline.
         """
         import json as _json
-        from signal_processing.feature_extraction import FEATURE_NAMES, NUM_FEATURES
+        from signal_processing_v3.features.extraction import FEATURE_NAMES_V3
 
-        # Try pre-computed features first
+        # Try pre-computed features first (must have at least one V3 key)
         if features_json_raw:
             try:
-                if isinstance(features_json_raw, str):
-                    feat_dict = _json.loads(features_json_raw)
-                else:
-                    feat_dict = features_json_raw
-
-                # Check if the features were backfilled (has our keys)
-                if "mean_hr_bpm" in feat_dict:
+                feat_dict = _json.loads(features_json_raw) if isinstance(features_json_raw, str) else features_json_raw
+                if "sdnn_ms" in feat_dict or "sample_entropy" in feat_dict:
+                    # V3 features present — use them
                     vec = np.array(
-                        [float(feat_dict.get(name, 0.0)) for name in FEATURE_NAMES],
+                        [float(feat_dict.get(name, 0.0)) for name in FEATURE_NAMES_V3],
                         dtype=np.float32,
                     )
                     return vec
             except Exception:
                 pass
 
-        # Fallback: extract from signal (slower)
-        r_peaks = None
-        if features_json_raw:
-            try:
-                if isinstance(features_json_raw, str):
-                    feat_dict = _json.loads(features_json_raw)
-                else:
-                    feat_dict = features_json_raw
-                rp = feat_dict.get("r_peaks", [])
-                if rp:
-                    r_peaks = np.array(rp, dtype=int)
-            except Exception:
-                pass
-
-        return self._extract_features(sig, fs=TARGET_FS, r_peaks=r_peaks)
+        # Fallback: full V3 pipeline on-the-fly
+        from signal_processing_v3 import process_ecg_v3
+        from signal_processing_v3.features.extraction import feature_dict_to_vector
+        try:
+            result = process_ecg_v3(sig, fs=TARGET_FS, min_quality=0.0)
+            return feature_dict_to_vector(result["features"])
+        except Exception:
+            return np.zeros(len(FEATURE_NAMES_V3), dtype=np.float32)
 
     def _resample_and_fixlen(self, sig, orig_fs):
         """Standardizes signal to 125 Hz and 1250 samples."""
