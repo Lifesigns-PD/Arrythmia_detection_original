@@ -3,10 +3,10 @@ import numpy as np
 from typing import Dict, Any
 
 from decision_engine.models import (
-    SegmentDecision, 
-    SegmentState, 
-    Event, 
-    EventCategory, 
+    SegmentDecision,
+    SegmentState,
+    Event,
+    EventCategory,
     DisplayState
 )
 from decision_engine.rules import (
@@ -15,6 +15,7 @@ from decision_engine.rules import (
     apply_display_rules,
     apply_training_flags
 )
+from decision_engine.sinus_detector import detect_sinus_and_rhythm
 
 class RhythmOrchestrator:
     def __init__(self):
@@ -66,8 +67,20 @@ class RhythmOrchestrator:
             # We don't manually append to final_display_events here anymore; 
             # we let the display arbitrator handle it in step 5.
 
-        # 3. Background rhythm FIRST (Simple Rule-Based for now)
-        decision.background_rhythm = self._detect_background_rhythm(clinical_features)
+        # 3. SINUS RHYTHM DETECTION (Signal Processing - BEFORE ML Model)
+        # Check if segment is Sinus Rhythm using V3 features
+        # If YES → classify as Brady/Normal/Tachy
+        # If NO → will use ML model below
+        sinus_label, sinus_conf, sinus_reason = detect_sinus_and_rhythm(clinical_features)
+
+        if sinus_label != "Unknown":
+            # Sinus Rhythm detected by signal processing - NO ML needed
+            decision.background_rhythm = sinus_label
+            print(f"[Sinus Detection] {sinus_label} (conf={sinus_conf:.2f}) - {sinus_reason}")
+        else:
+            # Not Sinus → will use ML model below
+            decision.background_rhythm = "Unknown"
+            print(f"[Sinus Detection] Not Sinus - passing to ML model")
 
         # 4. Gather Events
         # A) Rule-Derived Events — pass signal + r_peaks for AFL spectral detection
@@ -81,33 +94,40 @@ class RhythmOrchestrator:
             fs=_fs,
         )
         
-        # B) ML-Derived Events
+        # B) ML-Derived Events (Only if NOT Sinus - Sinus already detected above)
         ml_events = []
-        _rhythm_block = ml_prediction.get("rhythm") or {}
-        ml_label = _rhythm_block.get("label") or ml_prediction.get("label", "Unknown")
-        ml_conf = _rhythm_block.get("confidence") or ml_prediction.get("confidence", 0.0)
 
-        # B) ML-Derived Rhythm Events
-        # Per-class confidence thresholds: rarer and more dangerous rhythms require
-        # higher confidence to fire, reducing costly false positives.
-        _RHYTHM_CONF_THRESHOLDS = {
-            "Ventricular Fibrillation":      0.90,
-            "VT":                            0.88,
-            "Ventricular Tachycardia":       0.88,
-            "NSVT":                          0.85,
-            "Atrial Fibrillation":           0.85,
-            "AF":                            0.85,
-            "Atrial Flutter":                0.85,
-            "3rd Degree AV Block":           0.85,
-            "2nd Degree AV Block Type 2":    0.85,
-            "2nd Degree AV Block Type 1":    0.82,
-            "1st Degree AV Block":           0.80,
-            "Bundle Branch Block":           0.80,
-            "Sinus Bradycardia":             0.75,  # own class now — lower bar
-        }
-        required_conf = _RHYTHM_CONF_THRESHOLDS.get(ml_label, 0.80)
-        if ml_label not in ["Sinus Rhythm", "Unknown"] and ml_conf > required_conf:
-            ml_events.append(self._create_event_from_ml(ml_label, ml_prediction))
+        # Only use ML if Sinus wasn't detected by signal processing
+        if decision.background_rhythm == "Unknown":
+            _rhythm_block = ml_prediction.get("rhythm") or {}
+            ml_label = _rhythm_block.get("label") or ml_prediction.get("label", "Unknown")
+            ml_conf = _rhythm_block.get("confidence") or ml_prediction.get("confidence", 0.0)
+
+            # Per-class confidence thresholds: rarer and more dangerous rhythms require
+            # higher confidence to fire, reducing costly false positives.
+            _RHYTHM_CONF_THRESHOLDS = {
+                "Ventricular Fibrillation":      0.90,
+                "VT":                            0.88,
+                "Ventricular Tachycardia":       0.88,
+                "NSVT":                          0.85,
+                "Atrial Fibrillation":           0.85,
+                "AF":                            0.85,
+                "Atrial Flutter":                0.85,
+                "3rd Degree AV Block":           0.85,
+                "2nd Degree AV Block Type 2":    0.85,
+                "2nd Degree AV Block Type 1":    0.82,
+                "1st Degree AV Block":           0.80,
+                "Bundle Branch Block":           0.80,
+            }
+            required_conf = _RHYTHM_CONF_THRESHOLDS.get(ml_label, 0.80)
+            if ml_label not in ["Sinus Rhythm", "Unknown"] and ml_conf > required_conf:
+                decision.background_rhythm = ml_label
+                ml_events.append(self._create_event_from_ml(ml_label, ml_prediction))
+        else:
+            # Sinus already detected - don't override with ML
+            _rhythm_block = ml_prediction.get("rhythm") or {}
+            ml_label = _rhythm_block.get("label", "Unknown")
+            ml_conf = _rhythm_block.get("confidence", 0.0)
 
         # C) Per-beat ectopy events — required for bigeminy/trigeminy pattern detection
         #    xai.py now returns beat_events: [{beat_idx, peak_sample, label, conf}, ...]

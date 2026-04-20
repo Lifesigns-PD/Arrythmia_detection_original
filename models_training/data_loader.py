@@ -494,6 +494,16 @@ class ECGDataset:
             if mode == 'retrain':
                 where_clauses.append("is_corrected = TRUE")
 
+            # For rhythm task: EXCLUDE Sinus Rhythm (use signal processing rules instead)
+            # For ectopy task: NO FILTER (all ectopy types should be trained)
+            if self.task == 'rhythm':
+                where_clauses.append("""
+                    arrhythmia_label NOT IN (
+                        'Sinus Rhythm', 'Sinus Bradycardia', 'Sinus Tachycardia',
+                        'Other Arrhythmia'
+                    )
+                """)
+
             query = base_query + " WHERE " + " AND ".join(where_clauses)
             query += " ORDER BY segment_id DESC" # Get recent ones first if limited
 
