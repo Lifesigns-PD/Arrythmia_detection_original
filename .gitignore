@@ -43,6 +43,8 @@ data/input_segments/
 raw_data/
 models_training/outputs/logs/
 NO_USE/
+not good docs/
+signal_processing/
 testing_final/
 tmp/
 utils/
