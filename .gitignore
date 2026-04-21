@@ -43,6 +43,10 @@ data/input_segments/
 raw_data/
 models_training/outputs/logs/
 NO_USE/
+grpc_gen/
+sample/
+visualiser_bundle/
+package_v1.ps1  
 not good docs/
 signal_processing/
 testing_final/
