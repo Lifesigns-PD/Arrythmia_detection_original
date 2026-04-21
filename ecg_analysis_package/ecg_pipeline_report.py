@@ -629,7 +629,7 @@ def _draw_feature_table(ax, cf, nf, label):
                     ha="center", va="center", fontsize=8.5,
                     color=clr, fontweight=fw, transform=ax.transAxes)
 
-    ax.axhline(0.83, color="#cccccc", lw=0.8, transform=ax.transAxes)
+    ax.axhline(0.83, color="#cccccc", lw=0.8)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -640,18 +640,73 @@ def main():
     parser = argparse.ArgumentParser(description="ECG Pipeline Analysis Report")
     parser.add_argument("json_file", help="Path to JSON file with ECG segment(s)")
     parser.add_argument("--save", action="store_true", help="Save plots as PNG instead of showing")
+    parser.add_argument("--max-windows", type=int, default=3,
+                        help="Max 10s windows to analyse from a packet-array file (default: 3, 0=all)")
     args = parser.parse_args()
 
     with open(args.json_file) as f:
         data = json.load(f)
 
-    if isinstance(data, dict):
+    # ── Detect packet-array format (ECG_Data_Extracts style) ────────────────
+    # Each file is a list of dicts with keys: utcTimestamp, admissionId, value, packetNo
+    # value is [[sample, sample, ...]] — one sub-list of raw ECG samples per packet
+    def _is_packet_array(d) -> bool:
+        return (isinstance(d, list) and len(d) > 0
+                and isinstance(d[0], dict)
+                and "packetNo" in d[0] and "value" in d[0])
+
+    def _packets_to_segments(packets, fs: int = 125, window_s: int = 10) -> list:
+        """Assemble packets into one continuous signal, split into 10s windows."""
+        admission_id = packets[0].get("admissionId", "Unknown")
+        packets = sorted(packets, key=lambda p: p.get("packetNo", 0))
+        full_signal = []
+        for pkt in packets:
+            v = pkt.get("value", [])
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
+                full_signal.extend(v[0])   # value = [[...samples...]]
+            elif isinstance(v, list):
+                full_signal.extend(v)       # value = [...samples...]
+        full_signal = np.array(full_signal, dtype=np.float64)
+        window_len = fs * window_s
+        total_windows = len(full_signal) // window_len
+        n_windows = total_windows if args.max_windows == 0 else min(total_windows, args.max_windows)
+        print(f"Packet file: {len(packets)} packets → {len(full_signal)} samples "
+              f"({len(full_signal)/fs:.1f}s) → showing {n_windows}/{total_windows} x {window_s}s windows")
+        segs = []
+        for w in range(n_windows):
+            chunk = full_signal[w * window_len: (w + 1) * window_len]
+            segs.append({
+                "signal": chunk.tolist(),
+                "fs": fs,
+                "label": f"Adm {admission_id} | Window {w+1}/{total_windows}",
+            })
+        return segs
+
+    if _is_packet_array(data):
+        segments = _packets_to_segments(data)
+    elif isinstance(data, dict):
         segments = [data]
     elif isinstance(data, list):
         segments = data
     else:
         print("Error: JSON must be a dict or list of dicts")
         sys.exit(1)
+
+    # ── Normalise: support "signal" (internal) and "ecgData" (device JSON) ──
+    def _normalise_segment(seg: dict) -> dict:
+        seg = dict(seg)  # shallow copy — don't mutate original
+        if "signal" not in seg and "ecgData" in seg:
+            seg["signal"] = seg["ecgData"]
+        if "label" not in seg:
+            label_parts = []
+            if seg.get("patientId"):
+                label_parts.append(f"Patient {seg['patientId']}")
+            if seg.get("admissionId"):
+                label_parts.append(f"Adm {seg['admissionId']}")
+            seg["label"] = " | ".join(label_parts) if label_parts else "Unknown"
+        return seg
+
+    segments = [_normalise_segment(s) for s in segments]
 
     print(f"\nECG Pipeline Analysis Report")
     print(f"Loaded {len(segments)} segment(s) from {args.json_file}")
