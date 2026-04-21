@@ -74,9 +74,24 @@ class RhythmOrchestrator:
         sinus_label, sinus_conf, sinus_reason = detect_sinus_and_rhythm(clinical_features)
 
         if sinus_label != "Unknown":
-            # Sinus Rhythm detected by signal processing - NO ML needed
+            # Sinus Rhythm detected by signal processing — NO ML needed by default.
             decision.background_rhythm = sinus_label
             print(f"[Sinus Detection] {sinus_label} (conf={sinus_conf:.2f}) - {sinus_reason}")
+
+            # ML veto: if ML is highly confident about a dangerous rhythm, let it
+            # override the sinus call.  Threshold 0.88 is intentionally not too strict —
+            # it fires only when the model is very sure, not on borderline cases.
+            _DANGEROUS_RHYTHMS = {
+                "Atrial Fibrillation", "AF", "Atrial Flutter",
+                "3rd Degree AV Block", "2nd Degree AV Block Type 2",
+                "Ventricular Fibrillation", "Ventricular Tachycardia", "VT",
+            }
+            _rhythm_block_early = ml_prediction.get("rhythm") or {}
+            _ml_label_early     = _rhythm_block_early.get("label", "Unknown")
+            _ml_conf_early      = float(_rhythm_block_early.get("confidence", 0.0))
+            if _ml_label_early in _DANGEROUS_RHYTHMS and _ml_conf_early >= 0.88:
+                decision.background_rhythm = _ml_label_early
+                print(f"[ML Veto] {_ml_label_early} (conf={_ml_conf_early:.2f}) overrides {sinus_label}")
         else:
             # Not Sinus → will use ML model below
             decision.background_rhythm = "Unknown"
@@ -92,6 +107,7 @@ class RhythmOrchestrator:
             signal=np.asarray(_signal, dtype=np.float32) if _signal else None,
             r_peaks=np.asarray(_r_peaks, dtype=int) if _r_peaks else None,
             fs=_fs,
+            background_rhythm=decision.background_rhythm,
         )
         
         # B) ML-Derived Events (Only if NOT Sinus - Sinus already detected above)

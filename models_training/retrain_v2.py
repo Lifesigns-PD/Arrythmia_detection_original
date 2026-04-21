@@ -54,9 +54,15 @@ from models_v2 import CNNTransformerWithFeatures, load_v2_from_v1_checkpoint
 from signal_processing_v3 import process_ecg_v3
 from signal_processing_v3.features.extraction import (
     feature_dict_to_vector,
-    FEATURE_NAMES_V3 as FEATURE_NAMES,
+    feature_dict_to_vector_task,
+    FEATURE_NAMES_V3,
+    FEATURE_NAMES_RHYTHM,
+    FEATURE_NAMES_ECTOPY,
+    _get_feature_names_for_task,
 )
-NUM_FEATURES = len(FEATURE_NAMES)
+
+def _task_num_features(task: str) -> int:
+    return len(_get_feature_names_for_task(task))
 
 
 def clean_signal(sig, fs):
@@ -65,10 +71,17 @@ def clean_signal(sig, fs):
     return preprocess_v3(sig, fs=fs)["cleaned"].astype(np.float32)
 
 
-def extract_feature_vector(sig, fs=125, r_peaks=None):
-    """V3 feature extractor — drop-in replacement for V2 extract_feature_vector."""
+def extract_feature_vector(sig, fs=125, r_peaks=None, feature_names=None):
+    """
+    V3 feature extractor. Always runs the full V3 pipeline (60 features),
+    then slices to the task-specific subset if feature_names is provided.
+    feature_names=None → returns full 60-feature vector (backward compat).
+    """
     result = process_ecg_v3(sig, fs=fs, min_quality=0.0)
-    return feature_dict_to_vector(result["features"])
+    if feature_names is None:
+        return feature_dict_to_vector(result["features"])
+    vec = [float(result["features"].get(k) or 0.0) for k in feature_names]
+    return np.array(vec, dtype=np.float32)
 
 # ---------------------------------------------------------------------------
 # Paths & DB
@@ -158,18 +171,22 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
     SLIDE_STEP     = 1250
 
     def __init__(self, task="rhythm", source_filter="all", augment=False):
-        self.augment = augment
-        self.task    = task
-        self.samples = []  # (signal, features, label, source, seg_id, filename)
-        self.scaler  = None  # Set by run_initial/run_finetune after fitting
+        self.augment       = augment
+        self.task          = task
+        self.samples       = []  # (signal, features, label, source, seg_id, filename)
+        self.scaler        = None  # Set by run_initial/run_finetune after fitting
+        self.feature_names = _get_feature_names_for_task(task)   # task-specific subset
+        self.num_features  = len(self.feature_names)
         self.training_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        print(f"\n[DatasetV2] task={task}  filter={source_filter}")
+        print(f"\n[DatasetV2] task={task}  filter={source_filter}  features={self.num_features}")
         print(f"[DatasetV2] Training session: {self.training_session_id}")
         print( "[DatasetV2] Fetching segments from DB...")
 
-        # ARCHITECTURAL FIX: Only fetch segments that are cardiologist-verified (is_corrected=TRUE)
-        # This prevents reusing stale annotations from prior training runs.
+        # Use ALL labeled data (arrhythmia_label IS NOT NULL) — same as the best
+        # historical runs (April 2026). The is_corrected=TRUE filter was cutting
+        # training data from ~26K → ~8K windows and caused accuracy collapse.
+        # Cardiologist-verified data is still oversampled 5× via build_sampler().
         with psycopg2.connect(**DB_PARAMS) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -177,12 +194,12 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                            segment_fs, filename, is_corrected, features_json, sqi_score
                     FROM   ecg_features_annotatable
                     WHERE  signal_data IS NOT NULL
-                      AND  is_corrected = TRUE
+                      AND  arrhythmia_label IS NOT NULL
                     ORDER BY segment_id
                 """)
                 rows = cur.fetchall()
 
-        print(f"[DatasetV2] Fetched {len(rows)} cardiologist-verified segments")
+        print(f"[DatasetV2] Fetched {len(rows)} labeled segments (all sources)")
 
         skipped_null, skipped_short, skipped_label, total_windows = 0, 0, 0, 0
         used_segment_ids = set()  # Track segments used for None-class to prevent duplication
@@ -264,7 +281,9 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                 events = []
 
             # Corrected rhythm segments (same logic as retrain.py)
-            if self.task == "rhythm" and is_corrected and arrhythmia_label:
+            # EXCLUDE SINUS: sinus detected by signal processing rules BEFORE ML, not trained
+            _sinus_labels = {"Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia"}
+            if self.task == "rhythm" and is_corrected and arrhythmia_label and arrhythmia_label not in _sinus_labels:
                 has_existing = any(
                     ev.get("event_category") == "RHYTHM" and ev.get("annotation_source") == "cardiologist"
                     for ev in events if isinstance(ev, dict)
@@ -281,7 +300,10 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                             if features_json_raw:
                                 try:
                                     fj = features_json_raw if isinstance(features_json_raw, dict) else json.loads(features_json_raw)
-                                    stored_feat = feature_dict_to_vector(fj)
+                                    stored_feat = np.array(
+                                        [float(fj.get(k) or 0.0) for k in self.feature_names],
+                                        dtype=np.float32,
+                                    )
                                 except Exception:
                                     stored_feat = None
                             for win in windows:
@@ -289,7 +311,11 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                                     if stored_feat is not None:
                                         feat = stored_feat
                                     else:
-                                        feat = extract_feature_vector(win, fs=self.TARGET_FS, r_peaks=None)
+                                        feat = extract_feature_vector(win, fs=self.TARGET_FS, feature_names=self.feature_names)
+                                    # Skip any sample with NaN values
+                                    if np.any(np.isnan(feat)):
+                                        log_load_error("nan_values", seg_id, f"skipped window with NaN in features")
+                                        continue
                                     self.samples.append((
                                         win, feat, label_idx, "cardiologist",
                                         seg_id, filename or ""
@@ -354,7 +380,11 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
 
                     for win in windows:
                         if win is not None:
-                            feat = extract_feature_vector(win, fs=self.TARGET_FS, r_peaks=None)
+                            feat = extract_feature_vector(win, fs=self.TARGET_FS, feature_names=self.feature_names)
+                            # Skip any sample with NaN values
+                            if np.any(np.isnan(feat)):
+                                log_load_error("nan_values", seg_id, f"skipped {event_type} window with NaN in features")
+                                continue
                             self.samples.append((
                                 win, feat, label_idx, ann_source,
                                 seg_id, filename or ""
@@ -469,7 +499,7 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                     try:
                         win = self._center_window(sig, r / self.TARGET_FS, self.TARGET_FS)
                         if win is not None:
-                            feat = extract_feature_vector(win, fs=self.TARGET_FS, r_peaks=None)
+                            feat = extract_feature_vector(win, fs=self.TARGET_FS, feature_names=self.feature_names)
                             none_candidates.append((win, feat, ECTOPY_INDEX["None"], "imported", seg_id, filename or ""))
                     except Exception as e:
                         log_load_error("feature_extract_errors", seg_id, f"none-class beat: {str(e)}")
@@ -561,7 +591,7 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
         if self.augment:
             sig = self._augment_signal(sig.copy())
             # Re-extract features from augmented signal for consistency
-            feat = extract_feature_vector(sig, fs=self.TARGET_FS, r_peaks=None)
+            feat = extract_feature_vector(sig, fs=self.TARGET_FS, feature_names=self.feature_names)
         # Apply feature scaler if fitted (prevents high-magnitude features from
         # dominating gradient descent; scaler is fit on training split only)
         if self.scaler is not None:
@@ -826,9 +856,11 @@ def _update_training_metadata(dataset, training_round_increment=True):
 # INITIAL TRAINING (v2)
 # ---------------------------------------------------------------------------
 def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
+    feature_names = _get_feature_names_for_task(task)
+    num_features  = len(feature_names)
     print(f"\n{'='*65}")
     print(f"  V2 INITIAL TRAINING  |  task={task.upper()}  epochs={num_epochs}")
-    print(f"  Features: {NUM_FEATURES} ({', '.join(FEATURE_NAMES[:5])}...)")
+    print(f"  Features: {num_features} ({', '.join(feature_names[:5])}...)")
     print(f"{'='*65}")
 
     class_names = RHYTHM_CLASS_NAMES if task == "rhythm" else ECTOPY_CLASS_NAMES
@@ -901,12 +933,12 @@ def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
         v1_ckpt = CHECKPOINTS / f"best_model_{task}.pth"
         if v1_ckpt.exists():
             print(f"\n[Bootstrap] Loading signal pathway from v1: {v1_ckpt}")
-            model, _ = load_v2_from_v1_checkpoint(v1_ckpt, num_classes, NUM_FEATURES, device)
+            model, _ = load_v2_from_v1_checkpoint(v1_ckpt, num_classes, num_features, device)
         else:
             print(f"[Bootstrap] v1 checkpoint not found at {v1_ckpt}, starting fresh")
-            model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=NUM_FEATURES).to(device)
+            model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=num_features).to(device)
     else:
-        model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=NUM_FEATURES).to(device)
+        model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=num_features).to(device)
 
     criterion = _build_criterion(train_labels, num_classes, device)
     opt       = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-3)  # 5e-4→5e-3: stronger regularisation
@@ -936,8 +968,8 @@ def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
                 "model_state":  model.state_dict(),
                 "balanced_acc": best_bal_acc,
                 "class_names":  class_names,
-                "num_features": NUM_FEATURES,
-                "feature_names": FEATURE_NAMES,
+                "num_features": num_features,
+                "feature_names": feature_names,
                 "mode":         "initial",
                 "version":      "v2",
             }, ckpt_path)
@@ -959,8 +991,10 @@ def run_initial(task, num_epochs, batch_size, lr, bootstrap_v1=False):
 # FINE-TUNE (v2)
 # ---------------------------------------------------------------------------
 def run_finetune(task, num_epochs, batch_size, lr):
+    feature_names = _get_feature_names_for_task(task)
+    num_features  = len(feature_names)
     print(f"\n{'='*65}")
-    print(f"  V2 FINE-TUNE  |  task={task.upper()}  epochs={num_epochs}")
+    print(f"  V2 FINE-TUNE  |  task={task.upper()}  epochs={num_epochs}  features={num_features}")
     print(f"{'='*65}")
 
     class_names = RHYTHM_CLASS_NAMES if task == "rhythm" else ECTOPY_CLASS_NAMES
@@ -1024,7 +1058,7 @@ def run_finetune(task, num_epochs, batch_size, lr):
     val_ldr   = DataLoader(val_ds,   batch_size=max(1, eff_batch), shuffle=False, collate_fn=collate_fn_v2)
 
     # Load v2 checkpoint
-    model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=NUM_FEATURES).to(device)
+    model = CNNTransformerWithFeatures(num_classes=num_classes, num_features=num_features).to(device)
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
     prev_acc = state.get("balanced_acc", 0.0)
@@ -1056,7 +1090,7 @@ def run_finetune(task, num_epochs, batch_size, lr):
             best_bal_acc = va["balanced_acc"]
             torch.save({"epoch": ep, "model_state": model.state_dict(),
                         "balanced_acc": best_bal_acc, "class_names": class_names,
-                        "num_features": NUM_FEATURES, "feature_names": FEATURE_NAMES,
+                        "num_features": num_features, "feature_names": feature_names,
                         "mode": "finetune", "version": "v2"}, ckpt_path)
             print(f"  → Saved (improvement) bal_acc={best_bal_acc:.4f}")
 
@@ -1079,7 +1113,7 @@ def run_finetune(task, num_epochs, batch_size, lr):
             best_bal_acc = va["balanced_acc"]
             torch.save({"epoch": ep, "model_state": model.state_dict(),
                         "balanced_acc": best_bal_acc, "class_names": class_names,
-                        "num_features": NUM_FEATURES, "feature_names": FEATURE_NAMES,
+                        "num_features": num_features, "feature_names": feature_names,
                         "mode": "finetune", "version": "v2"}, ckpt_path)
             print(f"  → Saved (improvement) bal_acc={best_bal_acc:.4f}")
 
@@ -1120,7 +1154,7 @@ if __name__ == "__main__":
     print(f"[retrain_v2] task={args.task}  mode={args.mode}  epochs={args.epochs}  "
           f"batch={args.batch}  lr={args.lr}  bootstrap_v1={args.bootstrap_v1}")
     print(f"[retrain_v2] Log: {log_path}")
-    print(f"[retrain_v2] Features: {NUM_FEATURES} dimensions")
+    print(f"[retrain_v2] Features: {_task_num_features(args.task)} dimensions ({args.task})")
 
     if args.mode == "initial":
         run_initial(args.task, args.epochs, args.batch, args.lr, args.bootstrap_v1)

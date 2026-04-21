@@ -174,6 +174,8 @@ def _dfa(rr: np.ndarray, lags) -> Optional[float]:
 def _poincare(rr: np.ndarray):
     rr1 = rr[:-1]
     rr2 = rr[1:]
+    if len(rr1) < 2:          # ddof=1 needs at least 2 elements
+        return 0.0, 0.0
     sd1 = float(np.std((rr2 - rr1) / np.sqrt(2), ddof=1))
     sd2 = float(np.std((rr2 + rr1) / np.sqrt(2), ddof=1))
     return sd1, sd2

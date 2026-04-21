@@ -55,11 +55,14 @@ def _classify_compensatory_pause(
     return None  # ambiguous — trust ML
 
 
+_SINUS_BACKGROUNDS = {"Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia"}
+
 def derive_rule_events(
     features: Dict[str, Any],
     signal: Optional[np.ndarray] = None,
     r_peaks: Optional[np.ndarray] = None,
     fs: int = 125,
+    background_rhythm: str = "Unknown",
 ) -> List[Event]:
     """
     Analyzes clinical features to detect arrhythmias strictly via rules.
@@ -97,7 +100,10 @@ def derive_rule_events(
     if len(rr_arr) >= 4:
         rr_std = float(np.std(rr_arr))
         p_ratio = float(features.get("p_wave_present_ratio") or 1.0)
-        if rr_std > 160 and p_ratio < 0.4:
+        # Only fire AF safety net if sinus was NOT already declared — avoids a
+        # contradictory state where background=Sinus but an AF event also appears.
+        _sinus_declared = background_rhythm in _SINUS_BACKGROUNDS
+        if rr_std > 160 and p_ratio < 0.4 and not _sinus_declared:
             events.append(Event(
                 event_id=str(uuid.uuid4()),
                 event_type="Atrial Fibrillation",

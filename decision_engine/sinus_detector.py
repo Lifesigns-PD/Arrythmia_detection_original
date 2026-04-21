@@ -168,12 +168,11 @@ def detect_sinus_and_rhythm(features: Dict) -> Tuple[str, float, str]:
     sinus_variant = detector.classify_sinus_variant(features)
     confidence = 0.95  # High confidence when all criteria met
 
-    # Step 3: Check for ectopy override
-    ectopy_override = detector.check_ectopy_override(features)
-
-    if ectopy_override:
-        # Has Sinus + significant ectopy → use ectopy label
-        return ectopy_override, 0.80, f"Sinus + {ectopy_override} (ectopy override)"
+    # Step 3: Ectopy override intentionally disabled.
+    # The ML ectopy model detects PVC/PAC per-beat at ≥0.97 confidence, which is
+    # more precise than the segment-level pvc_score_mean threshold used here.
+    # Having two ectopy sources gave inconsistent counts — ML model wins.
+    # ectopy_override = detector.check_ectopy_override(features)  ← disabled
 
     # Return Sinus variant
     return sinus_variant, confidence, f"Sinus rhythm detected: {sinus_reason}"
