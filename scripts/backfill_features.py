@@ -140,8 +140,8 @@ def main():
     print(f"  Errors  : {errors}")
     print(f"  Features: {len(FEATURE_NAMES_V3)} dimensions")
     print(f"\nNext step:")
-    print(f"  python models_training/retrain_v2.py --task rhythm --mode initial")
-    print(f"  python models_training/retrain_v2.py --task ectopy --mode initial")
+    print(f"  python models_training/retrain_v2.py --task rhythm --mode finetune")
+    print(f"  (ectopy model does not need retraining — it takes raw signal, not features)")
 
 
 if __name__ == "__main__":

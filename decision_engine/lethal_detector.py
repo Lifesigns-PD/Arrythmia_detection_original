@@ -38,12 +38,25 @@ def detect_signal_rhythm(
         return label, 0.92, f"Spectral SPI >0.75 — {spec_label}"
 
     # ── Feature-based checks (use V3 60-feature dict) ────────────────────────
-    hr           = float(features.get("mean_hr_bpm") or features.get("mean_hr") or 0)
-    rr_cv        = float(features.get("rr_cv") or 0)
-    qrs_ms       = float(features.get("qrs_duration_ms") or 0)
-    wide_frac    = float(features.get("wide_qrs_fraction") or 0)
-    p_present    = float(features.get("p_wave_present_ratio") if features.get("p_wave_present_ratio") is not None else 1.0)
-    p_absent     = 1.0 - p_present
+    # Key mapping — V3 features use these exact names:
+    #   qrs_wide_fraction   (BEAT_DISC_FEATURES, not "wide_qrs_fraction")
+    #   p_absent_fraction   (BEAT_DISC_FEATURES, not "p_wave_present_ratio")
+    #   rr_cv, qrs_duration_ms, mean_hr_bpm — exact match
+    hr        = float(features.get("mean_hr_bpm") or features.get("mean_hr") or 0)
+    rr_cv     = float(features.get("rr_cv") or 0)
+    qrs_ms    = float(features.get("qrs_duration_ms") or 0)
+    wide_frac = float(features.get("qrs_wide_fraction")   # V3 canonical name
+                      or features.get("wide_qrs_fraction")  # fallback alias
+                      or 0)
+    # p_absent: prefer direct p_absent_fraction, else invert p_wave_present_ratio
+    _p_absent_direct  = features.get("p_absent_fraction")
+    _p_present_stored = features.get("p_wave_present_ratio")
+    if _p_absent_direct is not None:
+        p_absent = float(_p_absent_direct)
+    elif _p_present_stored is not None:
+        p_absent = 1.0 - float(_p_present_stored)
+    else:
+        p_absent = 0.0
 
     if _kinetic_vtach(hr, qrs_ms, wide_frac, p_absent):
         return ("Ventricular Tachycardia", 0.85,
