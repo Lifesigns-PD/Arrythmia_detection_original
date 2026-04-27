@@ -358,6 +358,8 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
                 # Resolve label
                 if self.task == "rhythm":
                     if event.get("event_category") == "ECTOPY": continue
+                    # Sinus labels excluded — handled by signal processing rules, not ML
+                    if event_type in {"Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia"}: continue
                     label_idx = get_rhythm_label_idx(event_type)
                 else:
                     if event.get("event_category") == "RHYTHM": continue
@@ -522,7 +524,7 @@ class ECGEventDatasetV2(torch.utils.data.Dataset):
             count = label_counts.get(idx, 0)
             print(f"              {idx}: {name} = {count}")
             if count == 0 and idx in [0, 1, 2, 3]:  # Critical classes
-                if self.task == "rhythm" and idx in [4, 5, 6, 7, 8, 9]:  # VF, VT rare classes
+                if self.task == "rhythm" and idx in [5, 6]:  # Artifact, 2nd Degree AV Block rare
                     continue  # Skip warning for ultra-rare classes
                 print(f"              [WARNING] Critical class has 0 samples!")
 

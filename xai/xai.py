@@ -12,8 +12,14 @@ import joblib
 
 from models_training.models_v2 import CNNTransformerWithFeatures
 from models_training.data_loader import CLASS_NAMES, RHYTHM_CLASS_NAMES, ECTOPY_CLASS_NAMES, extract_fixed_window, WINDOW_SEC
-from signal_processing_v3.features.extraction import FEATURE_NAMES_V3 as FEATURE_NAMES
+from signal_processing_v3.features.extraction import (
+    FEATURE_NAMES_V3 as FEATURE_NAMES,
+    FEATURE_NAMES_RHYTHM,
+    FEATURE_NAMES_ECTOPY,
+)
 NUM_FEATURES = len(FEATURE_NAMES)
+NUM_FEATURES_RHYTHM = len(FEATURE_NAMES_RHYTHM)   # 36
+NUM_FEATURES_ECTOPY = len(FEATURE_NAMES_ECTOPY)   # 47
 from decision_engine.models import SegmentDecision, SegmentState, DisplayState
 
 
@@ -103,7 +109,8 @@ def _load_model(task="rhythm"):
         return current_model
 
     device = _init_device()
-    model  = CNNTransformerWithFeatures(num_classes=len(classes), num_features=NUM_FEATURES)
+    nf     = NUM_FEATURES_RHYTHM if task == "rhythm" else NUM_FEATURES_ECTOPY
+    model  = CNNTransformerWithFeatures(num_classes=len(classes), num_features=nf)
 
     if ckpt.exists():
         try:
@@ -403,14 +410,15 @@ def _build_features_tensor(features: dict, device, task: str = "rhythm") -> torc
     Without the scaler, high-magnitude features (SDNN ~200 ms) dominate
     over low-magnitude clinical features (ST ~0.1 mV).
     """
+    feat_names = FEATURE_NAMES_RHYTHM if task == "rhythm" else FEATURE_NAMES_ECTOPY
     vec = np.array(
-        [float(features.get(name) or 0.0) for name in FEATURE_NAMES],
+        [float(features.get(name) or 0.0) for name in feat_names],
         dtype=np.float32,
     )
     scaler = _load_scaler(task)
     if scaler is not None:
         vec = scaler.transform(vec.reshape(1, -1))[0].astype(np.float32)
-    return torch.from_numpy(vec[None, :]).to(device)  # shape (1, NUM_FEATURES)
+    return torch.from_numpy(vec[None, :]).to(device)  # shape (1, num_features)
 
 
 def _compute_saliency(model, x, target_idx: int, features_t=None):

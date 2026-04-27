@@ -74,34 +74,35 @@ class RhythmOrchestrator:
         sinus_label, sinus_conf, sinus_reason = detect_sinus_and_rhythm(clinical_features)
 
         if sinus_label != "Unknown":
-            # Sinus Rhythm detected by signal processing — NO ML needed by default.
+            # Sinus Rhythm detected by signal processing — NO ML needed.
             decision.background_rhythm = sinus_label
             print(f"[Sinus Detection] {sinus_label} (conf={sinus_conf:.2f}) - {sinus_reason}")
-
-            # ML veto: if ML is highly confident about a dangerous rhythm, let it
-            # override the sinus call.  Threshold 0.88 is intentionally not too strict —
-            # it fires only when the model is very sure, not on borderline cases.
-            _DANGEROUS_RHYTHMS = {
-                "Atrial Fibrillation", "AF", "Atrial Flutter",
-                "3rd Degree AV Block", "2nd Degree AV Block Type 2",
-                "Ventricular Fibrillation", "Ventricular Tachycardia", "VT",
-            }
-            _rhythm_block_early = ml_prediction.get("rhythm") or {}
-            _ml_label_early     = _rhythm_block_early.get("label", "Unknown")
-            _ml_conf_early      = float(_rhythm_block_early.get("confidence", 0.0))
-            if _ml_label_early in _DANGEROUS_RHYTHMS and _ml_conf_early >= 0.88:
-                decision.background_rhythm = _ml_label_early
-                print(f"[ML Veto] {_ml_label_early} (conf={_ml_conf_early:.2f}) overrides {sinus_label}")
         else:
             # Not Sinus → will use ML model below
             decision.background_rhythm = "Unknown"
-            print(f"[Sinus Detection] Not Sinus - passing to ML model")
+            print(f"[Sinus Detection] Not Sinus - passing to lethal detector then ML")
+
+        # 3.5 — Lethal / non-ML rhythm gate (VTach / VFib / SVT via signal processing)
+        # Runs BEFORE the ML rhythm model. If it fires, ML rhythm is automatically
+        # skipped because Step 4B is gated on background_rhythm == "Unknown".
+        _signal  = clinical_features.get("_signal_clean") or clinical_features.get("_signal")
+        _r_peaks = clinical_features.get("r_peaks")
+        _fs      = int(clinical_features.get("fs", 125))
+
+        if decision.background_rhythm == "Unknown" and _signal is not None and _r_peaks is not None:
+            from decision_engine.lethal_detector import detect_signal_rhythm
+            _lethal_label, _lethal_conf, _lethal_reason = detect_signal_rhythm(
+                signal=np.asarray(_signal, dtype=np.float32),
+                r_peaks=np.asarray(_r_peaks, dtype=int),
+                features=clinical_features,
+                fs=_fs,
+            )
+            if _lethal_label:
+                decision.background_rhythm = _lethal_label
+                print(f"[Lethal/Signal Detection] {_lethal_label} (conf={_lethal_conf:.2f}) — {_lethal_reason}")
 
         # 4. Gather Events
         # A) Rule-Derived Events — pass signal + r_peaks for AFL spectral detection
-        _signal  = clinical_features.get("_signal")
-        _r_peaks = clinical_features.get("r_peaks")
-        _fs      = int(clinical_features.get("fs", 125))
         rule_events = derive_rule_events(
             clinical_features,
             signal=np.asarray(_signal, dtype=np.float32) if _signal else None,
@@ -133,7 +134,7 @@ class RhythmOrchestrator:
                 "2nd Degree AV Block Type 2":    0.85,
                 "2nd Degree AV Block Type 1":    0.82,
                 "1st Degree AV Block":           0.80,
-                "Bundle Branch Block":           0.80,
+                "Intraventricular Conduction Delay": 0.80,
             }
             required_conf = _RHYTHM_CONF_THRESHOLDS.get(ml_label, 0.80)
             if ml_label not in ["Sinus Rhythm", "Unknown"] and ml_conf > required_conf:
@@ -189,6 +190,21 @@ class RhythmOrchestrator:
             )
             if not has_consecutive_run:
                 candidate_beats = []  # Scattered high-density ectopy → hallucination → suppress
+
+        # Step 4: Template correlation refinement — override low-confidence ML calls
+        # using BATCH_PROCESS morphological scoring (Pearson + Ashman + T-deformation).
+        # Only fires when there are candidate beats and a clean signal available.
+        if candidate_beats and _signal is not None and _r_peaks is not None:
+            _per_beat = clinical_features.get("_per_beat_delineation", [])
+            if _per_beat:
+                from decision_engine.beat_classifier import refine_beat_labels
+                candidate_beats = refine_beat_labels(
+                    beat_events=candidate_beats,
+                    signal=np.asarray(_signal, dtype=np.float32),
+                    r_peaks=np.asarray(_r_peaks, dtype=int),
+                    per_beat_delineation=_per_beat,
+                    fs=_fs,
+                )
 
         for b in candidate_beats:
             t_center = b["peak_sample"] / seg_fs
@@ -246,21 +262,18 @@ class RhythmOrchestrator:
 
     def _detect_background_rhythm(self, features: Dict[str, Any]) -> str:
         """
-        Determines background rhythm from HR + P-wave + QRS width.
-        Uses clinical features beyond just rate for Junctional / Idioventricular detection.
+        Determines background rhythm from HR and P-wave ratio.
+        Used only for the SQI-unreliable path — main detection is in sinus_detector + lethal_detector.
         """
         hr_val  = features.get("mean_hr") or features.get("mean_hr_bpm")
         hr      = float(hr_val) if hr_val is not None else 0.0
         p_ratio = float(features.get("p_wave_present_ratio") or 1.0)
-        qrs_ms  = float(features.get("qrs_duration_ms") or 0)
 
         if hr == 0:
             return "Unknown"
 
         if hr < 60:
             # Slow rhythm — check for escape pacemakers
-            if p_ratio < 0.2 and qrs_ms > 120:
-                return "Idioventricular Rhythm"   # Wide-complex ventricular escape
             if p_ratio < 0.3:
                 return "Junctional Rhythm"        # Narrow, no P-waves, slow
             return "Sinus Bradycardia"

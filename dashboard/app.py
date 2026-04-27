@@ -99,7 +99,12 @@ def _load_data_from_json(file_path: Path) -> Tuple[np.ndarray, int]:
     return signal, original_fs
 
 
-from signal_processing.cleaning import clean_signal
+from signal_processing_v3.preprocessing.pipeline import preprocess_v3
+
+def clean_signal(sig, fs):
+    """V3 preprocessing replaces V2 clean_signal."""
+    return preprocess_v3(sig, fs=fs)["cleaned"].astype(np.float32)
+
 
 def _preprocess(signal: np.ndarray, original_fs: int) -> np.ndarray:
     """
@@ -787,33 +792,39 @@ def get_segment_api(segment_id: int):
         except:
             r_peaks_arr = np.array([], dtype=int)
 
-    # Vitals: computed live via NeuroKit2 — independent of stored features_json
-    # HR from RR intervals (R-peaks already detected above)
-    mean_hr = 0.0
-    if len(r_peaks_arr) >= 2:
+    # Vitals: prefer V3 pipeline values stored in DB features_json.
+    # These come from the full V3 ensemble R-peak + DWT delineation pipeline
+    # and are more accurate than the dashboard's own re-computation.
+    # Fall back to live computation only when the stored value is missing/zero.
+    _sig_arr = np.array(raw_signal, dtype=np.float32)
+
+    # Heart rate — from V3 features (mean_hr_bpm), else from live RR intervals
+    mean_hr = float(features.get("mean_hr_bpm") or 0.0)
+    if mean_hr == 0.0 and len(r_peaks_arr) >= 2:
         rr_intervals = np.diff(r_peaks_arr)
         rr_valid = rr_intervals[(rr_intervals > seg_fs * 0.2) & (rr_intervals < seg_fs * 3.0)]
         if len(rr_valid) > 0:
             mean_hr = float(60.0 * seg_fs / np.mean(rr_valid))
 
-    # QRS duration: live NeuroKit2 DWT delineation
-    _sig_arr = np.array(raw_signal, dtype=np.float32)
-    qrs_mean_ms = 0.0
-    try:
-        qrs_durations = _compute_qrs_durations(_sig_arr, r_peaks_arr, seg_fs)
-        if qrs_durations is not None and len(qrs_durations) > 0:
-            qrs_mean_ms = float(np.median(qrs_durations))
-    except Exception:
-        pass
+    # QRS duration — from V3 features (qrs_duration_ms), else live NeuroKit2 DWT
+    qrs_mean_ms = float(features.get("qrs_duration_ms") or 0.0)
+    if qrs_mean_ms == 0.0:
+        try:
+            qrs_durations = _compute_qrs_durations(_sig_arr, r_peaks_arr, seg_fs)
+            if qrs_durations is not None and len(qrs_durations) > 0:
+                qrs_mean_ms = float(np.median(qrs_durations))
+        except Exception:
+            pass
 
-    # PR interval: live NeuroKit2 DWT delineation
-    pr_interval_ms = 0.0
-    try:
-        pr_val = _calculate_pr_interval(_sig_arr, r_peaks_arr, seg_fs)
-        if pr_val is not None and pr_val > 0:
-            pr_interval_ms = float(pr_val)
-    except Exception:
-        pass
+    # PR interval — from V3 features (pr_interval_ms), else live NeuroKit2 DWT
+    pr_interval_ms = float(features.get("pr_interval_ms") or 0.0)
+    if pr_interval_ms == 0.0:
+        try:
+            pr_val = _calculate_pr_interval(_sig_arr, r_peaks_arr, seg_fs)
+            if pr_val is not None and pr_val > 0:
+                pr_interval_ms = float(pr_val)
+        except Exception:
+            pass
 
     # constructing structured response for frontend
     vitals = {
@@ -866,27 +877,35 @@ def get_segment_api(segment_id: int):
 
             r_label = ml_prediction.get("rhythm", {}).get("label", "Unknown")
 
-            # Build clinical features for the rules engine
-            # Use V3 features already stored in features_json — avoids re-running
-            # NeuroKit2 delineation separately (which would be inconsistent with the
-            # V3 pipeline used for model training).
+            # Build clinical features for the rules engine.
+            # Start by merging ALL stored V3 features (60-feature dict from DB)
+            # so the lethal detector, sinus gate, and rules engine get every key
+            # they need (rr_cv, wide_qrs_fraction, p_wave_present_ratio, etc.).
             rr_intervals_ms = []
             if len(r_peaks_arr) >= 2:
                 rr_intervals_ms = (np.diff(r_peaks_arr) * 1000.0 / seg_fs).tolist()
 
-            clinical_features = {
-                "mean_hr":            features.get("mean_hr_bpm") or mean_hr,
-                "pr_interval":        features.get("pr_interval_ms") or pr_interval_ms,
-                "per_beat_pr_ms":     [],
-                "rr_intervals_ms":    rr_intervals_ms,
-                "qrs_durations_ms":   [features.get("mean_qrs_duration_ms")] if features.get("mean_qrs_duration_ms") else [],
-                "qrs_duration_ms":    features.get("mean_qrs_duration_ms") or features.get("qrs_duration_ms"),
-                "p_wave_present_ratio": features.get("p_absent_fraction", 1.0),
-                "r_peaks":            r_peaks_arr.tolist() if len(r_peaks_arr) > 0 else [],
-                "pvc_score_mean":     features.get("pvc_score_mean"),
-                "pac_score_mean":     features.get("pac_score_mean"),
-                "fs":                 seg_fs,
-            }
+            clinical_features = {}
+            # Layer 1: all stored V3 features (may be floats — safe to merge first)
+            for k, v in features.items():
+                clinical_features[k] = v
+
+            # Layer 2: computed / required fields that override or extend V3 features
+            clinical_features.update({
+                "mean_hr":              features.get("mean_hr_bpm") or mean_hr,
+                "mean_hr_bpm":          features.get("mean_hr_bpm") or mean_hr,
+                "pr_interval":          features.get("pr_interval_ms") or pr_interval_ms,
+                "rr_intervals_ms":      rr_intervals_ms,
+                "qrs_duration_ms":      features.get("qrs_duration_ms") or features.get("mean_qrs_duration_ms") or 0,
+                "qrs_durations_ms":     [features.get("qrs_duration_ms")] if features.get("qrs_duration_ms") else [],
+                "p_wave_present_ratio": features.get("p_wave_present_ratio", 1.0),
+                "r_peaks":              r_peaks_arr.tolist() if len(r_peaks_arr) > 0 else [],
+                "fs":                   seg_fs,
+                # Pass the preprocessed signal so the lethal detector gets the
+                # bandpass-filtered waveform (not raw) for its Welch PSD check.
+                "_signal":              arr.tolist(),
+                "_signal_clean":        arr.tolist(),
+            })
 
             sqi_result = {"is_acceptable": True, "overall_sqi": 1.0}
 

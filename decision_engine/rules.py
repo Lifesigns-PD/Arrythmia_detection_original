@@ -518,7 +518,7 @@ def apply_training_flags(events: List[Event]) -> None:
         # Blocks — train the rhythm model (indices 7-11 in RHYTHM_CLASS_NAMES)
         "1st Degree AV Block", "2nd Degree AV Block Type 1",
         "2nd Degree AV Block Type 2", "3rd Degree AV Block",
-        "Bundle Branch Block",
+        "Intraventricular Conduction Delay",
 
         # NOTE: SVT, PSVT, Ventricular Run, Atrial Run are RULES-ONLY pattern
         # labels derived from clustering; they are NOT trained directly.

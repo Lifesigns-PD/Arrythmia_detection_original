@@ -1,7 +1,6 @@
 # Decision Engine — Complete Documentation
 ## Rules, Confidence Gates, Event Hierarchy, Display Logic
 
----
 
 ## 1. What the Decision Engine Does
 

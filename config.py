@@ -13,7 +13,7 @@ MONGO_URI        = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB         = os.getenv("MONGO_DB", "ecg_analysis")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "arrhythmia_results")
 
-# Processing constants (fixed — matches Shreyas confirmation)
+# Processing constants
 SAMPLING_RATE      = 125
 SAMPLES_PER_MINUTE = 7500
 WINDOW_SECONDS     = 10

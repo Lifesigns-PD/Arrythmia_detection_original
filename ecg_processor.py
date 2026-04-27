@@ -70,6 +70,8 @@ def _run_orchestrator(window: np.ndarray, v3_result: dict) -> dict:
             "r_peaks":              r_peaks,
             "fs":                   SAMPLING_RATE,
             "_signal":              window.tolist(),
+            "_signal_clean":        v3_result.get("signal", window).tolist(),
+            "_per_beat_delineation": per_beat,
         }
         # Merge all V3 features into clinical_features for orchestrator/explain_segment
         for k, v in features.items():
@@ -157,6 +159,8 @@ def process(
 
         all_rhythms.append(primary)
         all_events.extend(events)
+        if ectopy_label and ectopy_label not in ("None", "none", ""):
+            all_events.append(ectopy_label)
 
         segments_out.append({
             "segment_index":        idx,

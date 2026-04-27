@@ -140,7 +140,7 @@ CLASS_NAMES = [
     "PVC Couplet",                   # 17
     "PAC",                           # 18
     "PAC Bigeminy",                  # 19
-    "Bundle Branch Block",           # 20
+    "Intraventricular Conduction Delay", # 20
     "Artifact",                      # 21
     "Other Arrhythmia",              # 22
     
@@ -185,18 +185,16 @@ ECTOPY_TERMS = [
 ]
 
 RHYTHM_CLASS_NAMES = [
-    "Sinus Rhythm",                  # 0  — 3,244 segs (includes Sinus Tachycardia alias)
+    "Sinus Rhythm",                  # 0  — kept for finetune compatibility with existing checkpoint
     "Atrial Fibrillation",           # 1  — 203 segs
     "Atrial Flutter",                # 2  — 272 segs
     "1st Degree AV Block",           # 3  — 369 segs
     "3rd Degree AV Block",           # 4  — 180 segs
-    "Bundle Branch Block",           # 5  — 500 segs
+    "Intraventricular Conduction Delay", # 5  — 500 segs
     "Artifact",                      # 6  — 240 segs
     "Sinus Bradycardia",             # 7  — 821 segs
     "2nd Degree AV Block Type 2",    # 8  — 68 segs  (Mobitz II — cardiologist verified)
-    # Excluded (zero data):   Idioventricular Rhythm, VF, 2nd Degree AV Block Type 1, Pause
-    # Excluded (too few):     Junctional Rhythm (1), VT (3) — VT detected via rules
-    # Excluded (no def):      Other Arrhythmia — get_rhythm_label_idx returns None
+    # TODO: remove sinus (0, 7) and retrain fresh when doing next initial training run
 ]
 
 # Hard Safety Assertion
@@ -354,7 +352,7 @@ LABEL_MAP = {
     "WENCKEBACH": "2nd Degree AV Block Type 1", 
     "MOBITZ II": "2nd Degree AV Block Type 2", 
     "3AVB": "3rd Degree AV Block", 
-    "BBB": "Bundle Branch Block", "LBBB": "Bundle Branch Block", "RBBB": "Bundle Branch Block",
+    "BBB": "Intraventricular Conduction Delay", "LBBB": "Intraventricular Conduction Delay", "RBBB": "Intraventricular Conduction Delay",
     
     # Ectopy
     "PVC": "PVC", "VPB": "PVC",
@@ -380,8 +378,8 @@ LABEL_MAP = {
     "F": "PVC",               # Fusion of ventricular and normal beat — treated as PVC (clinically closest)
     "E": "Junctional Rhythm", # Escape beat
     "J": "Junctional Rhythm", # Nodal (junctional) premature beat
-    "L": "Bundle Branch Block", # Left bundle branch block beat
-    "R": "Bundle Branch Block", # Right bundle branch block beat
+    "L": "Intraventricular Conduction Delay", # Left bundle branch block beat
+    "R": "Intraventricular Conduction Delay", # Right bundle branch block beat
     "Q": "Artifact",          # Unclassifiable beat
     
     "ARTIFACT": "Artifact"
