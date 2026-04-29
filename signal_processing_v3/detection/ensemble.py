@@ -66,14 +66,40 @@ def detect_r_peaks_ensemble(signal: np.ndarray, fs: int = 125) -> np.ndarray:
     if len(valid) == 0:
         return np.array([], dtype=int)
 
+    # Exclude catastrophically-failed detectors from voting.
+    # If a detector found < 25% of the median count it almost certainly
+    # failed (e.g. Pan-Tompkins at very fast rates or low-amplitude signals).
+    # Keeping it in the vote would require 2-of-3 agreement that is impossible
+    # to satisfy for any beat the failed detector missed.
+    counts   = [len(p) for p in valid]
+    med_cnt  = float(np.median(counts))
+    reliable = [p for p in valid if len(p) >= max(2, 0.25 * med_cnt)]
+    if len(reliable) >= 2:
+        # Use only reliable detectors; enough to do majority voting
+        vote_lists = reliable
+    elif len(reliable) == 1:
+        # Only one detector is reliable — trust it directly, skip voting
+        agreed = _validate_rr(reliable[0], fs)
+        refine_win = max(int(0.020 * fs), 2)
+        refined = []
+        for p in agreed:
+            lo = max(0, int(p) - refine_win)
+            hi = min(len(signal), int(p) + refine_win + 1)
+            seg = signal[lo:hi]
+            local = int(np.argmin(seg)) if polarity == "negative" else int(np.argmax(seg))
+            refined.append(lo + local)
+        return np.array(refined, dtype=int) if refined else np.array([], dtype=int)
+    else:
+        vote_lists = valid
+
     # ── Adaptive voting window for irregular rhythms / wide PVC QRS ──────────
     # PVCs produce wide QRS complexes (120–180 ms).  Pan-Tompkins fires on the
     # steep upstroke while Hilbert / Wavelet fire on the amplitude peak — these
     # can be separated by 30–70 ms on a single beat.  When RR is irregular
     # (CV > 0.15, typical of AF or frequent PVCs), widen the agreement window
     # to 80 ms so a valid wide-QRS beat is not rejected as a "non-agreement".
-    if len(valid) >= 1:
-        best_det = max(valid, key=len)
+    if len(vote_lists) >= 1:
+        best_det = max(vote_lists, key=len)
         if len(best_det) >= 3:
             rr = np.diff(np.sort(best_det))
             rr_valid = rr[(rr > int(0.2 * fs)) & (rr < int(3.0 * fs))]
@@ -83,12 +109,16 @@ def detect_r_peaks_ensemble(signal: np.ndarray, fs: int = 125) -> np.ndarray:
                     # Irregular rhythm (AF, PVC-laden) — widen to 80 ms
                     agree_win = max(int(0.080 * fs), agree_win)
 
-    if len(valid) == 1:
-        agreed = valid[0]
+    if len(vote_lists) == 1:
+        agreed = vote_lists[0]
     else:
-        agreed = _vote(all_peaks, agree_win)
+        agreed = _vote(vote_lists, agree_win)
         if len(agreed) < 2:
-            agreed = max(valid, key=len)
+            agreed = max(vote_lists, key=len)
+
+    # Remove any residual duplicates within 220 ms (false doubles from union)
+    min_gap = max(int(0.220 * fs), 2)
+    agreed  = _dedup(agreed, min_gap)
 
     validated = _validate_rr(agreed, fs)
 
@@ -178,8 +208,18 @@ def _vote(peak_lists: List[np.ndarray], agree_win: int) -> np.ndarray:
     """
     Return peaks confirmed by ≥ 2 detectors within agree_win samples.
     Position = median of agreeing detector positions.
+
+    Special case — exactly 2 reliable detectors:
+    Take the union of both lists (deduped within agree_win) rather than
+    requiring 2-of-2 agreement.  Both Hilbert and Wavelet are trusted
+    detectors; their disagreements at fast rates are timing offsets on
+    the same real beat, not false positives.  Requiring exact agreement
+    causes systematic beat dropout at HR > 130 bpm.
     """
-    # Use the list with most peaks as "reference"
+    if len(peak_lists) == 2:
+        return _union_two(peak_lists[0], peak_lists[1], agree_win)
+
+    # ≥ 3 detectors: standard majority-vote (≥ 2 must agree)
     reference = max(peak_lists, key=len)
     if len(reference) == 0:
         return np.array([], dtype=int)
@@ -190,7 +230,6 @@ def _vote(peak_lists: List[np.ndarray], agree_win: int) -> np.ndarray:
         for other_list in peak_lists:
             if other_list is reference:
                 continue
-            # Find nearest peak in other_list
             if len(other_list) == 0:
                 continue
             diffs = np.abs(other_list - ref_peak)
@@ -204,16 +243,67 @@ def _vote(peak_lists: List[np.ndarray], agree_win: int) -> np.ndarray:
     if len(confirmed) == 0:
         return np.array([], dtype=int)
 
-    # Remove duplicates that crept in
     confirmed = np.unique(np.array(confirmed, dtype=int))
     return confirmed
+
+
+def _union_two(a: np.ndarray, b: np.ndarray, dedup_win: int) -> np.ndarray:
+    """
+    Union of two peak lists.  Where both detectors agree within dedup_win
+    samples, use the midpoint.  Peaks unique to one detector are included as-is.
+    """
+    if len(a) == 0 and len(b) == 0:
+        return np.array([], dtype=int)
+    if len(a) == 0:
+        return np.array(b, dtype=int)
+    if len(b) == 0:
+        return np.array(a, dtype=int)
+
+    merged = []
+    used_b = set()
+    for pa in np.sort(a):
+        diffs = np.abs(b - pa)
+        idx   = int(np.argmin(diffs))
+        if diffs[idx] <= dedup_win and idx not in used_b:
+            merged.append(int(round((pa + b[idx]) / 2.0)))
+            used_b.add(idx)
+        else:
+            merged.append(int(pa))
+    for j, pb in enumerate(np.sort(b)):
+        if j not in used_b:
+            merged.append(int(pb))
+
+    return np.unique(np.array(merged, dtype=int))
+
+
+def _dedup(peaks: np.ndarray, min_gap: int) -> np.ndarray:
+    """
+    Remove duplicate peaks closer than min_gap samples.
+    When two peaks are within min_gap, keep the one with the higher amplitude
+    is not available here, so keep the second (later) one which is typically
+    the true peak when the first is a rising-edge false trigger.
+    Simple greedy: scan sorted, drop any peak that is < min_gap from the
+    last kept peak.
+    """
+    if len(peaks) < 2:
+        return peaks
+    peaks  = np.sort(peaks)
+    kept   = [peaks[0]]
+    for p in peaks[1:]:
+        if p - kept[-1] >= min_gap:
+            kept.append(p)
+    return np.array(kept, dtype=int)
 
 
 def _validate_rr(peaks: np.ndarray, fs: int) -> np.ndarray:
     """
     Remove peaks whose RR interval is physiologically impossible
     (< 200 ms = > 300 bpm, or > 3000 ms = < 20 bpm)
-    OR is an extreme outlier (> 3× median RR).
+    OR is an extreme outlier (> 5× median RR).
+
+    Note: multiplier is 5× not 3× to handle bigeminy / alternating-RR rhythms
+    where the "long" interval can be ~3× the short coupling interval without
+    being a missed beat.
     """
     if len(peaks) < 2:
         return peaks
@@ -227,7 +317,7 @@ def _validate_rr(peaks: np.ndarray, fs: int) -> np.ndarray:
         samples_200ms  = int(0.200 * fs)
         samples_3000ms = int(3.000 * fs)
         # Keep if physiologically plausible AND not extreme outlier
-        if samples_200ms <= interval <= samples_3000ms and interval < 3.0 * med:
+        if samples_200ms <= interval <= samples_3000ms and interval < 5.0 * med:
             keep.append(i + 1)
 
     return peaks[keep].astype(int)

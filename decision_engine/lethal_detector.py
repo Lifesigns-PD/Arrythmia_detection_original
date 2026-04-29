@@ -196,12 +196,23 @@ def _coarse_vfib(hr: float, rr_cv: float, p_absent: float) -> bool:
 
 def _svt(hr: float, qrs_ms: float, rr_cv: float, p_absent: float) -> bool:
     """
-    Supraventricular Tachycardia: narrow + rapid + very regular + no visible P-waves.
-    Ported from BATCH_PROCESS calculate_metrics() svt_flag block lines 974-982.
-    SVT is not lethal but caught here because the rhythm ML model has only 27 training
-    samples (0 corrected) — ML cannot learn it reliably.
+    Supraventricular Tachycardia: narrow + rapid + regular.
+
+    Criteria relaxed from original BATCH_PROCESS thresholds:
+    - rr_cv < 0.10 was too strict — real SVT at 150-200 bpm still shows
+      rr_cv 0.15-0.30 due to physiological beat-to-beat variability and
+      baseline noise at 125 Hz quantisation (8 ms per sample).
+    - p_absent removed as primary gate — at HR > 140 bpm, P-waves merge
+      into the preceding T-wave; the delineation algorithm finds them
+      embedded in T, giving false "P present" readings. Instead we use
+      p_absent as a soft bonus (not required).
+
+    Hard gates: HR > 130, narrow QRS (< 120 ms), moderately regular (rr_cv < 0.35)
     """
-    return (hr > 100
-            and qrs_ms < 120
-            and rr_cv < 0.10
-            and p_absent > 0.60)
+    if not (hr > 130 and qrs_ms < 120 and rr_cv < 0.35):
+        return False
+    # Strongly regular (rr_cv < 0.15) → SVT regardless of P detection
+    if rr_cv < 0.15:
+        return True
+    # Moderately regular (0.15–0.35) → require P-wave evidence is weak
+    return p_absent > 0.25
